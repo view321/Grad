@@ -23,6 +23,7 @@ on this project.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,20 @@ class Session:
         self.client = ClaudeSDKClient(options=agent.build_options(cfg))
         await self.client.__aenter__()
 
+    async def close(self) -> None:
+        """Exit the client context entered by `start`.
+
+        The client owns a CLI subprocess and transport tasks. Entering the
+        context by hand and never exiting it leaves those alive for the life of
+        the app, and leaks a whole set on any later reconnect.
+        """
+        client, self.client = self.client, None
+        if client is not None:
+            try:
+                await client.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001 - shutdown must not raise on the way out
+                pass
+
     async def ask(self, prompt: str, on_settle: Any) -> None:
         await self.start()
         import agent  # noqa: PLC0415
@@ -94,6 +109,10 @@ class Session:
                 text = agent._text_of(message)  # noqa: SLF001 - one helper, deliberately shared
                 if text:
                     self.buffer += text
+        except Exception as exc:  # noqa: BLE001 - the transcript must say why a turn died
+            # Otherwise the turn settles as an empty message: the prompt looks
+            # unanswered and the reason is only in the server log.
+            self.buffer += f"\n\n**the session failed:** `{type(exc).__name__}: {exc}`"
         finally:
             self.busy = False
             settled_text = self.buffer
@@ -104,8 +123,22 @@ class Session:
             await on_settle(settled_text)
 
     def interrupt(self) -> None:
-        if self.client and hasattr(self.client, "interrupt"):
-            self._task = asyncio.create_task(self.client.interrupt())
+        """Interrupt the turn in flight, if there is one.
+
+        Bound to a button and to Escape, so it fires when nothing is running.
+        The result has to be consumed: a bare `create_task` drops any SDK error
+        and Python logs "Task exception was never retrieved".
+        """
+        if not (self.busy and self.client and hasattr(self.client, "interrupt")):
+            return
+
+        async def _interrupt() -> None:
+            try:
+                await self.client.interrupt()
+            except Exception:  # noqa: BLE001 - a failed interrupt must not kill the app
+                pass
+
+        self._task = asyncio.create_task(_interrupt())
 
     def _persist(self) -> None:
         """Closing the window should not be destructive."""
@@ -135,6 +168,7 @@ def build() -> None:
 
     session = Session()
     session.restore()
+    nicegui_app.on_shutdown(session.close)
 
     with ui.header().classes("items-center justify-between px-4 py-2 grad-panel"):
         with ui.row().classes("items-center gap-2"):
@@ -290,9 +324,17 @@ def _notebook_panel(ui: Any) -> None:
 
                 nb = nbformat.read(path, as_version=4)
                 body, _ = HTMLExporter(template_name="basic").from_notebook_node(nb)
-                ui.html(body).classes("w-full bg-white text-black rounded p-2")
+                # Sandboxed iframe, not ui.html: notebook outputs are untrusted
+                # HTML and can carry <script> or event handlers. Injecting them
+                # into the app origin would let a notebook from a downloaded
+                # repository run script in the page that drives the agent.
+                ui.element("iframe").props(
+                    f'sandbox="" srcdoc="{html.escape(body, quote=True)}"'
+                ).classes("w-full h-96 bg-white rounded")
             except ImportError:
                 ui.label("install nbformat and nbconvert to render notebooks").classes("text-sm opacity-60")
+            except Exception as exc:  # noqa: BLE001 - one bad notebook must not break the panel
+                ui.label(f"could not render {name}: {exc}").classes("text-sm text-red-400")
 
     ui.select([p.name for p in notebooks], value=notebooks[0].name, on_change=lambda e: show(e.value)).classes("w-full")
     show(notebooks[0].name)
@@ -306,7 +348,18 @@ def run(*, native: bool = True, port: int = 8080) -> None:
 
     paths.ensure_workspace()
     build()
-    ui.run(native=native, title="Grad", port=port, reload=False, dark=True, window_size=(1400, 900))
+    ui.run(
+        native=native,
+        title="Grad",
+        # Explicit localhost: in browser mode NiceGUI would otherwise bind
+        # 0.0.0.0, and this is an unauthenticated UI that accepts prompts for an
+        # agent with Bash access.
+        host="127.0.0.1",
+        port=port,
+        reload=False,
+        dark=True,
+        window_size=(1400, 900),
+    )
 
 
 if __name__ in {"__main__", "__mp_main__"}:

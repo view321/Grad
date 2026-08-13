@@ -35,7 +35,6 @@ cli = Cli(
 )
 
 ARXIV_SRC = "https://arxiv.org/e-print/{id}"
-ARXIV_META = "http://export.arxiv.org/api/query?id_list={id}"
 
 SECTION_RE = re.compile(r"\\(sub)*section\*?\{([^}]*)\}")
 ENV_RE = re.compile(
@@ -218,20 +217,38 @@ def _title_from(tex: str) -> str | None:
     return _clean(m.group(1)) if m else None
 
 
-def _embed_chunks(con: Any, cfg: Any, chunk_ids: list[int], texts: list[str]) -> int:
-    model = str(cfg.get("retrieval", "embed_model"))
-    dim = int(cfg.get("retrieval", "embed_dim", 1024))
-    corpus.bind_embedding_model(con, model, dim)
+def _compute_vectors(cfg: Any, texts: list[str], *, model: str, dim: int) -> list[list[float]]:
+    """Embed and validate, without touching the index.
+
+    Kept separate from the write so `reembed` can compute the replacements
+    *before* destroying what it is replacing.
+    """
     vectors: list[list[float]] = []
     batch = 64
     for i in range(0, len(texts), batch):
         vectors.extend(http.embed(texts[i : i + batch], cfg=cfg, input_type="document"))
+    if len(vectors) != len(texts):
+        raise UpstreamError(
+            f"embedded {len(vectors)} of {len(texts)} chunks",
+            fix="retry; a partial batch cannot be aligned to its chunks and is not written",
+        )
     if vectors and len(vectors[0]) != dim:
         raise ConfigError(
             f"{model} returned dimension {len(vectors[0])} but the index expects {dim}",
             fix=f"set retrieval.embed_dim = {len(vectors[0])} in config/grad.toml and re-embed",
         )
-    corpus.store_vectors(con, chunk_ids[: len(vectors)], vectors)
+    return vectors
+
+
+def _embed_chunks(con: Any, cfg: Any, chunk_ids: list[int], texts: list[str]) -> int:
+    model = str(cfg.get("retrieval", "embed_model"))
+    dim = int(cfg.get("retrieval", "embed_dim", 1024))
+    corpus.bind_embedding_model(con, model, dim)
+    vectors = _compute_vectors(cfg, texts, model=model, dim=dim)
+    # Exact length, never a truncating slice: a short batch that quietly wrote
+    # its first N vectors would pair chunk k with the embedding of some other
+    # chunk, and no later check would catch it.
+    corpus.store_vectors(con, chunk_ids, vectors)
     return len(vectors)
 
 
@@ -301,20 +318,27 @@ def cmd_reembed(args: argparse.Namespace) -> dict[str, Any]:
     dim = args.dim or int(cfg.get("retrieval", "embed_dim", 1024))
     con = corpus.connect()
     try:
-        con.execute("DELETE FROM chunk_vectors")
-        con.execute("DELETE FROM meta WHERE key='embedding_model'")
-        con.commit()
-        corpus.bind_embedding_model(con, args.model, dim)
         rows = con.execute("SELECT id, text FROM chunks ORDER BY id").fetchall()
         ids = [r["id"] for r in rows]
         texts = [r["text"] for r in rows]
+
+        # Compute first, swap second. Deleting the old vectors up front would
+        # mean a dimension mismatch, an upstream failure, or a Ctrl-C leaves the
+        # index holding chunks and no vectors at all -- dense retrieval silently
+        # degrades to lexical, and recovery costs another full paid re-embed.
         original = cfg.raw["retrieval"]["embed_model"]
         cfg.raw["retrieval"]["embed_model"] = args.model
         try:
-            count = _embed_chunks(con, cfg, ids, texts)
+            vectors = _compute_vectors(cfg, texts, model=args.model, dim=dim)
         finally:
             cfg.raw["retrieval"]["embed_model"] = original
-        return {"model": args.model, "dim": dim, "vectors": count}
+
+        with con:  # one transaction: the old index survives until the new one lands
+            con.execute("DELETE FROM chunk_vectors")
+            con.execute("DELETE FROM meta WHERE key='embedding_model'")
+            corpus.bind_embedding_model(con, args.model, dim)
+            corpus.store_vectors(con, ids, vectors)
+        return {"model": args.model, "dim": dim, "vectors": len(vectors)}
     finally:
         con.close()
 

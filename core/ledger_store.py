@@ -116,7 +116,32 @@ def runs_events() -> list[dict[str, Any]]:
 
 
 def append_run_event(record: dict[str, Any]) -> dict[str, Any]:
-    return jsonl.append(paths.runs_path(), record)
+    """Append one run event.
+
+    A `run_submitted` event binds an expectation, and the gate that checks the
+    binding runs before the write -- so two submitters racing could both pass
+    the check and both bind the same prediction. The uniqueness check is
+    therefore repeated here, inside the append lock, where it is atomic with the
+    write. `check_expectation` still runs first because it produces the better
+    error message; this is the backstop, not the explanation.
+    """
+    expectation_id = record.get("expectation_id") if record.get("type") == T_RUN_SUBMITTED else None
+    if not expectation_id:
+        return jsonl.append(paths.runs_path(), record)
+
+    def _still_unbound() -> None:
+        if expectation_id in bound_expectation_ids():
+            from core.errors import EXIT_EXPECTATION, GateRefusal
+
+            raise GateRefusal(
+                "expectation_bound",
+                f"expectation {expectation_id!r} was bound to another run while this one was "
+                "being submitted; each prediction covers exactly one run",
+                EXIT_EXPECTATION,
+                fix="mint a new expectation and resubmit: python -m tools.ledger expect ... --json",
+            )
+
+    return jsonl.append(paths.runs_path(), record, precondition=_still_unbound)
 
 
 @dataclass
@@ -376,7 +401,13 @@ def rebuild_index(db_path: Any = None) -> dict[str, int]:
                     (
                         r.id, dev.get("expectation_id"), dev.get("quantity"),
                         expected.get("low"), expected.get("high"), dev.get("actual"),
-                        dev.get("ratio"), 1 if dev.get("in_range") else 0,
+                        dev.get("ratio"),
+                        # Tri-state on purpose: NULL means "no program can settle
+                        # this" (relational prediction, non-numeric result,
+                        # missing quantity). Collapsing it to 0 would make the
+                        # index unable to separate "out of range" from "needs a
+                        # verdict", which the JSONL keeps distinct.
+                        None if dev.get("in_range") is None else (1 if dev["in_range"] else 0),
                         dev.get("verdict"), dev.get("note"),
                     ),
                 )

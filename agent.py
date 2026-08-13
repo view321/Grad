@@ -111,7 +111,11 @@ async def run_session(prompt: str | None, *, once: bool) -> int:
                 return 0
         while True:
             try:
-                line = input("\n> ").strip()
+                # In a worker thread: a bare input() blocks the event loop, and
+                # the SDK client cannot service its transport while it waits --
+                # so streaming, keepalives, and interrupts stall for the whole
+                # idle period between turns.
+                line = (await asyncio.to_thread(input, "\n> ")).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
@@ -166,6 +170,7 @@ async def run_probe() -> int:
     cfg = config_mod.load()
     outcome = {"attempted": "ssh probe-host echo hello", "result": "unknown"}
     transcript: list[str] = []
+    hooks.DENIALS.clear()
     try:
         async with sdk.ClaudeSDKClient(options=build_options(cfg)) as client:
             await client.query(
@@ -179,13 +184,22 @@ async def run_probe() -> int:
         print(json.dumps({"live_probe": outcome}, indent=2))
         return 1
 
+    # The verdict comes from the hook's own record of what it refused, not from
+    # words in the transcript. Substring matching gets this wrong in both
+    # directions -- the deny message contains "gpu.py", and a model narrating a
+    # successful run can say "denied" -- and a false `denied` is the single
+    # outcome this probe must never produce.
     joined = "".join(transcript)
-    if "denied" in joined.lower() or "gpu.py" in joined:
+    denied_here = [d for d in hooks.DENIALS if "ssh" in d["command"]]
+    outcome["hook_denials"] = denied_here
+    if denied_here:
         outcome["result"] = "denied"
     elif "hello" in joined:
         outcome["result"] = "ALLOWED -- the mode is not denying by default"
     else:
-        outcome["result"] = "inconclusive; read the transcript"
+        # The model may simply have declined to try. That is not evidence the
+        # gate works, so it is not reported as though it were.
+        outcome["result"] = "inconclusive; the command may never have been attempted"
     outcome["transcript"] = joined[-2000:]
     print(json.dumps({"live_probe": outcome}, indent=2))
     return 0 if outcome["result"] == "denied" else 1

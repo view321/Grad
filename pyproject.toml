@@ -31,6 +31,9 @@ grad = "agent:main"
 
 [tool.setuptools]
 packages = ["core", "tools", "ui", "ui.widgets"]
+# Top-level modules, not packages. Without these the installed `grad` command
+# cannot import `agent:main`, and `hooks` would be missing under it.
+py-modules = ["agent", "hooks"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

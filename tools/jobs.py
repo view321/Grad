@@ -62,7 +62,14 @@ def _hub() -> Any:
 def _token() -> str:
     """Fetched at the moment of use and never exported (HANDOFF §9)."""
     token = credentials.get(credentials.HF_TOKEN)
-    assert token  # credentials.get raises when required and missing
+    if not token:
+        # Not an assert: `python -O` strips those, and the failure mode there is
+        # passing None as the token and getting an opaque upstream error instead
+        # of "you have no credential stored".
+        raise ConfigError(
+            "no Hugging Face token is stored, so HF Jobs cannot be reached",
+            fix=f"python -m tools.jobs credential set {credentials.HF_TOKEN}",
+        )
     return token
 
 

@@ -190,8 +190,24 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         task=args.task,
     )
     remote_dir = f"{host.workdir}/{run_id}"
-    _stage(host, sub, remote_dir)
-    pid = _launch(host, sub, remote_dir, _command_for(sub))
+    try:
+        _stage(host, sub, remote_dir)
+        pid = _launch(host, sub, remote_dir, _command_for(sub))
+    except GradError as exc:
+        # The in-flight record already exists. Left alone it would consume the
+        # monthly ceiling at its estimate and then go stale and block further
+        # submissions -- for a run that never started. jobs.py finalises the
+        # equivalent failure; neither backend gets to differ on this.
+        submit_lib.finish(
+            run_id,
+            status="submit_failed",
+            results={},
+            cost_usd_actual=0.0,
+            artifacts_dir=submit_lib.artifacts_dir(run_id),
+            expectation=None,
+            extra={"error": exc.message, "host": host.name, "remote_dir": remote_dir},
+        )
+        raise
     submit_lib.attach_handle(run_id, {"pid": pid, "remote_dir": remote_dir, "host": host.name})
     return {
         "run_id": run_id,
@@ -223,12 +239,20 @@ def _launch(host: Host, sub: Submission, remote_dir: str, command: list[str]) ->
     logs to know whether the job finished.
     """
     inner = " ".join(shlex.quote(c) for c in command)
+    # Build the runner as one string and quote it *once* on the way into
+    # `sh -c`. Interpolating `inner` straight into a single-quoted literal
+    # breaks the moment an argument contains a quote or a metacharacter, and the
+    # failure is silent: the marker never reaches "finished", so `collect` waits
+    # on a job that already died.
+    runner = (
+        f"{inner} > stdout.log 2> stderr.log; "
+        'printf \'{"state":"finished","exit_code":%d,"ended_at":"%s"}\' '
+        f'"$?" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > {REMOTE_MARKER}'
+    )
     script = (
         f"cd {shlex.quote(remote_dir)} && "
-        f"echo '{{\"state\":\"running\"}}' > {REMOTE_MARKER} && "
-        f"nohup sh -c '{inner} > stdout.log 2> stderr.log; "
-        f"printf \"{{\\\"state\\\":\\\"finished\\\",\\\"exit_code\\\":%d,\\\"ended_at\\\":\\\"%s\\\"}}\" "
-        f"$? \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > {REMOTE_MARKER}' > /dev/null 2>&1 & echo $!"
+        f"printf '{{\"state\":\"running\"}}' > {REMOTE_MARKER} && "
+        f"nohup sh -c {shlex.quote(runner)} > /dev/null 2>&1 & echo $!"
     )
     return _ssh(host, script).strip() or "unknown"
 

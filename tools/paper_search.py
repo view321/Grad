@@ -127,7 +127,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
         docs = [_document_text(c) for c in pool]
         try:
             scored = http.rerank(args.question, docs, cfg=cfg, top_n=min(rerank_top, len(docs)))
-            ranked = [{**pool[s["index"]], "rerank_score": s["score"]} for s in scored if s.get("index") is not None]
+            ranked = apply_rerank(pool, scored)
         except GradError as exc:
             trace.setdefault("warnings", []).append(f"rerank unavailable: {exc}")
             ranked = pool[:rerank_top]
@@ -160,6 +160,23 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
         "trace": trace,
         "trace_log": str(paths.notes_dir() / "funnel" / f"{log_name}.md"),
     }
+
+
+def apply_rerank(pool: list[dict[str, Any]], scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reorder the pool by the reranker's verdict, ignoring unusable indices.
+
+    The index comes from upstream and is used to subscript `pool`. An
+    out-of-range value would raise IndexError and abandon a funnel run that has
+    already spent stage-0 quota; a negative one would silently promote the wrong
+    candidate, which is worse because nothing would look broken.
+    """
+    return [
+        {**pool[i], "rerank_score": s.get("score")}
+        for s in scored
+        if isinstance(i := s.get("index"), int)
+        and not isinstance(i, bool)
+        and 0 <= i < len(pool)
+    ]
 
 
 def _local_ranked(question: str, hyde: str | None, cfg: Any, trace: dict[str, Any]) -> list[dict[str, Any]]:
@@ -217,6 +234,10 @@ def _public(c: dict[str, Any], *, full: bool) -> dict[str, Any]:
     }
 
 
+# The alphabet `_slug` produces, and the only thing `trace` will open.
+SLUG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,79}")
+
+
 def _slug(question: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60]
     return f"{now_iso()[:10]}-{base or 'query'}"
@@ -269,8 +290,12 @@ def cmd_trace(args: argparse.Namespace) -> dict[str, Any]:
     d = paths.notes_dir() / "funnel"
     if not args.name:
         return {"traces": sorted(p.stem for p in d.glob("*.json"))} if d.exists() else {"traces": []}
+    # The name is a slug this CLI minted, and the agent can invoke this command.
+    # Without the pattern check a name like `../../../etc/some` would read and
+    # print any JSON file the process can open, widening the deny-by-default
+    # file boundary that the rest of §9 works to keep narrow.
     path = d / f"{args.name}.json"
-    if not path.exists():
+    if not SLUG_RE.fullmatch(args.name) or not path.exists():
         raise GradError("not_found", f"no trace named {args.name!r}", exit_code=3,
                         fix="python -m tools.paper_search trace --json   # lists them")
     return json.loads(path.read_text(encoding="utf-8"))

@@ -34,7 +34,6 @@ def preflight_panel() -> None:
         checks: dict[str, Any] = record.get("checks", {})
         failing = [n for n, r in checks.items() if r.get("ok") is False]
         passing = [n for n, r in checks.items() if r.get("ok")]
-        colour = "text-red-400" if failing else "text-emerald-400"
         title = f"{record.get('submission_hash', '?')} — {len(passing)} passing, {len(failing)} failing"
 
         with ui.expansion(title, value=bool(failing)).classes("w-full"):
@@ -45,7 +44,12 @@ def preflight_panel() -> None:
                 ok = result.get("ok")
                 icon = "check_circle" if ok else ("cancel" if ok is False else "help")
                 with ui.row().classes("items-center gap-2 w-full"):
-                    ui.icon(icon).classes(colour if ok is not None else "opacity-50")
+                    # Per check, not per record: one failing check must not
+                    # paint the checks that passed red.
+                    ui.icon(icon).classes(
+                        "text-emerald-400" if ok
+                        else ("text-red-400" if ok is False else "opacity-50")
+                    )
                     ui.label(name).classes("font-mono text-sm")
                     ui.label(f"{result.get('duration_s', '—')}s").classes("text-xs opacity-50")
                 if not ok:

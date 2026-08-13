@@ -111,20 +111,42 @@ class Config:
 
     @property
     def hosts(self) -> dict[str, Host]:
-        out: dict[str, Host] = {}
-        for name, spec in self.raw.get("hosts", {}).items():
-            if not isinstance(spec, dict):
-                continue
-            out[name] = Host(
-                name=name,
-                hostname=spec.get("hostname", ""),
-                user=spec.get("user", ""),
-                rate_usd_per_hour=float(spec.get("rate_usd_per_hour", 0.0)),
-                workdir=spec.get("workdir", "~/grad"),
-                key_credential=spec.get("key_credential"),
-                gpus=int(spec.get("gpus", 1)),
-                notes=spec.get("notes", ""),
+        """The inventory, with malformed entries reported as ConfigError.
+
+        A bad value here is a typo in a TOML file, not a bug, and it must not
+        surface as a bare ValueError from inside a submitter -- `rate_usd_per_hour`
+        in particular is what `collect` prices wall clock against, so getting it
+        wrong is a spend-accounting problem and deserves a real message.
+        """
+        raw = self.raw.get("hosts", {})
+        if not isinstance(raw, dict):
+            raise ConfigError(
+                f"[hosts] must be a table of host entries, not {type(raw).__name__}",
+                fix=f"see the [hosts.*] example in {paths.config_path()}",
             )
+        out: dict[str, Host] = {}
+        for name, spec in raw.items():
+            if not isinstance(spec, dict):
+                raise ConfigError(
+                    f"host {name!r} must be a table, not {type(spec).__name__}",
+                    fix=f"write it as [hosts.{name}] with hostname/user/rate_usd_per_hour keys",
+                )
+            try:
+                out[name] = Host(
+                    name=name,
+                    hostname=str(spec.get("hostname", "")),
+                    user=str(spec.get("user", "")),
+                    rate_usd_per_hour=float(spec.get("rate_usd_per_hour", 0.0)),
+                    workdir=str(spec.get("workdir", "~/grad")),
+                    key_credential=spec.get("key_credential"),
+                    gpus=int(spec.get("gpus", 1)),
+                    notes=str(spec.get("notes", "")),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(
+                    f"host {name!r} has a malformed value: {exc}",
+                    fix="rate_usd_per_hour must be a number and gpus an integer",
+                ) from exc
         return out
 
     def host(self, name: str) -> Host:
@@ -168,5 +190,46 @@ def load(path: Path | None = None, *, reload: bool = False) -> Config:
                 fix=f"fix the syntax in {path}, or delete it to fall back to defaults",
             ) from exc
     cfg = Config(raw=_merge(DEFAULTS, user))
+    _validate(cfg, path)
     _cache[key] = cfg
     return cfg
+
+
+# The numbers a gate compares against. A string where a float belongs would
+# otherwise surface as a TypeError from inside a ceiling check, which reads like
+# a bug in the gate rather than a typo in a config file.
+_NUMERIC = (
+    ("spend", "per_job_usd"),
+    ("spend", "monthly_usd"),
+    ("spend", "window_days"),
+    ("spend", "stale_grace_factor"),
+    ("spend", "stale_grace_floor_s"),
+    ("smoke", "max_steps"),
+    ("smoke", "max_wall_clock_s"),
+    ("smoke", "max_cost_usd"),
+)
+
+
+def _validate(cfg: Config, path: Path) -> None:
+    """Check the shapes a malformed file could break, before anything is cached."""
+    for section, key in _NUMERIC:
+        value = cfg.get(section, key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                f"[{section}] {key} must be a number, not {type(value).__name__}",
+                fix=f"fix {section}.{key} in {path}",
+            )
+        if value < 0:
+            raise ConfigError(
+                f"[{section}] {key} must not be negative",
+                fix=f"fix {section}.{key} in {path}",
+            )
+    rates = cfg.get("hf", "flavor_rates", {})
+    if not isinstance(rates, dict):
+        raise ConfigError(
+            "[hf.flavor_rates] must be a table of flavor -> dollars per hour",
+            fix=f"fix the [hf.flavor_rates] section in {path}",
+        )
+    cfg.hosts  # noqa: B018 - raises ConfigError on a malformed inventory

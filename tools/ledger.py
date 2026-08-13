@@ -158,7 +158,7 @@ def _query_args(p: argparse.ArgumentParser) -> None:
         help="uncollected runs and unjudged deviations (the things that quietly accumulate)",
     )
     p.add_argument("--open", action="store_true", help="expectations not yet bound to a run")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--limit", type=int, default=50, help="most recent N rows (minimum 1)")
 
 
 @cli.command("query", "query predictions, runs, and what is still pending", setup=_query_args)
@@ -166,6 +166,9 @@ def cmd_query(args: argparse.Namespace) -> dict[str, Any]:
     if args.pending:
         return ls.pending()
 
+    # `rows[-0:]` is `rows[:]`, so an unclamped --limit 0 would return
+    # everything and a negative one would slice from the wrong end.
+    limit = max(1, args.limit)
     out: dict[str, Any] = {}
     want_both = not (args.expectations or args.runs)
 
@@ -179,7 +182,7 @@ def cmd_query(args: argparse.Namespace) -> dict[str, Any]:
             and (not args.task or e.get("task") == args.task)
             and (not args.open or e["id"] not in bound)
         ]
-        out["expectations"] = rows[-args.limit :]
+        out["expectations"] = rows[-limit:]
 
     if args.runs or want_both:
         rows = [
@@ -192,7 +195,7 @@ def cmd_query(args: argparse.Namespace) -> dict[str, Any]:
                 or any(d.get("quantity") == args.quantity for d in r.get("deviations", []))
             )
         ]
-        out["runs"] = rows[-args.limit :]
+        out["runs"] = rows[-limit:]
 
     return out
 

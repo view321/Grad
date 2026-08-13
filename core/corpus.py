@@ -182,6 +182,18 @@ def replace_chunks(con: sqlite3.Connection, doc_id: str, chunks: Sequence[dict[s
 def store_vectors(con: sqlite3.Connection, chunk_ids: Sequence[int], vectors: Sequence[Sequence[float]]) -> None:
     if len(chunk_ids) != len(vectors):
         raise ValueError("chunk_ids and vectors differ in length")
+    # A wrong-dimension write is invisible after the fact: `vector_search` skips
+    # rows whose length differs from the query vector, so the dense ranking just
+    # comes back empty and the funnel quietly degrades to lexical only.
+    bound = embedding_model(con)
+    if bound is not None:
+        expected = int(bound["dim"])
+        wrong = sorted({len(v) for v in vectors if len(v) != expected})
+        if wrong:
+            raise ConfigError(
+                f"the index expects dimension {expected} but received {wrong}",
+                fix="python -m tools.paper_ingest reembed --model <model> --yes --json",
+            )
     for chunk_id, vec in zip(chunk_ids, vectors):
         con.execute(
             "INSERT OR REPLACE INTO chunk_vectors(chunk_id, dim, vec) VALUES (?,?,?)",

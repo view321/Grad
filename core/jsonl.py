@@ -29,6 +29,8 @@ from typing import Any
 
 _LOCK_TIMEOUT_S = 10.0
 _LOCK_POLL_S = 0.02
+# One fixed byte, past any plausible ledger, used purely as a mutex.
+_LOCK_OFFSET = 1 << 40
 
 # The OS file lock is what keeps *processes* from interleaving. It does not keep
 # *threads* in one process apart -- `msvcrt.locking` is per-process, so two
@@ -61,16 +63,20 @@ except ImportError:  # pragma: no cover
     if os.name == "nt":
         import msvcrt
 
-        # msvcrt locks a byte *range at the current file position*, and a handle
-        # opened in append mode starts at EOF -- so without the seek every
-        # writer would lock a different byte as the file grows, and none would
-        # exclude any other. Both sides seek to 0 so all writers contend on the
-        # same region.
+        # msvcrt locks a byte range at the *current file position*, and a handle
+        # opened in append mode starts at EOF -- so left alone, every writer
+        # locks a different byte as the file grows and none excludes any other.
+        # All writers therefore contend on one fixed sentinel byte, positioned
+        # far past any real ledger: a Windows lock denies reads as well as
+        # writes, so a lock over live data would make readers (and a
+        # precondition that consults the file) fail with PermissionError.
+        # The position is set with os.lseek on the descriptor, which is what
+        # msvcrt.locking reads; O_APPEND still sends every write to EOF.
         def _lock(fh) -> None:
             deadline = time.monotonic() + _LOCK_TIMEOUT_S
             while True:
                 try:
-                    fh.seek(0)
+                    os.lseek(fh.fileno(), _LOCK_OFFSET, os.SEEK_SET)
                     msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                     return
                 except OSError:
@@ -80,7 +86,7 @@ except ImportError:  # pragma: no cover
 
         def _unlock(fh) -> None:
             try:
-                fh.seek(0)
+                os.lseek(fh.fileno(), _LOCK_OFFSET, os.SEEK_SET)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             except OSError:
                 pass
@@ -95,11 +101,21 @@ except ImportError:  # pragma: no cover
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def append(path: Path | str, record: dict[str, Any]) -> dict[str, Any]:
+def append(
+    path: Path | str,
+    record: dict[str, Any],
+    *,
+    precondition: Any = None,
+) -> dict[str, Any]:
     """Append one JSON record as one line, under an exclusive lock.
 
     No CLI opens a ledger file for writing directly; they all call this.
     Returns the record, so callers can write and use it in one expression.
+
+    `precondition` is an optional callable run *while the lock is held*, before
+    the write, and may raise to abort it. That is what lets a uniqueness check
+    ("is this expectation already bound?") be atomic with the append rather than
+    a check that another process can win the race against.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,7 +127,11 @@ def append(path: Path | str, record: dict[str, Any]) -> dict[str, Any]:
         with open(path, "a", encoding="utf-8", newline="\n") as fh:
             _lock(fh)
             try:
-                fh.seek(0, os.SEEK_END)
+                if precondition is not None:
+                    precondition()
+                # No seek: the handle is open with O_APPEND, so every write
+                # lands at EOF regardless of where the descriptor points -- and
+                # it points at the lock sentinel.
                 fh.write(line + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())

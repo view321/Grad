@@ -12,6 +12,7 @@ relative attribution by stage, not a fuel gauge.
 from __future__ import annotations
 
 import argparse
+import math
 from typing import Any
 
 from core import config as config_mod, ledger_store as ls, quota_log
@@ -112,6 +113,13 @@ def _record_args(p: argparse.ArgumentParser) -> None:
 
 @cli.command("record", "append a usage record (used by the Stop hook)", setup=_record_args)
 def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
+    # This is the measurement instrument for every later cost decision, so a
+    # negative count (which would reduce reported usage) or a NaN (which is not
+    # valid JSON and would poison every later sum) is refused rather than stored.
+    if args.input_tokens < 0 or args.output_tokens < 0 or args.credits_usd < 0:
+        raise UsageError("usage values must be non-negative", fix="check the arguments")
+    if not math.isfinite(args.credits_usd):
+        raise UsageError("--credits-usd must be a finite number", fix="pass a real dollar amount")
     return {
         "recorded": quota_log.record(
             args.stage,
@@ -131,7 +139,11 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
     setup=lambda p: p.add_argument("-n", type=int, default=20),
 )
 def cmd_tail(args: argparse.Namespace) -> dict[str, Any]:
-    return {"entries": quota_log.entries()[-args.n :]}
+    if args.n < 0:
+        raise UsageError("-n must be non-negative", fix="python -m tools.quota tail -n 20 --json")
+    entries = quota_log.entries()
+    # `entries[-0:]` is the whole list, which is the opposite of what -n 0 asks.
+    return {"entries": entries[-args.n :] if args.n else []}
 
 
 if __name__ == "__main__":

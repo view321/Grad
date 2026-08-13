@@ -219,7 +219,16 @@ def _exec(argv: list[str], cwd: Path, timeout: float, log: Path, env_extra: dict
         return {"ok": False, "reason": f"command not found: {argv[0]} ({exc})",
                 "fix": f"install {argv[0]} or fix the command in config/grad.toml"}
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "") if isinstance(exc.stdout, str) else ""
+        # Each stream independently: a process that wrote only to stderr before
+        # the timeout leaves `exc.stdout` as None, and gating the whole
+        # expression on it would write an empty log while the error still tells
+        # the operator to go read that log.
+        def _text(stream: Any) -> str:
+            if stream is None:
+                return ""
+            return stream if isinstance(stream, str) else stream.decode("utf-8", "replace")
+
+        output = _text(exc.stdout) + _text(exc.stderr) + f"\n[preflight] timed out after {timeout}s\n"
         code = -1
         timed_out = True
 

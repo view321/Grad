@@ -253,4 +253,16 @@ def embed(texts: Sequence[str], *, cfg: Config, input_type: str = "document") ->
         unit="credits",
         detail={"texts": len(texts), "total_tokens": (data.get("usage") or {}).get("total_tokens")},
     )
-    return [row["embedding"] for row in data.get("data", [])]
+
+    # The caller zips these against chunk ids, so position *is* identity here.
+    # A short or reordered batch would attach wrong vectors to chunks and
+    # nothing downstream would notice: `vector_search` silently skips rows whose
+    # dimension differs, and a wrong-but-same-dimension vector is undetectable.
+    rows = data.get("data", [])
+    if len(rows) != len(texts):
+        raise UpstreamError(
+            f"asked for {len(texts)} embeddings and got {len(rows)}",
+            fix="retry; a partial batch cannot be aligned to its chunks and is not written",
+        )
+    rows = sorted(rows, key=lambda r: r.get("index", 0))
+    return [row["embedding"] for row in rows]

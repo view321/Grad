@@ -93,9 +93,18 @@ def test_extra_hash_paths_are_covered(workspace):
     assert Submission.load(d / "spec.toml", resolve_digest=False).hash() != before
 
 
-def test_untagged_image_is_refused(workspace):
+def test_untagged_image_is_refused(workspace, monkeypatch):
     """':latest is how remote environment drift sneaks past a hash that
-    otherwise looks airtight.'"""
+    otherwise looks airtight.'
+
+    The resolver is stubbed out: left alone it shells out to `docker manifest
+    inspect`, which on a machine that has docker contacts a registry and can
+    add two minutes to a suite that is meant to need no network.
+    """
+    def _no_docker(*_args, **_kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr("core.submission.subprocess.run", _no_docker)
     d = _pipeline(workspace)
     spec = (d / "spec.toml").read_text(encoding="utf-8").replace(
         "'org/img@sha256:aaaa'", "'org/img:latest'"
@@ -113,6 +122,52 @@ def test_dynamic_import_is_reported_not_ignored(workspace):
     )
     sub = Submission.load(d / "spec.toml", resolve_digest=False)
     assert any("dynamic import" in w for w in sub.warnings)
+
+
+def test_from_package_import_module_is_hashed(workspace):
+    """`from pkg import mod` names a module, not just an attribute.
+
+    Resolving only `node.module` stops at `pkg/__init__.py`, leaving `pkg/mod.py`
+    outside the hash -- so editing it would not invalidate the preflight record,
+    which is exactly the gap the import graph exists to close.
+    """
+    d = _pipeline(workspace)
+    pkg = d / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "inner.py").write_text("RATE = 1\n", encoding="utf-8")
+    (d / "train.py").write_text("from pkg import inner\n", encoding="utf-8")
+
+    before = Submission.load(d / "spec.toml", resolve_digest=False).hash()
+    (pkg / "inner.py").write_text("RATE = 2\n", encoding="utf-8")
+    assert Submission.load(d / "spec.toml", resolve_digest=False).hash() != before
+
+
+def test_relative_from_import_is_hashed(workspace):
+    d = _pipeline(workspace)
+    (d / "sibling.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (d / "train.py").write_text("from . import sibling\n", encoding="utf-8")
+
+    before = Submission.load(d / "spec.toml", resolve_digest=False).hash()
+    (d / "sibling.py").write_text("VALUE = 2\n", encoding="utf-8")
+    assert Submission.load(d / "spec.toml", resolve_digest=False).hash() != before
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        ("org/name:2026-08", "org/name"),
+        ("registry.local:5000/org/name:2026-08", "registry.local:5000/org/name"),
+        ("registry.local:5000/org/name", "registry.local:5000/org/name"),
+        ("org/name", "org/name"),
+    ],
+)
+def test_tag_stripping_leaves_a_registry_port_alone(image, expected):
+    """Cutting at the first colon turns `registry.local:5000/org/name:tag` into
+    `registry.local`, putting a wrong image in the hash and the submission."""
+    from core.submission import _strip_tag
+
+    assert _strip_tag(image) == expected
 
 
 def test_import_graph_ignores_third_party(workspace):

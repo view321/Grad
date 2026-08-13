@@ -160,7 +160,33 @@ def _next_figure_path() -> Path:
     return paths.figures_dir() / f"{(max(existing) + 1) if existing else 1:03d}.png"
 
 
-def execute(client: Any, code: str, timeout: float) -> dict[str, Any]:
+def _stop_running_cell(client: Any, kernel: str | None) -> None:
+    """Stop a cell that blew its wall clock, by whatever means the platform has.
+
+    `interrupt_request` over the control channel works for a normally launched
+    ipykernel on POSIX. On Windows ipykernel reports message-based interrupts as
+    unsupported and the cell keeps running, and this CLI launches the kernel
+    directly rather than through a KernelManager that could deliver a real
+    signal -- so there the kernel is terminated and the next `exec` gets a fresh
+    one. Losing the kernel's state is the lesser evil against a wedged kernel
+    that silently swallows every later cell.
+    """
+    try:
+        client.control_channel.send(client.session.msg("interrupt_request", {}))
+    except Exception:  # noqa: BLE001 - best effort; the fallback below is the real one
+        pass
+    if os.name != "nt":
+        return
+    time.sleep(0.5)
+    try:
+        client.stop_channels()
+    except Exception:  # noqa: BLE001
+        pass
+    if kernel:
+        _shutdown(kernel)
+
+
+def execute(client: Any, code: str, timeout: float, *, kernel: str | None = None) -> dict[str, Any]:
     """Run one cell, collect its outputs, and save images to figures/.
 
     Returns a structured result rather than a transcript: `ok`, `stdout`,
@@ -180,10 +206,9 @@ def execute(client: Any, code: str, timeout: float) -> dict[str, Any]:
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
-            try:
-                client.parent_header = None
-            finally:
-                pass
+            # Do not just walk away: the cell keeps running, so the kernel stays
+            # busy and the *next* exec would queue behind it with no sign why.
+            _stop_running_cell(client, kernel)
             raise GradError(
                 "kernel_timeout",
                 f"the cell exceeded the {timeout:.0f}s wall clock and was abandoned",
@@ -258,7 +283,7 @@ def cmd_exec(args: argparse.Namespace) -> dict[str, Any]:
     timeout = args.timeout or float(cfg.get("notebook", "exec_timeout_s", 300))
     client = _client(args.kernel, str(cfg.get("notebook", "kernel_name", "python3")))
     try:
-        out = execute(client, code, timeout)
+        out = execute(client, code, timeout, kernel=args.kernel)
     finally:
         client.stop_channels()
     if not out["ok"]:
@@ -300,14 +325,18 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     session = f"verify-{path.stem}"
     _conn_path(session).unlink(missing_ok=True)
     _start_kernel(session, str(cfg.get("notebook", "kernel_name", "python3")))
-    client = _client(session, str(cfg.get("notebook", "kernel_name", "python3")), autostart=False)
 
     executed = 0
+    client = None
     try:
+        # Inside the protected region: if the client never becomes ready,
+        # `_client` raises, and the kernel spawned a line above would otherwise
+        # be left running -- holding the GPU memory the verify was meant to free.
+        client = _client(session, str(cfg.get("notebook", "kernel_name", "python3")), autostart=False)
         for index, cell in enumerate(nb.cells):
             if cell.get("cell_type") != "code" or not (cell.get("source") or "").strip():
                 continue
-            out = execute(client, cell["source"], timeout)
+            out = execute(client, cell["source"], timeout, kernel=session)
             executed += 1
             if args.write:
                 cell["outputs"] = _as_nb_outputs(out)
@@ -323,7 +352,8 @@ def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
                     detail={"cell_index": index, "cells_executed": executed, **out},
                 )
     finally:
-        client.stop_channels()
+        if client is not None:
+            client.stop_channels()
         _shutdown(session)
 
     if args.write:

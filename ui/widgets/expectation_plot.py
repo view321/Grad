@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from core import ledger_store as ls
+from core.errors import NotFound
 
 
 def _rows() -> list[dict[str, Any]]:
@@ -23,7 +24,10 @@ def _rows() -> list[dict[str, Any]]:
             if dev.get("expectation_id"):
                 try:
                     expectation = ls.expectation(dev["expectation_id"])
-                except Exception:  # noqa: BLE001 - a dangling ref is reported by `ledger verify`
+                except NotFound:
+                    # Only a dangling reference, which `ledger verify` reports.
+                    # A read failure should stay visible rather than render as a
+                    # row that merely happens to show no prediction evidence.
                     expectation = None
             rows.append({"run": run, "dev": dev, "expectation": expectation})
     return rows

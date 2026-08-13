@@ -88,7 +88,20 @@ def import_graph(entrypoint: Path, roots: list[Path]) -> tuple[list[Path], list[
             if isinstance(node, ast.Import):
                 specs = [(alias.name, 0) for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
-                specs = [(node.module or "", node.level or 0)]
+                # `from pkg import mod` and `from . import mod` name a *module*
+                # as often as an attribute, and resolving only `node.module`
+                # stops at `pkg/__init__.py` -- leaving `pkg/mod.py` out of the
+                # hash, so editing it would not invalidate a preflight record.
+                # That is precisely the invalidation gap the import graph exists
+                # to close, so each alias is tried as a module too.
+                level = node.level or 0
+                module = node.module or ""
+                specs = [(module, level)]
+                specs += [
+                    (f"{module}.{alias.name}" if module else alias.name, level)
+                    for alias in node.names
+                    if alias.name != "*"
+                ]
             elif isinstance(node, ast.Call):
                 fn = node.func
                 name = getattr(fn, "attr", None) or getattr(fn, "id", None)
@@ -113,6 +126,17 @@ def import_graph(entrypoint: Path, roots: list[Path]) -> tuple[list[Path], list[
 # ---------------------------------------------------------------------------
 # container image
 # ---------------------------------------------------------------------------
+def _strip_tag(image: str) -> str:
+    """Drop a trailing `:tag`, leaving a registry port alone.
+
+    `registry.local:5000/org/name:2026-08` splits at the *last* colon, not the
+    first -- cutting at the first would resolve to `registry.local@sha256:...`
+    and put a wrong image in both the hash and the submission.
+    """
+    head, sep, tail = image.rpartition(":")
+    return head if sep and "/" not in tail else image
+
+
 def resolve_image_digest(image: str) -> str:
     """Require a digest-pinned image.
 
@@ -141,7 +165,7 @@ def resolve_image_digest(image: str) -> str:
             except (json.JSONDecodeError, AttributeError, IndexError):
                 digest = None
             if digest:
-                return f"{image.split(':')[0]}@{digest}"
+                return f"{_strip_tag(image)}@{digest}"
         elif "@sha256:" in text:
             return text
     raise ConfigError(

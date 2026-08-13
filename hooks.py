@@ -124,13 +124,22 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
+# Deterministic evidence for the §12 deny probe. The probe must not decide its
+# verdict by looking for words in a transcript: the deny message itself contains
+# "gpu.py", and a model narrating a successful run can use the word "denied".
+DENIALS: list[dict[str, Any]] = []
+
+
 async def pre_tool_use(input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
     """PreToolUse gate. Runs before deny rules, allow rules, and the mode."""
     if (input_data or {}).get("tool_name") != "Bash":
         return {}
     command = ((input_data or {}).get("tool_input") or {}).get("command", "")
     denial = evaluate_bash(command)
-    return _deny(denial.message()) if denial else {}
+    if not denial:
+        return {}
+    DENIALS.append({"command": command, "reason": denial.reason})
+    return _deny(denial.message())
 
 
 async def stop(input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
