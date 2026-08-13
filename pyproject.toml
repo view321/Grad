@@ -19,7 +19,10 @@ dependencies = [
 
 [project.optional-dependencies]
 agent = ["claude-agent-sdk>=0.1.0"]
-notebook = ["jupyter-client>=8.6", "nbformat>=5.10", "nbconvert>=7.16"]
+# ipykernel is spawned by name (`python -m ipykernel_launcher`) rather than
+# imported, so nothing else would catch its absence; >=6.29 is the floor for the
+# control-channel `interrupt_request` handling `_stop_running_cell` relies on.
+notebook = ["jupyter-client>=8.6", "ipykernel>=6.29", "nbformat>=5.10", "nbconvert>=7.16"]
 retrieval = ["httpx>=0.27", "sqlite-vec>=0.1.6"]
 remote = ["keyring>=25.0", "huggingface-hub>=0.24"]
 ui = ["nicegui>=2.0", "pywebview>=5.0", "nbformat>=5.10", "nbconvert>=7.16"]

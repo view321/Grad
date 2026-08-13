@@ -25,6 +25,9 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
+import re
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +36,12 @@ from ui import katex
 from ui.widgets import expectation_panel, funnel_view, preflight_panel, quota_meter, quota_panel
 
 FLUSH_HZ = 15
-SESSION_FILE = "ui_session.jsonl"
+SESSION_PREFIX = "ui_session"
+ROLES = ("user", "assistant")
+
+# Where anything the transcript must not carry goes instead: this handler is the
+# app's own log, not user-visible text and not the persisted session file.
+log = logging.getLogger("grad.ui")
 
 # Quasar's defaults, overridden rather than accepted -- untouched spacing and
 # typography is the giveaway that something is a stock NiceGUI app.
@@ -62,9 +70,14 @@ class Session:
 
     The UI holds no logic of its own beyond this: everything else it shows is
     read from the ledger or produced by the CLIs.
+
+    One of these per connected client, keyed by `key`: two windows sharing a
+    single `ClaudeSDKClient` would interleave their turns into one conversation
+    and overwrite each other's transcript file.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, key: str = "default") -> None:
+        self.key = key
         self.client: Any = None
         self.buffer: str = ""
         self.settled: list[dict[str, str]] = []
@@ -111,8 +124,15 @@ class Session:
                     self.buffer += text
         except Exception as exc:  # noqa: BLE001 - the transcript must say why a turn died
             # Otherwise the turn settles as an empty message: the prompt looks
-            # unanswered and the reason is only in the server log.
-            self.buffer += f"\n\n**the session failed:** `{type(exc).__name__}: {exc}`"
+            # unanswered and there is nothing on screen to say why. Only the
+            # exception class goes on screen and into the session file -- an SDK
+            # message can carry a URL with a token in it, a header, or a path,
+            # and both of those destinations are readable long after the fact.
+            log.exception("session turn failed")
+            self.buffer += (
+                f"\n\n**the session failed:** `{type(exc).__name__}` "
+                "(details are in the app log)"
+            )
         finally:
             self.busy = False
             settled_text = self.buffer
@@ -140,36 +160,102 @@ class Session:
 
         self._task = asyncio.create_task(_interrupt())
 
+    def path(self) -> Path:
+        return paths.data_dir() / f"{SESSION_PREFIX}-{self.key}.jsonl"
+
     def _persist(self) -> None:
         """Closing the window should not be destructive."""
-        path = paths.data_dir() / SESSION_FILE
+        path = self.path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "\n".join(json.dumps(m, ensure_ascii=False) for m in self.settled), encoding="utf-8"
         )
 
     def restore(self) -> None:
-        path = paths.data_dir() / SESSION_FILE
+        """Read the transcript back, keeping only records that render.
+
+        The file is on disk between runs, so a record is not necessarily one we
+        wrote: `_bubble` subscripts `role` and `text`, and a line that is a bare
+        string or is missing `text` would take the whole page down at build time.
+        """
+        path = self.path()
         if not path.exists():
             return
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
-                self.settled.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if (
+                isinstance(record, dict)
+                and record.get("role") in ROLES
+                and isinstance(record.get("text"), str)
+            ):
+                self.settled.append({"role": record["role"], "text": record["text"]})
 
 
 def build() -> None:
+    """Register the page. Everything with per-client state is built inside it.
+
+    Constructing the `Session` out here would build the layout once, at import,
+    and hand every connected client the same `ClaudeSDKClient`, the same token
+    buffer and the same transcript file -- a second window would see the first
+    one's stream and race it on the way to disk.
+    """
     from nicegui import app as nicegui_app, ui
 
     ui.add_head_html(THEME)
     katex.install(nicegui_app)
-    ui.dark_mode(True)
 
-    session = Session()
-    session.restore()
-    nicegui_app.on_shutdown(session.close)
+    @ui.page("/")
+    def index() -> None:
+        from nicegui import context  # noqa: PLC0415 - page scope, not import scope
 
+        ui.dark_mode(True)
+        session = Session(_client_key())
+        session.restore()
+        # Per client, not `app.on_shutdown`: that would accumulate one handler
+        # per connection and hold every session's subprocess open until the app
+        # itself exits.
+        context.client.on_disconnect(session.close)
+        _layout(ui, session)
+
+
+def _client_key() -> str:
+    """A filesystem-safe id for this client's transcript.
+
+    The browser id is signed into a cookie (see `_storage_secret`), so a reload
+    restores its own transcript rather than someone else's; the connection id is
+    the fallback when storage is unavailable, and isolates without persisting.
+    """
+    from nicegui import app as nicegui_app, context  # noqa: PLC0415
+
+    try:
+        key = str(nicegui_app.storage.browser.get("id") or "")
+    except (RuntimeError, KeyError):  # no storage_secret configured
+        key = ""
+    key = key or str(context.client.id)
+    return re.sub(r"[^A-Za-z0-9_-]", "", key)[:64] or "default"
+
+
+def _storage_secret() -> str:
+    """The key NiceGUI signs the browser-id cookie with.
+
+    Persisted rather than generated per launch so a restart does not orphan
+    every transcript written before it.
+    """
+    path = paths.data_dir() / "ui_storage_secret"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:  # not every filesystem honours it; the file is local either way
+            log.debug("could not restrict permissions on %s", path)
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _layout(ui: Any, session: Session) -> None:
     with ui.header().classes("items-center justify-between px-4 py-2 grad-panel"):
         with ui.row().classes("items-center gap-2"):
             ui.label("Grad").classes("text-lg font-semibold")
@@ -356,6 +442,8 @@ def run(*, native: bool = True, port: int = 8080) -> None:
         # agent with Bash access.
         host="127.0.0.1",
         port=port,
+        # Signs the browser-id cookie each client's transcript is keyed by.
+        storage_secret=_storage_secret(),
         reload=False,
         dark=True,
         window_size=(1400, 900),

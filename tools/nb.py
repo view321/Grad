@@ -49,7 +49,7 @@ def _jupyter() -> Any:
     except ImportError as exc:
         raise ConfigError(
             "jupyter_client is not installed, so there is no kernel to talk to",
-            fix="pip install 'jupyter-client>=8.6' nbformat",
+            fix="pip install 'jupyter-client>=8.6' 'ipykernel>=6.29' nbformat",
         ) from exc
     return jupyter_client
 
@@ -173,14 +173,14 @@ def _stop_running_cell(client: Any, kernel: str | None) -> None:
     """
     try:
         client.control_channel.send(client.session.msg("interrupt_request", {}))
-    except Exception:  # noqa: BLE001 - best effort; the fallback below is the real one
+    except Exception:  # noqa: BLE001, S110 - best effort; the fallback below is the real one
         pass
     if os.name != "nt":
         return
     time.sleep(0.5)
     try:
         client.stop_channels()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - channels that are already down are the desired state
         pass
     if kernel:
         _shutdown(kernel)

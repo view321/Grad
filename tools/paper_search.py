@@ -128,6 +128,14 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
         try:
             scored = http.rerank(args.question, docs, cfg=cfg, top_n=min(rerank_top, len(docs)))
             ranked = apply_rerank(pool, scored)
+            if not ranked:
+                # Every index came back unusable. Dropping the pool here would
+                # return nothing at all from a run that has already spent stage-0
+                # quota -- an unordered pool is still better than no results.
+                trace.setdefault("warnings", []).append(
+                    "rerank returned no usable indices; falling back to the unreranked pool"
+                )
+                ranked = pool[:rerank_top]
         except GradError as exc:
             trace.setdefault("warnings", []).append(f"rerank unavailable: {exc}")
             ranked = pool[:rerank_top]

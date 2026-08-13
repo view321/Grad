@@ -106,13 +106,18 @@ def test_untagged_image_is_refused(workspace, monkeypatch):
 
     monkeypatch.setattr("core.submission.subprocess.run", _no_docker)
     d = _pipeline(workspace)
+
+    # The control: a digest-pinned image resolves without docker at all, so the
+    # refusal below is about the tag and not merely about docker being missing.
+    assert Submission.load(d / "spec.toml", resolve_digest=True).image == "org/img@sha256:aaaa"
+
     spec = (d / "spec.toml").read_text(encoding="utf-8").replace(
         "'org/img@sha256:aaaa'", "'org/img:latest'"
     )
     (d / "spec.toml").write_text(spec, encoding="utf-8")
     with pytest.raises(ConfigError) as exc:
         Submission.load(d / "spec.toml", resolve_digest=True)
-    assert "digest" in str(exc.value)
+    assert "'org/img:latest' is not pinned to a digest" in str(exc.value)
 
 
 def test_dynamic_import_is_reported_not_ignored(workspace):

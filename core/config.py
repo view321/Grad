@@ -212,6 +212,16 @@ _NUMERIC = (
 
 def _validate(cfg: Config, path: Path) -> None:
     """Check the shapes a malformed file could break, before anything is cached."""
+    # `Config.get` subscripts the section, so `spend = "lots"` in the file would
+    # surface as an AttributeError from inside the loop below -- a traceback that
+    # reads like a bug in the loader rather than a typo in a TOML file.
+    for section in (*dict.fromkeys(s for s, _ in _NUMERIC), "hf"):
+        table = cfg.raw.get(section)
+        if table is not None and not isinstance(table, dict):
+            raise ConfigError(
+                f"[{section}] must be a table, not {type(table).__name__}",
+                fix=f"write it as a [{section}] section with its keys underneath, in {path}",
+            )
     for section, key in _NUMERIC:
         value = cfg.get(section, key)
         if value is None:

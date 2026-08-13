@@ -79,7 +79,9 @@ def test_wrong_dimension_vectors_are_refused(workspace):
 # ---------------------------------------------------------------------------
 # rerank indices come from upstream
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("index", [99, -1, None, "2", 2.0, True])
+# "1", 1.0 and True are *in range* for this pool on purpose: a type check that
+# only caught out-of-range values would pass a parametrisation of 99 and -1 alone.
+@pytest.mark.parametrize("index", [99, -1, None, "1", 1.0, True])
 def test_unusable_rerank_indices_are_dropped(index):
     """An IndexError here would abandon a funnel run that already spent stage-0
     quota; a negative index would silently promote the wrong candidate."""
@@ -87,6 +89,36 @@ def test_unusable_rerank_indices_are_dropped(index):
 
     pool = [{"id": "a"}, {"id": "b"}]
     assert apply_rerank(pool, [{"index": index, "score": 0.5}]) == []
+
+
+def test_a_wholly_unusable_rerank_falls_back_to_the_pool(workspace, monkeypatch, capsys):
+    """End to end: every index unusable must not empty the funnel.
+
+    The pool is what stage 1 already paid quota for. Returning nothing because
+    an upstream reranker answered with indices we cannot use reads, from the
+    agent's side, as "there is no literature on this".
+    """
+    from core import corpus, http
+    from tools import paper_search
+
+    con = corpus.connect()
+    try:
+        # Two, because stage 2 does not run on a pool of one.
+        for doc_id, text in (("d1", "a note about gradient flow"), ("d2", "gradient flow again")):
+            corpus.upsert_document(con, {"id": doc_id, "title": "gradient flow", "source": "notes"})
+            corpus.replace_chunks(con, doc_id, [{"text": text}])
+    finally:
+        con.close()
+
+    monkeypatch.setattr(http, "rerank", lambda *a, **k: [{"index": 99, "score": 0.5}])
+
+    assert paper_search.cli.run(
+        ["search", "gradient flow", "--local-only", "--no-expand", "--no-triage", "--json"]
+    ) == 0
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data["funnel"] == {"candidates": 2, "reranked": 2, "returned": 2}
+    assert {r["id"] for r in data["results"]} == {"local:d1#1", "local:d2#2"}
+    assert any("no usable indices" in w for w in data["trace"]["warnings"])
 
 
 def test_valid_rerank_indices_reorder_the_pool():
@@ -112,9 +144,10 @@ def test_trace_refuses_a_traversing_name(workspace, capsys, name):
 
     funnel = paths.notes_dir() / "funnel"
     funnel.mkdir(parents=True, exist_ok=True)
-    secret = paths.root() / "secret.json"
-    secret.write_text('{"password": "hunter2"}', encoding="utf-8")
-    (paths.root() / ".." / "secret.json").resolve().write_text('{"password": "hunter2"}', encoding="utf-8")
+    # In the root but outside notes/funnel: `../../secret` reaches it, and that
+    # is the whole claim. Writing above the root would have this test scribble
+    # into the directory that holds the temp workspace.
+    (paths.root() / "secret.json").write_text('{"password": "hunter2"}', encoding="utf-8")
 
     assert paper_search.cli.run(["trace", name, "--json"]) == 3
     payload = json.loads(capsys.readouterr().out)
@@ -229,6 +262,16 @@ def test_a_scalar_hosts_section_is_a_config_error(workspace):
     _write_config(workspace, 'hosts = "gpu-box"\n')
     with pytest.raises(ConfigError):
         config_mod.load(reload=True)
+
+
+@pytest.mark.parametrize("text", ['spend = "lots"\n', "smoke = 1\n", 'hf = "a10g-small"\n'])
+def test_a_scalar_where_a_section_belongs_is_a_config_error(workspace, text):
+    """`cfg.get` subscripts the section: a scalar there would come back as an
+    AttributeError from inside the validator, which reads like a loader bug."""
+    _write_config(workspace, text)
+    with pytest.raises(ConfigError) as exc:
+        config_mod.load(reload=True)
+    assert "must be a table" in exc.value.message
 
 
 # ---------------------------------------------------------------------------
