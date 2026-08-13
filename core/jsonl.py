@@ -61,10 +61,16 @@ except ImportError:  # pragma: no cover
     if os.name == "nt":
         import msvcrt
 
+        # msvcrt locks a byte *range at the current file position*, and a handle
+        # opened in append mode starts at EOF -- so without the seek every
+        # writer would lock a different byte as the file grows, and none would
+        # exclude any other. Both sides seek to 0 so all writers contend on the
+        # same region.
         def _lock(fh) -> None:
             deadline = time.monotonic() + _LOCK_TIMEOUT_S
             while True:
                 try:
+                    fh.seek(0)
                     msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
                     return
                 except OSError:

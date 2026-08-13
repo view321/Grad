@@ -138,6 +138,49 @@ def test_unjudged_deviations_are_surfaced(workspace):
     assert [d["run_id"] for d in pending["unjudged_deviations"]] == [run_id]
 
 
+def test_relational_results_stay_pending_until_judged(workspace):
+    """A relational prediction has no range to test, so `in_range` is None.
+
+    §7 prefers relational expectations precisely because they survive a setup
+    mismatch, so they must not fall out of the pending list -- otherwise the
+    most-preferred prediction type is the one that quietly stops being judged.
+    """
+    ls.append_run_event(
+        {"type": ls.T_RUN_SUBMITTED, "id": "run-rel", "task": "t", "status": "in_flight",
+         "submitted_at": ls.now_iso(), "estimate_usd": 1.0, "estimated_duration_s": 60}
+    )
+    ls.append_run_event(
+        {"type": ls.T_RUN_COLLECTED, "id": "run-rel", "status": "completed", "collected_at": ls.now_iso(),
+         "cost_usd_actual": 1.0, "results": {"val_loss": 3.0},
+         "deviations": submit_lib.compute_deviations(
+             {"id": "exp-r", "quantity": "val_loss", "predicted": {"direction": "decrease"}},
+             {"val_loss": 3.0},
+         )}
+    )
+    assert ls.run("run-rel").get("deviations")[0]["in_range"] is None
+    assert [d["run_id"] for d in ls.pending()["unjudged_deviations"]] == ["run-rel"]
+
+    assert run_cli(["verdict", "run-rel", "--quantity", "val_loss", "--verdict", "real",
+                    "--note", "beat the baseline on the same eval", "--json"]) == 0
+    assert ls.pending()["unjudged_deviations"] == []
+
+
+def test_a_missing_quantity_also_stays_pending(workspace):
+    ls.append_run_event(
+        {"type": ls.T_RUN_SUBMITTED, "id": "run-gap", "task": "t", "status": "in_flight",
+         "submitted_at": ls.now_iso(), "estimate_usd": 1.0, "estimated_duration_s": 60}
+    )
+    ls.append_run_event(
+        {"type": ls.T_RUN_COLLECTED, "id": "run-gap", "status": "completed", "collected_at": ls.now_iso(),
+         "cost_usd_actual": 1.0, "results": {"other": 1.0},
+         "deviations": submit_lib.compute_deviations(
+             {"id": "exp-g", "quantity": "val_loss", "predicted": {"low": 1, "high": 2}},
+             {"other": 1.0},
+         )}
+    )
+    assert [d["run_id"] for d in ls.pending()["unjudged_deviations"]] == ["run-gap"]
+
+
 def test_verdict_attaches_to_the_deviation(workspace):
     run_id = _collected_run_with_deviation(workspace)
     assert run_cli(["verdict", run_id, "--quantity", "val_loss", "--verdict", "bug", "--note", "lr typo", "--json"]) == 0

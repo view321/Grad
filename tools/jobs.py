@@ -463,9 +463,21 @@ def _download_artifacts(r: ls.Run, dest: Path) -> None:
 # ---------------------------------------------------------------------------
 # credentials
 # ---------------------------------------------------------------------------
+# Names only. `credentials.status()` probes the credential store, and argparse
+# setup runs at import time -- listing it here would read all four entries out
+# of Windows Credential Manager on every `jobs.py` invocation, including
+# `collect` and `ceilings`.
+CREDENTIAL_NAMES = (
+    credentials.HF_TOKEN,
+    credentials.OPENROUTER_KEY,
+    credentials.VOYAGE_KEY,
+    credentials.S2_KEY,
+)
+
+
 def _credential_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("action", choices=["status", "set", "delete"])
-    p.add_argument("name", nargs="?", help=f"one of: {', '.join(credentials.status())}")
+    p.add_argument("name", nargs="?", help=f"one of: {', '.join(CREDENTIAL_NAMES)}")
 
 
 @cli.command("credential", "inspect or set stored credentials (values are never printed)", setup=_credential_args)
@@ -475,7 +487,7 @@ def cmd_credential(args: argparse.Namespace) -> dict[str, Any]:
     if args.action == "status":
         return {"credentials": credentials.status(), "service": credentials.SERVICE}
     if not args.name:
-        raise UsageError("give a credential name", fix=f"one of: {', '.join(credentials.status())}")
+        raise UsageError("give a credential name", fix=f"one of: {', '.join(CREDENTIAL_NAMES)}")
     if args.action == "delete":
         credentials.delete(args.name)
         return {"deleted": args.name}

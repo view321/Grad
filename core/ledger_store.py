@@ -155,10 +155,20 @@ class Run:
         return float(self.data.get("estimate_usd") or 0.0)
 
     def unjudged_deviations(self) -> list[dict[str, Any]]:
+        """Anything not confirmed in range and not yet judged.
+
+        `in_range` is False for a numeric miss and **None** for the cases no
+        program can settle: a relational prediction, a non-numeric result, or a
+        run that reported nothing for the predicted quantity. All of them need a
+        verdict, and relational predictions are the kind §7 says to prefer -- so
+        the predicate here is `is not True`, matching what `collect` surfaces.
+        Filtering on `is False` would drop the preferred prediction type out of
+        the pending list the moment the agent moved on.
+        """
         return [
             d
             for d in self.data.get("deviations", [])
-            if d.get("in_range") is False and not d.get("verdict")
+            if d.get("in_range") is not True and not d.get("verdict")
         ]
 
 
