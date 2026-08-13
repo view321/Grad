@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Derived index - rebuildable from the JSONL at any time (HANDOFF §7).
+ledger/ledger.sqlite
+ledger/ledger.sqlite-*
+
+# Local corpus and artifacts. The JSONL ledgers ARE tracked on purpose:
+# they are the source of truth and are meant to be human-diffable.
+data/corpus.sqlite
+data/corpus.sqlite-*
+data/papers/
+ledger/runs/
+figures/
+notebooks/.ipynb_checkpoints/
+
+# Credentials never live in the workspace (HANDOFF §9). This is belt and braces.
+.env
+*.pem
+credentials.json
