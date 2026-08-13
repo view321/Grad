@@ -1,0 +1,84 @@
+# Grad configuration.
+#
+# Every number a gate compares against lives here rather than in a prompt.
+# Defaults are in core/config.py; this file overrides them. A malformed file is
+# a hard error rather than a silent fallback, because a config that fails to
+# load must never quietly raise a ceiling.
+
+[spend]
+# HANDOFF §6: a per-invocation cap alone does not stop twenty invocations, so
+# both ceilings are checked at submit. In-flight runs count at their estimates.
+per_job_usd = 25.0
+monthly_usd = 200.0
+window_days = 30
+# A run uncollected past estimate * factor (floored) blocks new submissions.
+stale_grace_factor = 3.0
+stale_grace_floor_s = 1800
+
+[smoke]
+# The §6 carve-out, hard-capped in code. Nothing useful can be trained inside
+# these numbers, which is exactly what keeps the exemption from becoming the way
+# real jobs escape the gate.
+max_steps = 1
+max_wall_clock_s = 600
+max_cost_usd = 0.50
+allow_artifact_upload = false
+
+[preflight]
+checks = ["tests", "dry_run", "smoke"]
+test_command = ["pytest", "-q"]
+dry_run_timeout_s = 900
+test_timeout_s = 900
+
+[notebook]
+# The kernel is the agent's only interactive compute channel; a training loop in
+# a cell blocks it with no way to observe progress.
+exec_timeout_s = 300
+verify_timeout_s = 1800
+kernel_name = "python3"
+
+[retrieval]
+rerank_model = "voyageai/rerank-2.5"
+embed_model = "voyage-4"
+embed_dim = 1024
+triage_model = "claude-haiku-4-5"
+expand_model = "claude-haiku-4-5"
+rrf_k = 60
+candidates = 300
+rerank_top = 50
+triage_top = 15
+# Unauthenticated Semantic Scholar is ~1 req/s, so cache aggressively.
+min_request_interval_s = 1.1
+cache_ttl_s = 604800
+
+[agent]
+model = "claude-opus-4-5"
+# Verify this empirically after any SDK upgrade: `python agent.py --probe`.
+# Mode names and semantics have changed between releases.
+permission_mode = "dontAsk"
+
+[hf]
+default_flavor = "a10g-small"
+
+[hf.flavor_rates]
+# `collect` prices the platform's own start/end timestamps against this table.
+# A rate that is stale in the optimistic direction makes the ceiling decoration.
+cpu-basic = 0.0
+cpu-upgrade = 0.03
+t4-small = 0.40
+t4-medium = 0.60
+a10g-small = 1.05
+a10g-large = 1.50
+a100-large = 4.13
+
+# SSH hosts are a fixed inventory; an unknown name is a configuration error,
+# never an ad-hoc connection. Uncomment and fill in for a real host.
+#
+# [hosts.gpu-box]
+# hostname = "10.0.0.7"
+# user = "research"
+# gpus = 2
+# rate_usd_per_hour = 0.0      # 0 = free to use, still ledgered
+# workdir = "~/grad"
+# key_credential = "gpu_box_key"
+# notes = "2x4090, shared with the lab"
