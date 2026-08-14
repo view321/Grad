@@ -535,3 +535,52 @@ def test_halt_on_an_open_campaign_records_the_request(workspace):
 def test_halting_an_unknown_campaign_is_a_not_found(workspace):
     with pytest.raises(NotFound):
         evolve.cmd_halt(argparse.Namespace(campaign="nope", reason="", json=True))
+
+
+def test_a_halt_request_is_validated_inside_the_append_lock(workspace):
+    """The loop closing a campaign and a human halting it are two processes
+    racing over one file, so a check made before the lock is a check the other
+    process can win. Same backstop as `append_run_event`'s binding check."""
+    with pytest.raises(NotFound):
+        camp.request_halt("camp-nope")
+    assert camp.campaign_events() == []
+
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.close_campaign("camp-1", status="closed")
+    before = len(camp.campaign_events())
+
+    with pytest.raises(GradError) as exc:
+        camp.request_halt("camp-1")
+    assert exc.value.code == "campaign_not_open"
+    # Rejected under the lock means nothing was written.
+    assert len(camp.campaign_events()) == before
+    assert camp.halt_requested("camp-1") is False
+
+
+def test_losing_the_halt_race_reports_closed_rather_than_raising(workspace, monkeypatch):
+    """The campaign closed between the CLI's check and the append. That is the
+    halt getting what it wanted a moment early, not a failure."""
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.close_campaign("camp-1", status="closed")
+
+    real = camp.campaign
+    calls = {"n": 0}
+
+    def stale_first(campaign_id):
+        # The pre-check sees a campaign that is still open; the precondition,
+        # reading under the lock, sees the truth.
+        calls["n"] += 1
+        record = dict(real(campaign_id))
+        if calls["n"] == 1:
+            record["status"] = "open"
+        return record
+
+    monkeypatch.setattr(evolve.camp, "campaign", stale_first)
+    payload = evolve.cmd_halt(argparse.Namespace(campaign="camp-1", reason="", json=True))
+    assert payload["halted"] is False
+    assert payload["status"] == "closed"
+    assert camp.halt_requested("camp-1") is False

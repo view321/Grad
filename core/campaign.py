@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from core import jsonl, paths
-from core.errors import NotFound
+from core.errors import EXIT_USAGE, GradError, NotFound
 
 T_CAMPAIGN = "campaign"
 T_GENERATION = "campaign_generation"
@@ -209,9 +209,35 @@ def request_halt(campaign_id: str, *, reason: str = "") -> dict[str, Any]:
     abandons an in-flight candidate, which goes stale and blocks every future
     submission (exit 7) -- so `_drive` checks this exactly where the budget gate
     already stops cleanly, with every candidate collected.
+
+    The campaign must exist and still be open, and that is checked *inside the
+    append lock* for the same reason `append_run_event` re-checks its binding
+    there: the loop closing a campaign and a human asking it to halt are two
+    processes racing over one file, and a check made before the lock is a check
+    the other process can win. `tools.evolve halt` still checks first, because
+    it produces the better message; this is the backstop, not the explanation.
     """
-    return append_campaign(
-        {"type": T_HALT_REQUESTED, "id": campaign_id, "at": now_iso(), "reason": reason}
+
+    def _still_open() -> None:
+        record = campaigns().get(campaign_id)
+        if record is None:
+            raise NotFound(
+                f"campaign {campaign_id!r} does not exist",
+                fix="python -m tools.evolve status --json   # lists known campaigns",
+            )
+        status = record.get("status")
+        if status != "open":
+            raise GradError(
+                "campaign_not_open",
+                f"campaign {campaign_id!r} is {status}, so there is nothing to halt",
+                exit_code=EXIT_USAGE,
+                fix=f"python -m tools.evolve status --campaign {campaign_id} --json",
+            )
+
+    return jsonl.append(
+        campaigns_path(),
+        {"type": T_HALT_REQUESTED, "id": campaign_id, "at": now_iso(), "reason": reason},
+        precondition=_still_open,
     )
 
 

@@ -828,13 +828,16 @@ def cmd_halt(args: argparse.Namespace) -> dict[str, Any]:
     """
     record = camp.campaign(args.campaign)
     if record.get("status") != "open":
-        return {
-            "campaign": args.campaign,
-            "halted": False,
-            "status": record.get("status"),
-            "message": f"campaign {args.campaign} is already {record.get('status')}",
-        }
-    camp.request_halt(args.campaign, reason=args.reason)
+        return _already_closed(args.campaign, record.get("status"))
+    try:
+        camp.request_halt(args.campaign, reason=args.reason)
+    except GradError as exc:
+        # The loop closed the campaign between the check above and the append.
+        # That is the halt getting what it wanted a moment early, not a failure,
+        # so it reports the same way as finding it closed in the first place.
+        if exc.code != "campaign_not_open":
+            raise
+        return _already_closed(args.campaign, camp.campaign(args.campaign).get("status"))
     return {
         "campaign": args.campaign,
         "halted": True,
@@ -844,6 +847,15 @@ def cmd_halt(args: argparse.Namespace) -> dict[str, Any]:
             "candidate collected"
         ),
         "next": f"python -m tools.evolve status --campaign {args.campaign} --json",
+    }
+
+
+def _already_closed(campaign_id: str, status: Any) -> dict[str, Any]:
+    return {
+        "campaign": campaign_id,
+        "halted": False,
+        "status": status,
+        "message": f"campaign {campaign_id} is already {status}",
     }
 
 
