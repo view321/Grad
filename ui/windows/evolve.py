@@ -31,7 +31,11 @@ def subtitle(workspace: Any) -> str:
 def chips(workspace: Any) -> list[tuple[str, str]]:
     model = workspace.model("evolve") or {}
     campaign = model.get("campaign") or {}
-    return [("EVOLVING", "ok")] if campaign.get("running") else []
+    if not campaign.get("running"):
+        return []
+    if campaign.get("halt_requested"):
+        return [("HALTING", "attention")]
+    return [("EVOLVING", "ok")]
 
 
 def render(workspace: Any) -> None:
@@ -81,11 +85,26 @@ def _stats(workspace: Any, campaign: dict[str, Any]) -> None:
         kit.note(f"objective — {campaign.get('objective')}")
         if campaign.get("running"):
             async def halt() -> None:
-                payload = await run_tool("tools.evolve", "status", "--campaign", campaign["id"], "--json")
+                workspace.say(f"requesting halt of {campaign['id']} …")
+                payload = await run_tool(
+                    "tools.evolve", "halt",
+                    "--campaign", campaign["id"],
+                    "--reason", "halted from the workspace",
+                    "--json",
+                )
                 workspace.say(envelope_message(payload))
+                workspace.invalidate("evolve")
+                workspace.tick()
 
-            kit.button("■ HALT", tone="danger", on_click=halt,
-                       title="stop after the current generation")
+            if campaign.get("halt_requested"):
+                # The request is in the ledger but the loop has not reached a
+                # boundary yet. Saying so beats a button that looks unpressed.
+                kit.chip("HALT REQUESTED", "attention")
+                kit.caption("stops before the next generation")
+            else:
+                kit.button("■ HALT", tone="danger", on_click=halt,
+                           title="stop at the next generation boundary, "
+                                 "with every candidate collected")
 
 
 def _lineage(campaign: dict[str, Any]) -> None:

@@ -487,6 +487,15 @@ def _drive(
     reason = ""
 
     for generation in range(generations):
+        # Checked at the generation boundary, alongside the gate and for the
+        # same reason: this is the point where the campaign can end with every
+        # candidate collected rather than one abandoned in flight.
+        if camp.halt_requested(campaign_id):
+            status = "halted"
+            reason = "halt requested"
+            camp.record_generation(campaign_id, generation, halted=True, reason=reason)
+            break
+
         remaining = (generations - generation) * population
         try:
             _campaign_gate(project_id, per_candidate * remaining, remaining, per_candidate)
@@ -799,6 +808,42 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
             "top-K rather than the argmax, on purpose: a search optimising a scalar "
             "will find the bug in the metric"
         ),
+    }
+
+
+def _halt_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--campaign", required=True)
+    p.add_argument("--reason", default="", help="recorded on the halt event")
+
+
+@cli.command("halt", "stop a campaign at the next generation boundary", setup=_halt_args)
+def cmd_halt(args: argparse.Namespace) -> dict[str, Any]:
+    """Ask a running campaign to stop cleanly.
+
+    Not a kill. `evolve run` holds the loop in whatever process started it, so
+    this writes a request the loop reads between generations -- which is also
+    the only boundary at which stopping is safe, because every candidate is
+    collected there. A campaign that is already closed is reported as such
+    rather than being handed a request nothing will ever read.
+    """
+    record = camp.campaign(args.campaign)
+    if record.get("status") != "open":
+        return {
+            "campaign": args.campaign,
+            "halted": False,
+            "status": record.get("status"),
+            "message": f"campaign {args.campaign} is already {record.get('status')}",
+        }
+    camp.request_halt(args.campaign, reason=args.reason)
+    return {
+        "campaign": args.campaign,
+        "halted": True,
+        "status": "open",
+        "message": (
+            "halt requested; the campaign stops before the next generation, with every "
+            "candidate collected"
+        ),
+        "next": f"python -m tools.evolve status --campaign {args.campaign} --json",
     }
 
 

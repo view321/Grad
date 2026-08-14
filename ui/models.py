@@ -613,20 +613,53 @@ def quota_model(*, days: int = 1) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 4. preflight + gates
 # ---------------------------------------------------------------------------
+def _preflight_files() -> list[Path]:
+    """Preflight records, newest first.
+
+    `stat()` is guarded per file rather than in the sort key's caller: these
+    records are written by a concurrent `preflight run` (temp file plus
+    `os.replace`), so a path returned by `glob` can be gone by the time it is
+    stat'd, and one vanished file must not take the whole listing down.
+    """
+    directory = paths.preflight_dir()
+    if not directory.exists():
+        return []
+    return sorted(directory.glob("*.json"), key=_mtime, reverse=True)
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def preflight_model() -> dict[str, Any]:
-    """The most recent submission's checklist, with its one-click remedy."""
+    """The most recent submission's checklist, with its one-click remedy.
+
+    Reads are guarded **per record**, not around the loop. `jsonl.read_json`
+    returns `None` for a missing or malformed file but propagates
+    `UnicodeDecodeError` and `OSError` -- and `UnicodeDecodeError` is a sibling
+    of `JSONDecodeError` under `ValueError`, not a subclass, so its own
+    `except` does not catch it. An unreadable record left to escape here is
+    caught upstream by `Workspace.rebuild` and replaces the *entire* model with
+    an error, which this window renders as "No preflight records yet." -- the
+    one wrong answer, since it says nothing is there precisely when something is
+    there and cannot be read.
+    """
     from core import jsonl
 
-    directory = paths.preflight_dir()
-    files: list[Path] = []
-    if directory.exists():
-        files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files, listing_error = _safe(_preflight_files, [])
+    problems = [listing_error] if listing_error else []
 
     records = []
-    for path in files[:20]:
-        record = jsonl.read_json(path)
-        if isinstance(record, dict):
+    for path in (files or [])[:20]:
+        record, error = _safe(lambda p=path: jsonl.read_json(p))
+        if error:
+            problems.append(f"{path.name}: {error}")
+        elif isinstance(record, dict):
             records.append(record)
+    error = "; ".join(problems) or None
 
     if not records:
         return {
@@ -634,6 +667,7 @@ def preflight_model() -> dict[str, Any]:
             "current": None,
             "blocking": 0,
             "can_proceed": False,
+            "error": error,
             "empty_fix": "python -m tools.preflight run --spec <spec> --json",
         }
 
@@ -667,6 +701,7 @@ def preflight_model() -> dict[str, Any]:
         "blocking": blocking,
         "can_proceed": blocking == 0 and bool(rows),
         "remedy": next((r["fix"] for r in rows if r["state"] == "broken" and r.get("fix")), None),
+        "error": error,
         "empty_fix": "python -m tools.preflight run --spec <spec> --json",
     }
 
@@ -954,6 +989,7 @@ def evolve_model(campaign_id: str | None = None) -> dict[str, Any]:
             "champion_score": _score_of(champion_record) if champion_record else None,
             "delta": delta,
             "running": str(record.get("status")) == "open",
+            "halt_requested": bool(record.get("halt_requested")),
         },
         "error": error or cand_error,
     }
@@ -1155,13 +1191,18 @@ def wiki_model() -> dict[str, Any]:
     from tools import wiki as wiki_tool
 
     manifest_path = wiki_tool.output_dir() / "manifest.json"
-    manifest = jsonl.read_json(manifest_path)
+    # Guarded for the same reason as the preflight records: `read_json` returns
+    # `None` for missing and malformed, but lets `UnicodeDecodeError` and
+    # `OSError` through, and "the manifest is unreadable" must not render as
+    # "no wiki has been generated yet".
+    manifest, manifest_error = _safe(lambda: jsonl.read_json(manifest_path))
     if not isinstance(manifest, dict):
         return {
             "built": False,
             "stale": False,
             "scopes": [],
             "changed": [],
+            "error": manifest_error,
             "empty_fix": "python -m tools.wiki map --json",
         }
 

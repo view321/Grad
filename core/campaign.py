@@ -39,10 +39,11 @@ from core.errors import NotFound
 T_CAMPAIGN = "campaign"
 T_GENERATION = "campaign_generation"
 T_CAMPAIGN_CLOSED = "campaign_closed"
+T_HALT_REQUESTED = "campaign_halt_requested"
 T_CANDIDATE = "candidate"
 T_CANDIDATE_PROMOTED = "candidate_promoted"
 
-STATUSES = ("open", "closed", "exhausted", "failed")
+STATUSES = ("open", "closed", "exhausted", "failed", "halted")
 
 # Shinka's own markers, kept verbatim so a task directory works with the
 # upstream tool unmodified.
@@ -157,6 +158,10 @@ def campaigns() -> dict[str, dict[str, Any]]:
             node.setdefault("generation_log", []).append(
                 {k: v for k, v in rec.items() if k not in ("type", "id")}
             )
+        elif cid in folded and kind == T_HALT_REQUESTED:
+            folded[cid]["halt_requested"] = True
+            folded[cid]["halt_requested_at"] = rec.get("at")
+            folded[cid]["halt_reason"] = rec.get("reason")
         elif cid in folded and kind == T_CAMPAIGN_CLOSED:
             folded[cid]["status"] = rec.get("status", "closed")
             folded[cid]["closed_at"] = rec.get("at")
@@ -189,6 +194,30 @@ def close_campaign(campaign_id: str, *, status: str = "closed", reason: str = ""
         {"type": T_CAMPAIGN_CLOSED, "id": campaign_id, "at": now_iso(),
          "status": status, "reason": reason}
     )
+
+
+def request_halt(campaign_id: str, *, reason: str = "") -> dict[str, Any]:
+    """Ask a running campaign to stop at the next generation boundary.
+
+    A *request*, written to the ledger, rather than a signal: `evolve run` holds
+    the loop in whatever process started it -- usually the agent's -- and the UI
+    or a second terminal has no handle on it. An event both processes can see is
+    the only mechanism that works across all three callers, and it has the
+    side benefit of being diffable afterwards.
+
+    The boundary matters as much as the request. Killing the loop mid-generation
+    abandons an in-flight candidate, which goes stale and blocks every future
+    submission (exit 7) -- so `_drive` checks this exactly where the budget gate
+    already stops cleanly, with every candidate collected.
+    """
+    return append_campaign(
+        {"type": T_HALT_REQUESTED, "id": campaign_id, "at": now_iso(), "reason": reason}
+    )
+
+
+def halt_requested(campaign_id: str) -> bool:
+    record = campaigns().get(campaign_id) or {}
+    return bool(record.get("halt_requested"))
 
 
 # ---------------------------------------------------------------------------

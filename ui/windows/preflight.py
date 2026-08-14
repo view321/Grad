@@ -35,6 +35,10 @@ def chips(workspace: Any) -> list[tuple[str, str]]:
 
 def render(workspace: Any) -> None:
     model = workspace.model("preflight") or {}
+    # Before the empty state, not after: "no records yet" and "the records are
+    # there and cannot be read" look identical otherwise, and only one of them
+    # means you are clear to submit.
+    kit.error_strip(model.get("error"))
     current = model.get("current")
     if not current:
         kit.empty("No preflight records yet.", model.get("empty_fix"))

@@ -31,6 +31,7 @@ def build(workspace: Workspace) -> None:
     from nicegui import ui
 
     roots: dict[str, Any] = {}
+    bars: dict[str, Any] = {}
 
     with kit.el("div", "grad-app"):
         with kit.el("div", "grad-shell"):
@@ -61,7 +62,12 @@ def build(workspace: Workspace) -> None:
             _statusbar(workspace)
 
     def draw_window(window_id: str) -> None:
-        """Re-render one window's body in place, leaving its slot alone."""
+        """Re-render one window's title bar and body, leaving its slot alone."""
+        bar = bars.get(window_id)
+        if bar is not None:
+            bar.clear()
+            with bar:
+                _titlebar(workspace, window_id)
         root = roots.get(window_id)
         if root is None:
             return
@@ -80,6 +86,7 @@ def build(workspace: Workspace) -> None:
                 # take its iframe down with it.
                 _on_close(ui, window_id)
                 roots.pop(window_id).delete()
+                bars.pop(window_id, None)
                 workspace.unbind_window(window_id)
 
         with tiles:
@@ -93,7 +100,7 @@ def build(workspace: Workspace) -> None:
                         if slot_index:
                             _handle(vertical=True)
                         with kit.el("div", "grad-slot", style=f"--grad-fraction: {slot.fraction:.6f}"):
-                            _frame(workspace, slot.window, roots, attic, draw_window)
+                            _frame(workspace, slot.window, roots, bars, attic, draw_window)
 
     workspace.bind_chrome(draw_appbar)
     workspace.bind_chrome(draw_opener)
@@ -225,26 +232,23 @@ def _handle(*, vertical: bool) -> None:
             kit.el("span")
 
 
-def _frame(workspace: Workspace, window_id: str, roots: dict[str, Any], attic: Any, draw_window: Any) -> None:
+def _frame(
+    workspace: Workspace,
+    window_id: str,
+    roots: dict[str, Any],
+    bars: dict[str, Any],
+    attic: Any,
+    draw_window: Any,
+) -> None:
     """One window inside its slot: title bar, then the root moved back in."""
-    spec = registry.spec(window_id)
     focused = workspace.layout.focused == window_id
     with kit.el("div", f"grad-window {'focused' if focused else ''}".strip()) as frame:
         bar = kit.row("grad-titlebar")
         bar.props(f'data-window="{window_id}"')
         bar.on("click", lambda _=None, wid=window_id: workspace.focus(wid))
+        bars[window_id] = bar
         with bar:
-            kit.text(spec.name, "name")
-            kit.text(registry.subtitle(window_id, workspace), "subtitle")
-            for text, tone in registry.chips(window_id, workspace):
-                kit.chip(text, tone)
-            kit.spacer()
-            kit.button("⇱", tone="ghost", classes="grad-winctl", title="focus this pane",
-                       on_click=lambda _=None, wid=window_id: (workspace.focus(wid), workspace.preset("full")))
-            kit.button("⇲", tone="ghost", classes="grad-winctl", title="restore the tiled layout",
-                       on_click=lambda: workspace.preset("tile"))
-            kit.button("✕", tone="ghost", classes="grad-winctl", title="close",
-                       on_click=lambda _=None, wid=window_id: workspace.close(wid))
+            _titlebar(workspace, window_id)
 
     # Outside the `with`, on purpose: `move` sets the parent explicitly, and
     # doing it inside the block would append to whatever slot is current.
@@ -257,6 +261,29 @@ def _frame(workspace: Workspace, window_id: str, roots: dict[str, Any], attic: A
         with root:
             _render(workspace, window_id)
     root.move(frame)
+
+
+def _titlebar(workspace: Workspace, window_id: str) -> None:
+    """The bar's contents, refreshed on the same tick as the window's body.
+
+    Separated from `_frame` because the subtitle and the state chips are read
+    from the model, not from the layout: `EVOLVING` becomes `HALTING`, a verify
+    turns `NOT CITABLE` into `CITABLE`, an unjudged count moves. Drawing them
+    only when the panes are rebuilt left them stale until the next retile --
+    a chip that lags the thing it reports is worse than no chip.
+    """
+    spec = registry.spec(window_id)
+    kit.text(spec.name, "name")
+    kit.text(registry.subtitle(window_id, workspace), "subtitle")
+    for text, tone in registry.chips(window_id, workspace):
+        kit.chip(text, tone)
+    kit.spacer()
+    kit.button("⇱", tone="ghost", classes="grad-winctl", title="focus this pane",
+               on_click=lambda _=None, wid=window_id: (workspace.focus(wid), workspace.preset("full")))
+    kit.button("⇲", tone="ghost", classes="grad-winctl", title="restore the tiled layout",
+               on_click=lambda: workspace.preset("tile"))
+    kit.button("✕", tone="ghost", classes="grad-winctl", title="close",
+               on_click=lambda _=None, wid=window_id: workspace.close(wid))
 
 
 def _render(workspace: Workspace, window_id: str) -> None:

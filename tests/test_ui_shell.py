@@ -131,6 +131,51 @@ def test_a_stacked_column_gets_a_row_handle(rendered):
     assert len([h for h in handles if "row" in h.classes]) == 1
 
 
+def test_the_title_bar_tracks_the_model_not_just_the_layout(rendered):
+    """The subtitle and the state chips are read from the model: `EVOLVING`
+    becomes `HALTING`, a verify turns `NOT CITABLE` into `CITABLE`. Drawing them
+    only when the panes are rebuilt leaves them stale until the next retile, and
+    a chip that lags what it reports is worse than no chip."""
+    from core import campaign as campaign_mod, ledger_store as ls
+
+    campaign_mod.append_campaign(
+        {"type": campaign_mod.T_CAMPAIGN, "id": "camp-1", "status": "open",
+         "at": ls.now_iso(), "task_dir": "tasks/x"}
+    )
+    campaign_mod.append_candidate(
+        {"type": campaign_mod.T_CANDIDATE, "id": "c0", "campaign": "camp-1", "generation": 0,
+         "metrics": {"combined_score": 0.4}, "at": ls.now_iso()}
+    )
+    client, space = rendered(["evolve"])
+    assert "EVOLVING" in html_of(client)
+
+    campaign_mod.request_halt("camp-1", reason="from the workspace")
+    space.tick()          # a poll, with no retile
+    markup = html_of(client)
+    assert "HALTING" in markup
+    assert "EVOLVING" not in markup
+
+
+def test_a_verify_flips_the_notebook_chip_without_a_retile(rendered):
+    from core import ledger_store as ls
+    from ui import models
+
+    seed_everything()
+    client, space = rendered(["notebook"])
+    space.tick()
+    assert "NOT CITABLE" in html_of(client)
+
+    models.write_verify_record(
+        "x.ipynb", {"ok": True, "at": ls.now_iso(), "cells_executed": 12, "duration_s": 4.0}
+    )
+    space.tick()
+    markup = html_of(client)
+    # "CITABLE" is a substring of "NOT CITABLE", so the negative is the
+    # assertion that actually carries the test.
+    assert "NOT CITABLE" not in markup
+    assert "CITABLE" in markup
+
+
 def test_the_focused_window_is_marked(rendered):
     client, space = rendered(["chat", "ledger"])
     space.focus("ledger")

@@ -308,6 +308,49 @@ def test_a_check_that_never_ran_is_neither_passing_nor_blocking(workspace):
     assert models.preflight_model()["blocking"] == 0
 
 
+def test_an_unreadable_record_is_reported_not_swallowed(workspace):
+    """`jsonl.read_json` returns None for missing and malformed, but lets
+    `UnicodeDecodeError` through -- it is a sibling of `JSONDecodeError` under
+    `ValueError`, not a subclass. Left to escape, `Workspace.rebuild` catches it
+    upstream and the window renders "No preflight records yet.", which is the
+    one wrong answer: it says nothing is there exactly when something is there
+    and cannot be read."""
+    paths.preflight_dir().mkdir(parents=True, exist_ok=True)
+    (paths.preflight_dir() / "bad.json").write_bytes(b"\xff\xfe{}")
+    model = models.preflight_model()
+    assert model["current"] is None
+    assert "bad.json" in model["error"]
+    assert "UnicodeDecodeError" in model["error"]
+
+
+def test_one_unreadable_record_does_not_hide_the_readable_ones(workspace):
+    _preflight(workspace, {"tests": {"ok": True, "duration_s": 1.0}})
+    (paths.preflight_dir() / "bad.json").write_bytes(b"\xff\xfe{}")
+    model = models.preflight_model()
+    assert model["can_proceed"] is True
+    assert model["error"]
+
+
+def test_a_vanished_record_does_not_break_the_listing(workspace, monkeypatch):
+    """`preflight run` writes atomically, so a path returned by `glob` can be
+    gone by the time it is stat'd."""
+    _preflight(workspace, {"tests": {"ok": True}})
+    monkeypatch.setattr(
+        models.Path, "stat", lambda self, **k: (_ for _ in ()).throw(FileNotFoundError(self))
+    )
+    assert isinstance(models.preflight_model(), dict)
+
+
+def test_an_unreadable_wiki_manifest_is_not_reported_as_never_generated(workspace):
+    from tools import wiki as wiki_tool
+
+    wiki_tool.output_dir().mkdir(parents=True, exist_ok=True)
+    (wiki_tool.output_dir() / "manifest.json").write_bytes(b"\xff\xfe{}")
+    model = models.wiki_model()
+    assert model["built"] is False
+    assert "UnicodeDecodeError" in model["error"]
+
+
 def test_hash_warnings_survive_into_the_window(workspace):
     """The known gaps in the submission hash: dynamic imports and runtime-loaded
     files. Shown, not swallowed."""
@@ -454,6 +497,20 @@ def test_top_is_flattened_so_the_window_never_touches_metrics(workspace):
     top = models.evolve_model()["campaign"]["top"]
     assert top[0]["score"] == 0.71
     assert set(top[0]) == {"id", "generation", "score"}
+
+
+def test_a_requested_halt_is_visible_before_the_loop_reaches_a_boundary(workspace):
+    """The request is in the ledger but the generation is still running. The
+    window has to show that, or the button looks unpressed and gets pressed
+    again."""
+    from core import campaign as campaign_mod
+
+    _campaign(workspace, [0.4])
+    assert models.evolve_model()["campaign"]["halt_requested"] is False
+    campaign_mod.request_halt("camp-1", reason="too slow")
+    campaign = models.evolve_model()["campaign"]
+    assert campaign["halt_requested"] is True
+    assert campaign["running"] is True
 
 
 def test_an_unevaluated_campaign_has_no_champion_rather_than_a_fake_one(workspace):

@@ -20,7 +20,7 @@ import argparse
 import pytest
 
 from core import budget, campaign as camp, config as config_mod, ledger_store as ls, paths
-from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, GradError, UsageError
+from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, GradError, NotFound, UsageError
 from tools import evolve
 
 
@@ -470,3 +470,68 @@ def test_capabilities_names_the_granularity_it_found(workspace):
         assert isinstance(report["driver_viable"], bool)
     else:
         assert "shinka" in report["reason"]
+
+
+# ---------------------------------------------------------------------------
+# halting (the UI's ■ HALT, and the CLI behind it)
+# ---------------------------------------------------------------------------
+class HaltingMutator(FakeMutator):
+    """Requests a halt from inside generation 0, the way a human would from the
+    workspace while the loop is mid-generation."""
+
+    def __init__(self, campaign_getter, **kwargs):
+        super().__init__(**kwargs)
+        self._campaign = campaign_getter
+
+    def propose(self, *, generation, population, best):
+        if generation == 0:
+            camp.request_halt(self._campaign(), reason="halted from the workspace")
+        return super().propose(generation=generation, population=population, best=best)
+
+
+def test_a_halt_stops_the_loop_at_the_next_generation_boundary(workspace, monkeypatch):
+    """Not a kill. Stopping mid-generation would abandon an in-flight candidate,
+    which goes stale and blocks every future submission -- so the check sits at
+    the same boundary the budget gate stops at."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(
+        evolve, "_make_mutator",
+        lambda *a, **k: HaltingMutator(lambda: next(iter(camp.campaigns()))),
+    )
+    result = evolve.cmd_run(run_args(task_dir, make_expectation(), generations=5, population=2))
+
+    assert result["status"] == "halted"
+    # Generation 0 completed; generation 1 never started.
+    assert result["generations_run"] == 1
+    assert len(camp.candidates(result["campaign"])) == 2
+    # And nothing is left half-evaluated.
+    assert all(r.get("metrics") or r.get("error") for r in camp.candidates(result["campaign"]))
+    assert camp.campaign(result["campaign"])["status"] == "halted"
+
+
+def test_halt_is_a_request_the_ledger_carries(workspace, monkeypatch):
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(run_args(task_dir, make_expectation()))
+    campaign_id = result["campaign"]
+
+    # A closed campaign is told so rather than handed a request nothing reads.
+    payload = evolve.cmd_halt(argparse.Namespace(campaign=campaign_id, reason="", json=True))
+    assert payload["halted"] is False
+    assert "already" in payload["message"]
+    assert camp.halt_requested(campaign_id) is False
+
+
+def test_halt_on_an_open_campaign_records_the_request(workspace):
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    payload = evolve.cmd_halt(argparse.Namespace(campaign="camp-1", reason="too slow", json=True))
+    assert payload["halted"] is True
+    assert camp.halt_requested("camp-1") is True
+    assert camp.campaign("camp-1")["halt_reason"] == "too slow"
+
+
+def test_halting_an_unknown_campaign_is_a_not_found(workspace):
+    with pytest.raises(NotFound):
+        evolve.cmd_halt(argparse.Namespace(campaign="nope", reason="", json=True))
