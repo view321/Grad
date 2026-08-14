@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; background: #E8E2D4; }
+  a { color: #B04A2C; text-decoration: underline; text-underline-offset: 2px; }
+  a:hover { color: #14100C; background: #FFD400; }
+  @keyframes gradblink { 0%,49% { opacity: 1 } 50%,100% { opacity: 0 } }
+</style>
+</helmet>
+<div style="padding: 28px; background: #E8E2D4; font-family: 'Space Grotesk', Helvetica, sans-serif; color: #14100C;">
+<div style="width: 1500px; margin: 0 auto; display: flex; flex-direction: column; gap: 34px;">
+
+  <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 12px; border-bottom: 2px solid #14100C;">
+    <div style="font-family: 'Instrument Serif', Georgia, serif; font-size: 34px;">Grad — the remaining windows</div>
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.12em; opacity: 0.6;">SAME CHROME, SAME 2PX RULE, ONE ACCENT PER STATE</div>
+  </div>
+
+  <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8;">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">WIKI</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">RepoWiki · grad/scaling · indexed 2h ago</div>
+      <div style="flex: 1;"></div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px solid #14100C;">↻ REINDEX</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 8px 440px;">
+      <div style="display: flex; flex-direction: column; gap: 14px; padding: 16px 18px;">
+        <div style="display: flex; flex-direction: column; gap: 6px; align-self: flex-end; max-width: 80%;">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; opacity: 0.5; text-align: right;">YOU</div>
+          <div style="padding: 10px 12px; border: 2px solid #14100C; background: #FFFDF8; font-size: 14px;">Where does the sweep cache its tokenizer key?</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 8px; max-width: 92%;">
+          <div style="display: flex; align-items: center; gap: 7px;">
+            <div style="width: 16px; height: 16px; background: #FFD400; border: 1.5px solid #14100C; display: flex; align-items: center; justify-content: center; font-family: 'JetBrains Mono', monospace; font-size: 9px; font-weight: 700;">∇</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; opacity: 0.5;">WIKI</div>
+          </div>
+          <div style="font-size: 14px; line-height: 1.62;">In <a href="#">grad/scaling.py</a> the cache key is built from the tokenizer name at <span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 0 3px; background: #EFE8D8;">line 96</span><sup style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; color: #B04A2C;">[1]</sup>, but <span style="font-family: 'JetBrains Mono', monospace; font-size: 13px; padding: 0 3px; background: #EFE8D8;">val_loss</span> reads it back with the caller's name, not the cached one<sup style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; color: #B04A2C;">[2]</sup>. That mismatch is exactly the KeyError in cell 4.</div>
+          <div style="display: flex; gap: 7px;">
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 4px 8px; border: 2px solid #14100C; background: #FFD400;">→ OPEN IN EDITOR</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 4px 8px; border: 2px solid #14100C;">→ ASK GRAD TO PATCH</div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: flex-end; gap: 8px; margin-top: auto; padding-top: 12px;">
+          <div style="flex: 1; padding: 9px 11px; border: 2px solid #14100C; background: #FFFDF8; font-size: 14px; opacity: 0.45;">Ask the repo…</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 11px 12px; border: 2px solid #14100C; background: #FFD400;">⏎</div>
+        </div>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column; background: #EFE8D8;">
+        <div style="padding: 7px 12px; border-bottom: 2px solid #14100C; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">REFERENCES · 2</div>
+        <div style="padding: 12px; border-bottom: 1px solid rgba(20,16,12,0.2);">
+          <div style="display: flex; align-items: baseline; gap: 7px; margin-bottom: 6px;">
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 1px 5px; background: #14100C; color: #F7F3E8;">1</span>
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;">grad/scaling.py</span>
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.55;">L92–99</span>
+          </div>
+          <pre style="margin: 0; padding: 9px 10px; border: 1.5px solid #14100C; background: #FFFDF8; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.6; overflow-x: auto;">key = f"loss@{tok.name}"
+frame[key] = losses
+cache.put(cfg_hash, frame)</pre>
+        </div>
+        <div style="padding: 12px;">
+          <div style="display: flex; align-items: baseline; gap: 7px; margin-bottom: 6px;">
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 1px 5px; background: #14100C; color: #F7F3E8;">2</span>
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;">grad/scaling.py</span>
+            <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.55;">L146–149</span>
+          </div>
+          <pre style="margin: 0; padding: 9px 10px; border: 1.5px solid #A3122F; background: #FDEEF1; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.6; overflow-x: auto;">def val_loss(frame, tokenizer):
+    return frame[f"loss@{tokenizer}"]</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8;">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">PAPERS</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">cited by this project · 24</div>
+      <div style="flex: 1;"></div>
+      <div style="display: flex; gap: 5px;">
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C; background: #14100C; color: #F7F3E8;">CITED IN PAPER</div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C;">READ</div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C;">QUEUED</div>
+      </div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+    </div>
+    <div style="display: grid; grid-template-columns: 1fr 8px 520px;">
+      <div style="display: flex; flex-direction: column;">
+        <div style="display: flex; gap: 14px; padding: 14px 16px; border-bottom: 1px solid rgba(20,16,12,0.15); border-left: 6px solid #14100C; background: #FFFDF8;">
+          <div style="width: 70px; height: 92px; border: 1.5px solid #14100C; background: repeating-linear-gradient(0deg, #EFE8D8 0 4px, #F7F3E8 4px 8px); flex-shrink: 0;"></div>
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-family: 'Instrument Serif', Georgia, serif; font-size: 21px; line-height: 1.2;">Scaling Laws for Neural Language Models</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.6; margin: 4px 0 8px;">Kaplan et al. · 2020 · arXiv:2001.08361</div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; background: #FFD400;">3 CLAIMS DEPEND ON THIS</span>
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px solid #14100C;">Fig 3 · Fig 9</span>
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px solid #14100C;">PDF LOCAL</span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 14px; padding: 14px 16px; border-bottom: 1px solid rgba(20,16,12,0.15);">
+          <div style="width: 70px; height: 92px; border: 1.5px solid #14100C; background: repeating-linear-gradient(0deg, #EFE8D8 0 4px, #F7F3E8 4px 8px); flex-shrink: 0;"></div>
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-family: 'Instrument Serif', Georgia, serif; font-size: 21px; line-height: 1.2;">Training Compute-Optimal Large Language Models</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.6; margin: 4px 0 8px;">Hoffmann et al. · 2022 · arXiv:2203.15556</div>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; background: #12A594; color: #04302C;">CONTRADICTS exp-79f4</span>
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px solid #14100C;">Tab 3</span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 14px; padding: 14px 16px;">
+          <div style="width: 70px; height: 92px; border: 1.5px dashed #14100C; flex-shrink: 0;"></div>
+          <div style="flex: 1; min-width: 0;">
+            <div style="font-family: 'Instrument Serif', Georgia, serif; font-size: 21px; line-height: 1.2; opacity: 0.75;">The Depth-to-Width Interplay in Self-Attention</div>
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.6; margin: 4px 0 8px;">Levine et al. · 2020 · arXiv:2006.12467</div>
+            <div style="display: flex; gap: 6px;">
+              <span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px dashed #14100C;">QUEUED BY GRAD · not read</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column; background: #EFE8D8;">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-bottom: 2px solid #14100C;">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">READER · Kaplan 2020</div>
+          <div style="flex: 1;"></div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.6;">p. 8 / 30</div>
+        </div>
+        <div style="flex: 1; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+          <div style="height: 214px; border: 2px solid #14100C; background: repeating-linear-gradient(135deg, #F1EADA 0 8px, #E7DFCC 8px 16px); display: flex; align-items: center; justify-content: center;">
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 6px 10px; background: #F7F3E8; border: 1.5px solid #14100C;">PDF page — Fig 3 highlighted</div>
+          </div>
+          <div style="padding: 10px 11px; border: 2px solid #14100C; background: #FFD400;">
+            <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.12em; margin-bottom: 5px;">PULLED INTO exp-7c41</div>
+            <div style="font-size: 13.5px; line-height: 1.5;">Loss at 1.3B params, 1e9 tokens sits in 2.88–3.06 after tokenizer correction.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8;">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">EVOLVE</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">ShinkaEvolve · run ev-014 · gen 12 / 40</div>
+      <div style="flex: 1;"></div>
+      <div style="display: flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 2px 8px; background: #12A594; color: #04302C;"><span style="width: 7px; height: 7px; background: #04302C;"></span>EVOLVING</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C;">■ HALT</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+    </div>
+    <div style="display: grid; grid-template-columns: 300px 8px 1fr 8px 420px;">
+      <div style="display: flex; flex-direction: column; background: #EFE8D8;">
+        <div style="padding: 7px 12px; border-bottom: 2px solid #14100C; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">POPULATION</div>
+        <div style="padding: 12px; display: flex; flex-direction: column; gap: 9px; font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+          <div style="display: flex; justify-content: space-between;"><span style="opacity: 0.6;">island A</span><span>16 alive · best 2.86</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="opacity: 0.6;">island B</span><span>16 alive · best 2.91</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="opacity: 0.6;">migrations</span><span>4</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="opacity: 0.6;">novelty</span><span>0.41</span></div>
+          <div style="display: flex; justify-content: space-between;"><span style="opacity: 0.6;">spend</span><span>$0.94 / $3.00</span></div>
+        </div>
+        <div style="padding: 0 12px 12px;">
+          <div style="padding: 9px 10px; border: 2px dashed #14100C; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; line-height: 1.55;">objective: minimise L_val at fixed 6NT, penalise param count above 1.4B</div>
+        </div>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column;">
+        <div style="padding: 7px 12px; border-bottom: 2px solid #14100C; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em; background: #EFE8D8;">LINEAGE — BEST PER GENERATION</div>
+        <div style="flex: 1; padding: 16px; display: flex; align-items: flex-end; gap: 5px; height: 210px; box-sizing: border-box;">
+          <div style="flex: 1; height: 26%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 34%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 31%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 45%; background: #FFD400; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 43%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 52%; background: #FFD400; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 49%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 61%; background: #FFD400; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 58%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 72%; background: #FFD400; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 69%; background: #EFE8D8; border: 1.5px solid #14100C;"></div>
+          <div style="flex: 1; height: 88%; background: #12A594; border: 1.5px solid #14100C;"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; padding: 0 16px 12px; font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.6;"><span>gen 1</span><span>fitness = −L_val</span><span>gen 12</span></div>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column; background: #FFFDF8;">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">DIFF — CHAMPION g12</div>
+          <div style="flex: 1;"></div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 1px 6px; background: #12A594; color: #04302C;">2.86 ↓0.08</div>
+        </div>
+        <pre style="margin: 0; padding: 12px 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.65; overflow-x: auto;"><span style="opacity: 0.5;">@@ grad/model.py L64 @@</span>
+<span style="background: #FDEEF1; color: #7A1024;">- attn = MHA(d, heads=d // 64)</span>
+<span style="background: #DFF3EF; color: #04302C;">+ attn = MHA(d, heads=d // 96,</span>
+<span style="background: #DFF3EF; color: #04302C;">+           qk_norm=True)</span>
+<span style="opacity: 0.5;">@@ grad/train.py L21 @@</span>
+<span style="background: #FDEEF1; color: #7A1024;">- warmup = 1000</span>
+<span style="background: #DFF3EF; color: #04302C;">+ warmup = 2500</span></pre>
+        <div style="display: flex; gap: 7px; padding: 0 14px 14px;">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 5px 9px; border: 2px solid #14100C; background: #FFD400;">✓ ADOPT INTO MAIN</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 5px 9px; border: 2px solid #14100C;">→ SEND TO NOTEBOOK</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8;">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">EDITOR</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">paper/main.tex · §4 Results</div>
+      <div style="flex: 1;"></div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C;">⌘S SAVE</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C; background: #FFD400;">BUILD PDF</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+    </div>
+    <div style="display: grid; grid-template-columns: 190px 8px 1fr 8px 1fr;">
+      <div style="display: flex; flex-direction: column; background: #EFE8D8; font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+        <div style="padding: 7px 12px; border-bottom: 2px solid #14100C; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">OUTLINE</div>
+        <div style="padding: 8px 12px; opacity: 0.7;">1 Introduction</div>
+        <div style="padding: 8px 12px; opacity: 0.7;">2 Setup</div>
+        <div style="padding: 8px 12px; opacity: 0.7;">3 Method</div>
+        <div style="padding: 8px 12px; font-weight: 700; background: #14100C; color: #F7F3E8;">4 Results</div>
+        <div style="padding: 8px 12px 8px 24px; opacity: 0.7;">4.1 Width vs depth</div>
+        <div style="padding: 8px 12px 8px 24px; opacity: 0.7;">4.2 Tokenizer</div>
+        <div style="padding: 8px 12px; opacity: 0.7;">5 Discussion</div>
+        <div style="margin: 12px; padding: 9px 10px; border: 2px solid #A3122F; background: #FDEEF1; font-size: 10.5px; line-height: 1.5; color: #5A1020;"><strong>2 claims uncited.</strong> Grad blocks the build until each is bound to a run or a paper.</div>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column;">
+        <div style="padding: 7px 12px; border-bottom: 2px solid #14100C; font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em; background: #EFE8D8;">SOURCE</div>
+        <pre style="margin: 0; padding: 14px 16px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.75; overflow-x: auto;"><span style="color:#8A8272;">\subsection</span>{Width vs depth}
+
+At fixed compute the widest configuration wins:
+<span style="color:#8A8272;">\gradcite</span>{<span style="color:#0B7B6E;">run-8f21</span>} reaches <span style="color:#8A8272;">$L_{val}=2.94$</span>, inside the
+band registered as <span style="color:#8A8272;">\gradexp</span>{<span style="color:#0B7B6E;">exp-7c41</span>}.
+
+<span style="background:#FDEEF1; color:#7A1024;">Depth beyond 12 layers does not help.</span>  <span style="color:#9C9484;">% uncited</span>
+
+<span style="color:#8A8272;">\begin</span>{figure}
+  <span style="color:#8A8272;">\includegraphics</span>{figures/loss_band.png}
+  <span style="color:#8A8272;">\caption</span>{Nine configurations against the band.}
+<span style="color:#8A8272;">\end</span>{figure}</pre>
+      </div>
+      <div style="background: #14100C;"></div>
+      <div style="display: flex; flex-direction: column; background: #FFFDF8;">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.14em;">PREVIEW</div>
+          <div style="flex: 1;"></div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.6;">built 14s ago</div>
+        </div>
+        <div style="padding: 20px 24px; font-family: 'Instrument Serif', Georgia, serif;">
+          <div style="font-size: 19px; margin-bottom: 10px;">4.1&nbsp;&nbsp;Width vs depth</div>
+          <div style="font-size: 14.5px; line-height: 1.72; text-align: justify; font-family: 'Space Grotesk', sans-serif;">At fixed compute the widest configuration wins: run-8f21 reaches <span style="font-style: italic; font-family: 'Instrument Serif', serif; font-size: 16px;">L</span><span style="font-size: 11px; vertical-align: sub;">val</span> = 2.94, inside the band registered as exp-7c41. <span style="background: #FDEEF1; border-bottom: 2px solid #A3122F;">Depth beyond 12 layers does not help.</span></div>
+          <div style="margin-top: 14px; height: 118px; border: 1.5px solid #14100C; background: repeating-linear-gradient(135deg, #F1EADA 0 8px, #E7DFCC 8px 16px);"></div>
+          <div style="margin-top: 7px; font-size: 12px; opacity: 0.7; font-family: 'Space Grotesk', sans-serif;">Figure 4: Nine configurations against the band.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 28px;">
+
+    <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8; display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">PREFLIGHT</div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">before any spend</div>
+        <div style="flex: 1;"></div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+      </div>
+      <div style="display: flex; flex-direction: column;">
+        <div style="display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid rgba(20,16,12,0.15);">
+          <div style="width: 18px; height: 18px; border: 2px solid #14100C; background: #12A594; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #04302C;">✓</div>
+          <div style="font-size: 13.5px; flex: 1;">Expectation registered and falsifiable</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.55;">exp-7c41</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid rgba(20,16,12,0.15);">
+          <div style="width: 18px; height: 18px; border: 2px solid #14100C; background: #12A594; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #04302C;">✓</div>
+          <div style="font-size: 13.5px; flex: 1;">Notebook verifies on a fresh kernel</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.55;">41.8s</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid rgba(20,16,12,0.15); background: #FFFBE8;">
+          <div style="width: 18px; height: 18px; border: 2px solid #14100C; background: #FFD400; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700;">!</div>
+          <div style="font-size: 13.5px; flex: 1;">Seed is fixed but the dataloader is not</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 6px; border: 1.5px solid #14100C;">FIX</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 2px solid #14100C;">
+          <div style="width: 18px; height: 18px; border: 2px solid #A3122F; background: #A3122F; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: #FFF;">✕</div>
+          <div style="font-size: 13.5px; flex: 1;">Estimated spend exceeds the step cap</div>
+          <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; color: #A3122F;">$1.80 &gt; $1.00</div>
+        </div>
+      </div>
+      <div style="padding: 12px 14px; display: flex; align-items: center; gap: 9px;">
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 7px 11px; border: 2px solid #14100C; background: #EFE8D8; opacity: 0.5;">▶ PROCEED</div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 7px 11px; border: 2px solid #14100C; background: #FFD400;">RAISE CAP TO $2.00</div>
+        <div style="flex: 1;"></div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; opacity: 0.55;">1 blocking</div>
+      </div>
+    </div>
+
+    <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8; display: flex; flex-direction: column;">
+      <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">FUNNEL</div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">retrieval for “tokenizer cache key”</div>
+        <div style="flex: 1;"></div>
+        <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+      </div>
+      <div style="padding: 16px 14px; display: flex; flex-direction: column; gap: 10px;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <div style="width: 100%; height: 34px; border: 2px solid #14100C; background: #EFE8D8; display: flex; align-items: center; padding: 0 11px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-weight: 700;">CORPUS · 1 284 chunks</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-left: 8%;">
+          <div style="width: 84%; height: 34px; border: 2px solid #14100C; background: #EFE8D8; display: flex; align-items: center; justify-content: space-between; padding: 0 11px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;"><span style="font-weight: 700;">BM25 + EMBED</span><span style="opacity: 0.6;">→ 96</span></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-left: 20%;">
+          <div style="width: 60%; height: 34px; border: 2px solid #14100C; background: #FFD400; display: flex; align-items: center; justify-content: space-between; padding: 0 11px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;"><span style="font-weight: 700;">RERANK</span><span>→ 12</span></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-left: 32%;">
+          <div style="width: 36%; height: 34px; border: 2px solid #14100C; background: #12A594; color: #04302C; display: flex; align-items: center; justify-content: space-between; padding: 0 11px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;"><span style="font-weight: 700;">IN CONTEXT</span><span>4</span></div>
+        </div>
+        <div style="margin-top: 4px; border-top: 1px dashed rgba(20,16,12,0.35); padding-top: 10px; display: flex; flex-direction: column; gap: 7px; font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+          <div style="display: flex; gap: 9px;"><span style="width: 22px; font-weight: 700;">1.</span><span style="flex: 1;">grad/scaling.py L92–99</span><span style="opacity: 0.6;">0.88</span></div>
+          <div style="display: flex; gap: 9px;"><span style="width: 22px; font-weight: 700;">2.</span><span style="flex: 1;">grad/scaling.py L146–149</span><span style="opacity: 0.6;">0.84</span></div>
+          <div style="display: flex; gap: 9px;"><span style="width: 22px; font-weight: 700;">3.</span><span style="flex: 1;">tests/test_cache.py L30</span><span style="opacity: 0.6;">0.61</span></div>
+          <div style="display: flex; gap: 9px; opacity: 0.45;"><span style="width: 22px; font-weight: 700;">4.</span><span style="flex: 1;">docs/cache.md</span><span>0.55 · dropped, stale</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="border: 2px solid #14100C; box-shadow: 6px 6px 0 #14100C; background: #F7F3E8;">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-bottom: 2px solid #14100C; background: #EFE8D8;">
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; letter-spacing: 0.14em;">QUEUE</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.55;">runs &amp; GPU · 1 of 2 busy</div>
+      <div style="flex: 1;"></div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 700; padding: 2px 7px; border: 1.5px solid #14100C;">+ ENQUEUE</div>
+      <div style="font-family: 'JetBrains Mono', monospace; font-size: 11px; opacity: 0.5;">⇱ ⇲ ✕</div>
+    </div>
+    <table style="border-collapse: collapse; width: 100%; font-family: 'JetBrains Mono', monospace; font-size: 12px;">
+      <thead><tr style="background: #14100C; color: #F7F3E8;">
+        <th style="text-align: left; padding: 7px 14px; letter-spacing: 0.06em;">job</th>
+        <th style="text-align: left; padding: 7px 14px;">what</th>
+        <th style="text-align: left; padding: 7px 14px;">device</th>
+        <th style="text-align: left; padding: 7px 14px; width: 260px;">progress</th>
+        <th style="text-align: right; padding: 7px 14px;">eta</th>
+        <th style="text-align: right; padding: 7px 14px;">cost</th>
+        <th style="text-align: left; padding: 7px 14px;">state</th>
+      </tr></thead>
+      <tbody>
+        <tr style="border-bottom: 1px solid rgba(20,16,12,0.15); background: #FFFDF8;">
+          <td style="padding: 9px 14px; font-weight: 700;">job-221</td><td style="padding: 9px 14px;">sweep w1024 d12 · bpe-50k</td><td style="padding: 9px 14px;">cuda:0 · 4090</td>
+          <td style="padding: 9px 14px;"><div style="height: 12px; border: 1.5px solid #14100C; display: flex;"><div style="width: 68%; background: #12A594;"></div></div></td>
+          <td style="padding: 9px 14px; text-align: right;">6m 10s</td><td style="padding: 9px 14px; text-align: right;">$0.61</td>
+          <td style="padding: 9px 14px;"><span style="padding: 1px 6px; background: #12A594; color: #04302C; font-weight: 700; font-size: 11px;">RUNNING</span></td>
+        </tr>
+        <tr style="border-bottom: 1px solid rgba(20,16,12,0.15);">
+          <td style="padding: 9px 14px; font-weight: 700;">job-222</td><td style="padding: 9px 14px;">sweep w512 d16 · bpe-50k</td><td style="padding: 9px 14px;">cuda:1 · queued</td>
+          <td style="padding: 9px 14px;"><div style="height: 12px; border: 1.5px dashed rgba(20,16,12,0.4);"></div></td>
+          <td style="padding: 9px 14px; text-align: right;">—</td><td style="padding: 9px 14px; text-align: right;">~$0.58</td>
+          <td style="padding: 9px 14px;"><span style="padding: 1px 6px; background: #FFD400; font-weight: 700; font-size: 11px;">WAITING GATE</span></td>
+        </tr>
+        <tr style="border-bottom: 1px solid rgba(20,16,12,0.15);">
+          <td style="padding: 9px 14px; font-weight: 700;">job-220</td><td style="padding: 9px 14px;">evolve gen 12 eval</td><td style="padding: 9px 14px;">cuda:0</td>
+          <td style="padding: 9px 14px;"><div style="height: 12px; border: 1.5px solid #14100C; display: flex;"><div style="width: 100%; background: #14100C;"></div></div></td>
+          <td style="padding: 9px 14px; text-align: right;">done</td><td style="padding: 9px 14px; text-align: right;">$0.34</td>
+          <td style="padding: 9px 14px;"><span style="padding: 1px 6px; border: 1.5px solid #14100C; font-weight: 700; font-size: 11px;">DONE</span></td>
+        </tr>
+        <tr>
+          <td style="padding: 9px 14px; font-weight: 700;">job-219</td><td style="padding: 9px 14px;">sweep w256 d8 · bpe-32k</td><td style="padding: 9px 14px;">cuda:1</td>
+          <td style="padding: 9px 14px;"><div style="height: 12px; border: 1.5px solid #A3122F; display: flex;"><div style="width: 31%; background: #A3122F;"></div></div></td>
+          <td style="padding: 9px 14px; text-align: right;">—</td><td style="padding: 9px 14px; text-align: right;">$0.12</td>
+          <td style="padding: 9px 14px;"><span style="padding: 1px 6px; background: #A3122F; color: #FFF; font-weight: 700; font-size: 11px;">FAILED · KeyError</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1560,&quot;height&quot;:2400}}"></script>
+</body>
+</html>

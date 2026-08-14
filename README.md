@@ -189,8 +189,15 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   haiku.py            funnel stages 0 and 3, via forced SDK tools
   http.py             Semantic Scholar, rerank, embeddings, Context7
 tools/                the CLIs
-ui/                   NiceGUI app and the widgets
-config/jupyter/       the Lab server config: framing headers and overrides
+ui/                   the NiceGUI workspace: a tiling shell over eleven windows
+  tokens.py           the design tokens; the stylesheet is generated from them
+  layout.py           the pane tree and the moves over it   -- pure, tested
+  models.py           what each window shows, as plain data -- pure, tested
+  registry.py         the one list of windows the shell is derived from
+  shell.py            the chrome, and how a window survives a retile
+  windows/            eleven renderers, none of which read a ledger directly
+  jupyter_theme.py    the same tokens, emitted as JupyterLab's custom.css
+config/jupyter/       the Lab server config: framing headers, overrides, theme
 skills/               loaded on demand, not into the default context
 ledger/               expectations.jsonl, runs.jsonl, quota.jsonl, projects.jsonl,
                       campaigns.jsonl, candidates.jsonl, preflight records

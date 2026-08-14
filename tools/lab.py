@@ -174,6 +174,11 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     argv = [
         executable, "lab",
         "--no-browser",
+        # Loads config/jupyter/custom/custom.css, which is the Grad Paper theme
+        # (see ui/jupyter_theme.py). Without this flag JupyterLab ignores the
+        # file entirely and the iframe renders as stock Lab inside Grad's own
+        # chrome -- a visible seam exactly where the design says there is none.
+        "--custom-css",
         f"--port={port}",
         "--ip=127.0.0.1",
         f"--IdentityProvider.token={token}",

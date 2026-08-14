@@ -55,10 +55,15 @@ window.gradRenderMath = function (selector) {{
 
 
 def install(app) -> None:
-    """Register the head HTML and, when the assets are vendored, serve them."""
+    """Register the head HTML and, when the assets are vendored, serve them.
+
+    `shared=True`: this runs at global scope next to a `@ui.page` route, and
+    NiceGUI will not guess whether such markup belongs to one page or to all of
+    them. KaTeX belongs to all of them.
+    """
     from nicegui import ui
 
-    ui.add_head_html(head_html())
+    ui.add_head_html(head_html(), shared=True)
     if assets_present():
         app.add_static_files("/katex", str(ASSET_DIR))
 

@@ -231,9 +231,12 @@ money".
 
 ### UI
 
-The header meter ([ui/widgets/quota_meter.py](ui/widgets/quota_meter.py)) gains a project
-selector and shows three bars rather than one. The Quota tab gains a per-project breakdown by
-stage. Both read the ledger; no new logic in the UI, per §10.
+The header meter ([ui/models.py](ui/models.py) `quota_model`, rendered by
+[ui/windows/quota.py](ui/windows/quota.py)) gains a project selector and shows three bars
+rather than one. The Quota window gains a per-project breakdown by stage. Both read the
+ledger; no new logic in the UI, per §10. (The tab strip and `ui/widgets/*` this section
+originally named were replaced by the window system; the behaviour described here is
+unchanged.)
 
 ---
 
