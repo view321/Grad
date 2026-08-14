@@ -33,11 +33,23 @@ cli = Cli(
 def _summary_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--days", type=int, help="restrict to the last N days")
     p.add_argument("--stage", help="only this stage")
+    p.add_argument("--role", help="only this model role (research, evolve, expand, triage, report, cite)")
+    p.add_argument("--project", help="only this project's usage")
 
 
-@cli.command("summary", "totals by stage", setup=_summary_args)
+@cli.command("summary", "totals by stage, role, and project", setup=_summary_args)
 def cmd_summary(args: argparse.Namespace) -> dict[str, Any]:
-    summary = quota_log.summarise(args.days)
+    """`--role` is what answers "what did Opus cost me this week" without
+    inferring the role from a model id (§16)."""
+    summary = quota_log.summarise(args.days, project=args.project)
+    if args.role:
+        by_role = summary["by_role"]
+        if args.role not in by_role:
+            raise UsageError(
+                f"no usage recorded for role {args.role!r}",
+                fix=f"known roles: {', '.join(by_role) or '(none yet)'}",
+            )
+        summary["by_role"] = {args.role: by_role[args.role]}
     if args.stage:
         by_stage = summary["by_stage"]
         if args.stage not in by_stage:
@@ -108,6 +120,8 @@ def _record_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--output-tokens", type=int, default=0)
     p.add_argument("--credits-usd", type=float, default=0.0)
     p.add_argument("--unit", choices=["quota", "credits"], default="quota")
+    p.add_argument("--role", help="the §16 model role this call filled")
+    p.add_argument("--project", help="override the current project for this record")
     p.add_argument("--session")
 
 
@@ -128,6 +142,8 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
             output_tokens=args.output_tokens,
             credits_usd=args.credits_usd,
             unit=args.unit,
+            role=args.role,
+            project=args.project,
             session=args.session,
         )
     }

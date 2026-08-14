@@ -26,6 +26,10 @@ HF_TOKEN = "hf_token"
 OPENROUTER_KEY = "openrouter_key"
 VOYAGE_KEY = "voyage_key"
 S2_KEY = "s2_api_key"
+# The fifth entry (HANDOFF-2 §18). Free from Context7's dashboard; raises rate
+# limits rather than unlocking anything, so `tools/docs.py` treats it as
+# optional and says so when it is missing.
+CONTEXT7_KEY = "context7_key"
 
 
 def _keyring() -> Any:
@@ -93,7 +97,10 @@ def present(name: str) -> bool:
 
 def status() -> dict[str, bool]:
     """Which credentials exist. Values are never returned."""
-    return {n: present(n) for n in (HF_TOKEN, OPENROUTER_KEY, VOYAGE_KEY, S2_KEY)}
+    return {
+        n: present(n)
+        for n in (HF_TOKEN, OPENROUTER_KEY, VOYAGE_KEY, S2_KEY, CONTEXT7_KEY)
+    }
 
 
 def _env_fallback_allowed() -> bool:
@@ -115,6 +122,7 @@ def scrub_environment() -> list[str]:
         "HUGGING_FACE_HUB_TOKEN",
         "OPENROUTER_API_KEY",
         "VOYAGE_API_KEY",
+        "CONTEXT7_API_KEY",
         # The GRAD_* fallbacks too. They exist for CI and first-run bootstrap,
         # where no agent is running; leaving them in place under the agent would
         # hand it exactly the environment-resident credentials §9 argues must
@@ -124,6 +132,7 @@ def scrub_environment() -> list[str]:
         f"GRAD_{OPENROUTER_KEY.upper()}",
         f"GRAD_{VOYAGE_KEY.upper()}",
         f"GRAD_{S2_KEY.upper()}",
+        f"GRAD_{CONTEXT7_KEY.upper()}",
     ):
         if os.environ.pop(var, None) is not None:
             removed.append(var)

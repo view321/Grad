@@ -68,7 +68,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     hyde = None
     if not args.no_expand:
         expansion = haiku.expand(
-            args.question, model=str(cfg.get("retrieval", "expand_model")), log_name=log_name
+            args.question, model=cfg.model_for("expand"), log_name=log_name
         )
         queries = list(expansion["queries"])
         hyde = expansion["hyde"]
@@ -147,7 +147,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     survivors = ranked[:top]
     if not args.no_triage and ranked:
         verdicts = haiku.triage(
-            args.question, ranked, model=str(cfg.get("retrieval", "triage_model")), log_name=log_name
+            args.question, ranked, model=cfg.model_for("triage"), log_name=log_name
         )
         reasons = {v["id"]: v.get("reason", "") for v in verdicts if v.get("keep")}
         kept = [c for c in ranked if c["id"] in reasons]

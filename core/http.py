@@ -172,6 +172,157 @@ class SemanticScholar:
 
 
 # ---------------------------------------------------------------------------
+# Context7 (HANDOFF-2 §18) -- what is *current*, as opposed to what is installed
+# ---------------------------------------------------------------------------
+class Context7:
+    """Library documentation over plain HTTP.
+
+    This is the second instance of an existing pattern, not a new one: §5
+    already reaches Asta's MCP endpoint over streamable HTTP "without adopting
+    MCP as an architecture", and the same applies here. `tools/docs.py` wraps it
+    rather than allowlisting the official `ctx7` CLI, because the `--json` /
+    exit-code / `fix`-field contract is what makes a tool legible to the model
+    (§8) and `ctx7` does not have it -- and because this is where the credential
+    fetch and the cache live. Documentation lookups repeat heavily, and
+    `core/http.py` already has the TTL cache and the rate limiter.
+
+    The endpoint paths and the response keys below are verified against the live
+    API. They remain configurable because a third-party API can move, and a 404
+    should be a one-line config edit rather than a code change -- the error says
+    which path it tried, so the mismatch names itself.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.base = str(cfg.get("docs", "base", "https://context7.com")).rstrip("/")
+        self.resolve_path = str(cfg.get("docs", "resolve_path", "/api/v2/libs/search"))
+        self.docs_path = str(cfg.get("docs", "docs_path", "/api/v2/context"))
+        self.timeout = float(cfg.get("docs", "request_timeout_s", 30))
+        self.ttl = float(cfg.get("docs", "cache_ttl_s", 86400))
+        self.interval = float(cfg.get("docs", "min_request_interval_s", 0.5))
+        # Free from their dashboard, and it raises rate limits rather than
+        # unlocking anything -- so its absence is a note, not an error. That
+        # includes the case where the credential *store* is unreachable: on a
+        # machine with no keyring installed, `credentials.get` raises even for
+        # an optional credential, and letting that propagate would make an
+        # anonymous lookup impossible for want of a key it does not need.
+        try:
+            self.key = credentials.get(credentials.CONTEXT7_KEY, required=False)
+        except ConfigError:
+            self.key = None
+
+    @property
+    def authenticated(self) -> bool:
+        return bool(self.key)
+
+    def _get(self, path: str, params: dict[str, Any]) -> Any:
+        url = f"{self.base}{path}"
+        key = f"ctx7:{url}:{json.dumps(params, sort_keys=True)}:{bool(self.key)}"
+        hit = _cached(key, self.ttl)
+        if hit is not None:
+            return hit
+        _throttle("context7", self.interval)
+        httpx = _httpx()
+        headers = {"Accept": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        try:
+            resp = httpx.get(url, params=params, headers=headers, timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise UpstreamError(
+                f"Context7 request failed: {exc}",
+                fix="retry, or run `python -m tools.docs check <file>` which works offline",
+            ) from exc
+        if resp.status_code == 401:
+            raise UpstreamError(
+                "Context7 rejected the credential",
+                fix=f"python -m tools.jobs credential set {credentials.CONTEXT7_KEY}",
+            )
+        if resp.status_code == 429:
+            raise UpstreamError(
+                "Context7 rate-limited the request",
+                fix=(
+                    "wait, or store a free key to raise the limit: "
+                    f"python -m tools.jobs credential set {credentials.CONTEXT7_KEY}"
+                ),
+            )
+        if resp.status_code == 404:
+            raise UpstreamError(
+                f"Context7 returned 404 for {url}",
+                fix=(
+                    "the API may have moved: read context7.com/docs/api-guide and set "
+                    "[docs] base / resolve_path / docs_path in config/grad.toml"
+                ),
+            )
+        if resp.status_code >= 400:
+            raise UpstreamError(
+                f"Context7 returned {resp.status_code}: {resp.text[:200]}",
+                fix="check the library id and the query",
+            )
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 - the docs endpoint may serve text
+            data = {"text": resp.text}
+        _store(key, data)
+        return data
+
+    def resolve(self, name: str) -> list[dict[str, Any]]:
+        """Library name -> candidate Context7 library ids.
+
+        The MCP tool this mirrors is `resolve-library-id`; note that the docs
+        tool is `query-docs`, and `get-library-docs` in older material is stale.
+        """
+        data = self._get(self.resolve_path, {"libraryName": name, "query": name})
+        results = data.get("results") if isinstance(data, dict) else data
+        out = []
+        for item in results or []:
+            if not isinstance(item, dict):
+                continue
+            out.append(
+                {
+                    "library_id": item.get("id") or item.get("libraryId") or item.get("settings", {}).get("project"),
+                    "title": item.get("title") or item.get("name"),
+                    "description": item.get("description", ""),
+                    "trust_score": item.get("trustScore") or item.get("trust_score"),
+                    "snippets": item.get("totalSnippets") or item.get("snippets"),
+                    "versions": item.get("versions") or [],
+                }
+            )
+        return [o for o in out if o["library_id"]]
+
+    def docs(self, library_id: str, query: str, *, tokens: int = 5000) -> dict[str, Any]:
+        """Documentation for a library, narrowed by a topic query.
+
+        `type=json` matters: without it the endpoint returns markdown prose,
+        which is fine for a human and useless as a `--json` payload.
+        """
+        params = {"libraryId": library_id, "query": query, "tokens": tokens, "type": "json"}
+        # A path template is still honoured, so an older `/{library_id}` style
+        # endpoint keeps working from config alone.
+        if "{library_id}" in self.docs_path:
+            path = self.docs_path.format(library_id=library_id.lstrip("/"))
+            params.pop("libraryId")
+            params["topic"] = params.pop("query")
+        else:
+            path = self.docs_path
+        data = self._get(path, params)
+
+        if isinstance(data, dict) and "text" in data and len(data) == 1:
+            return {"library_id": library_id, "query": query, "text": data["text"]}
+        # The key differs by API version -- `codeSnippets` on v2, `snippets` on
+        # v1 -- and reading only one of them turns a working response into an
+        # empty result that looks like "this library has no docs".
+        snippets = None
+        if isinstance(data, dict):
+            snippets = data.get("codeSnippets") or data.get("snippets")
+        return {
+            "library_id": library_id,
+            "query": query,
+            "snippets": snippets or [],
+            "raw": None if snippets else data,
+        }
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter rerank (credits, not quota)
 # ---------------------------------------------------------------------------
 def rerank(query: str, documents: Sequence[str], *, cfg: Config, top_n: int) -> list[dict[str, Any]]:

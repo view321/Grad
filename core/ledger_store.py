@@ -169,6 +169,13 @@ class Run:
     def is_smoke(self) -> bool:
         return bool(self.data.get("smoke"))
 
+    @property
+    def project(self) -> str:
+        """HANDOFF-2 §15. Records written before the dimension existed fold as
+        `unassigned`, which is what keeps this an additive schema change rather
+        than a migration."""
+        return str(self.data.get("project") or "unassigned")
+
     def cost_for_ceiling(self) -> float:
         """Actual once collected, estimate while in flight.
 
@@ -307,14 +314,23 @@ def stale_runs(*, cfg: Any = None, now: _dt.datetime | None = None) -> list[Run]
     return [r for r in in_flight() if is_stale(r, cfg=cfg, now=now)]
 
 
-def rolling_spend(window_days: int = 30, *, now: _dt.datetime | None = None) -> dict[str, Any]:
-    """Rolling total: actuals for collected runs, estimates for in-flight ones."""
+def rolling_spend(
+    window_days: int = 30, *, now: _dt.datetime | None = None, project: str | None = None
+) -> dict[str, Any]:
+    """Rolling total: actuals for collected runs, estimates for in-flight ones.
+
+    `project` narrows it to one allocation (§15). The unfiltered total is still
+    what the global ceiling compares against -- a project ceiling is an extra
+    bound, never a replacement for the machine's.
+    """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     cutoff = now - _dt.timedelta(days=window_days)
     actual = 0.0
     estimated = 0.0
     counted: list[dict[str, Any]] = []
     for r in runs():
+        if project and r.project != project:
+            continue
         submitted = parse_iso(r.get("submitted_at"))
         if submitted and submitted < cutoff:
             continue
@@ -325,9 +341,12 @@ def rolling_spend(window_days: int = 30, *, now: _dt.datetime | None = None) -> 
         else:
             estimated += amount
             basis = "estimate"
-        counted.append({"run_id": r.id, "usd": amount, "basis": basis, "smoke": r.is_smoke})
+        counted.append(
+            {"run_id": r.id, "usd": amount, "basis": basis, "smoke": r.is_smoke, "project": r.project}
+        )
     return {
         "window_days": window_days,
+        "project": project,
         "total_usd": round(actual + estimated, 4),
         "actual_usd": round(actual, 4),
         "in_flight_usd": round(estimated, 4),
@@ -348,7 +367,8 @@ CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, task TEXT, status TEXT, smoke INTEGER,
     submitted_at TEXT, collected_at TEXT, platform TEXT, target TEXT,
     submission_hash TEXT, expectation_id TEXT,
-    estimate_usd REAL, cost_usd_actual REAL, results_json TEXT
+    estimate_usd REAL, cost_usd_actual REAL, results_json TEXT,
+    project TEXT
 );
 CREATE TABLE IF NOT EXISTS deviations (
     run_id TEXT, expectation_id TEXT, quantity TEXT,
@@ -356,6 +376,7 @@ CREATE TABLE IF NOT EXISTS deviations (
     in_range INTEGER, verdict TEXT, note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task);
+CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project);
 CREATE INDEX IF NOT EXISTS idx_dev_quantity ON deviations(quantity);
 CREATE INDEX IF NOT EXISTS idx_exp_quantity ON expectations(quantity);
 """
@@ -386,12 +407,13 @@ def rebuild_index(db_path: Any = None) -> dict[str, int]:
         rs = runs()
         for r in rs:
             con.execute(
-                "INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     r.id, r.get("task"), r.status, 1 if r.is_smoke else 0,
                     r.get("submitted_at"), r.get("collected_at"), r.get("platform"),
                     _dumps(r.get("target")), r.get("submission_hash"), r.get("expectation_id"),
                     r.get("estimate_usd"), r.get("cost_usd_actual"), _dumps(r.get("results")),
+                    r.project,
                 ),
             )
             for dev in r.get("deviations", []) or []:

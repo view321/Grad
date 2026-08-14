@@ -28,6 +28,7 @@ import json
 import logging
 import re
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -269,6 +270,7 @@ def _layout(ui: Any, session: Session) -> None:
         tab_funnel = ui.tab("Funnel")
         tab_quota = ui.tab("Quota")
         tab_nb = ui.tab("Notebooks")
+        tab_lab = ui.tab("Lab")
 
     with ui.tab_panels(tabs, value=tab_chat).classes("w-full"):
         with ui.tab_panel(tab_chat):
@@ -283,6 +285,8 @@ def _layout(ui: Any, session: Session) -> None:
             _refreshable(ui, quota_panel)
         with ui.tab_panel(tab_nb):
             _notebook_panel(ui)
+        with ui.tab_panel(tab_lab):
+            _lab_panel(ui)
 
 
 def _refreshable(ui: Any, render: Any) -> None:
@@ -388,8 +392,103 @@ def _figures_in(text: str) -> list[str]:
     return found
 
 
+async def _verify_notebook(ui: Any, name: str, target: Any) -> None:
+    """Shell out to `nb verify` and render the failing cell index and traceback.
+
+    HANDOFF-2 §19 calls this the highest-value part of the whole item, and it is
+    why it was built before the embed: Lab and `tools/nb.py` are two kernel
+    owners over one notebook, which reproduces exactly the "works in the kernel
+    that grew it" failure `nb verify` exists to catch. The discipline is
+    unchanged -- anything edited in Lab passes this before it is cited in
+    `notes/` or referenced from a ledger entry -- and a button is what makes a
+    discipline actually get followed.
+    """
+    target.clear()
+    with target:
+        ui.spinner(size="sm")
+        ui.label(f"running {name} top to bottom on a fresh kernel…").classes("text-sm opacity-70")
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "tools.nb", "verify", f"notebooks/{name}", "--json",
+        cwd=str(paths.root()),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    try:
+        payload = json.loads((out or b"").decode("utf-8", "replace").strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        payload = {"ok": False, "error": {"message": (err or b"").decode("utf-8", "replace")[-2000:]}}
+
+    target.clear()
+    with target:
+        if payload.get("ok"):
+            data = payload.get("data") or {}
+            ui.label(
+                f"verified — {data.get('cells_executed', '?')} cells ran clean on a fresh kernel"
+            ).classes("text-sm text-green-400")
+            return
+        error = payload.get("error") or {}
+        detail = error.get("detail") or {}
+        ui.label(error.get("message") or "verification failed").classes("text-sm text-red-400")
+        index = detail.get("cell_index")
+        if index is not None:
+            ui.label(
+                f"first failing cell: index {index} "
+                f"({detail.get('cells_executed', '?')} cells ran before it)"
+            ).classes("text-xs opacity-80")
+        # `nb verify` nests the kernel's own error under `error`, with the
+        # traceback already stripped of ANSI escapes.
+        traceback_text = ((detail.get("error") or {}).get("traceback")) or detail.get("stdout")
+        if traceback_text:
+            if isinstance(traceback_text, list):
+                traceback_text = "\n".join(str(t) for t in traceback_text)
+            ui.code(str(traceback_text)[-4000:], language="python").classes("w-full")
+        if error.get("fix"):
+            ui.code(str(error["fix"]), language="bash").classes("w-full")
+
+
+def _lab_panel(ui: Any) -> None:
+    """JupyterLab, embedded (HANDOFF-2 §19).
+
+    This iframe is **deliberately unsandboxed**, and that is a considered
+    difference from the notebook-output iframe below it. Notebook output is
+    untrusted HTML from files that may have come from a downloaded repository,
+    so it is `sandbox=""`. Lab is a server we started ourselves, on its own
+    port, with a token we minted -- and it cannot function sandboxed. The two
+    are separate iframes on purpose; do not merge them.
+    """
+    from tools import lab as lab_tool  # noqa: PLC0415 - optional dependency
+
+    container = ui.column().classes("w-full")
+
+    def draw() -> None:
+        container.clear()
+        state = lab_tool.lab_state()
+        with container:
+            if not state.get("running"):
+                ui.label("JupyterLab is not running.").classes("text-sm opacity-70")
+                ui.code("python -m tools.lab start --json", language="bash")
+                ui.label(
+                    "Anything edited in Lab must pass `nb verify` before it is cited in "
+                    "notes/ or referenced from a ledger entry — Lab and tools/nb.py are "
+                    "two kernel owners over one notebook."
+                ).classes("text-xs opacity-60 max-w-2xl")
+                return
+            with ui.row().classes("items-center gap-3"):
+                ui.label(f"127.0.0.1:{state['port']}").classes("text-xs font-mono opacity-70")
+                ui.button("Stop", on_click=lambda: (lab_tool.cmd_stop(None), draw())).props("flat dense")
+            ui.element("iframe").props(
+                f'src="http://127.0.0.1:{state["port"]}/lab?token={state["token"]}" '
+                'allow="clipboard-read; clipboard-write"'
+            ).classes("w-full h-[80vh] rounded bg-white")
+
+    ui.button(icon="refresh", on_click=draw).props("flat dense").classes("self-end")
+    draw()
+
+
 def _notebook_panel(ui: Any) -> None:
-    """Render notebook *outputs*, read-only, with a link out to JupyterLab."""
+    """Render notebook *outputs*, read-only, with Verify and a link into Lab."""
     notebooks = sorted(paths.notebooks_dir().glob("*.ipynb")) if paths.notebooks_dir().exists() else []
     if not notebooks:
         ui.label("No notebooks yet.").classes("text-sm opacity-60")
@@ -401,8 +500,16 @@ def _notebook_panel(ui: Any) -> None:
         container.clear()
         path = paths.notebooks_dir() / name
         with container:
+            verify_out = ui.column().classes("w-full gap-1")
             with ui.row().classes("items-center gap-3"):
-                ui.link("open in JupyterLab", f"http://localhost:8888/lab/tree/notebooks/{name}").classes("text-sm")
+                ui.button(
+                    "Verify",
+                    icon="fact_check",
+                    on_click=lambda: _verify_notebook(ui, name, verify_out),
+                ).props("unelevated dense").tooltip(
+                    "restart the kernel and run every cell top to bottom"
+                )
+                ui.link("open in JupyterLab", _lab_link(name)).classes("text-sm")
                 ui.code(f"python -m tools.nb verify notebooks/{name} --json", language="bash")
             try:
                 import nbformat  # noqa: PLC0415
@@ -424,6 +531,24 @@ def _notebook_panel(ui: Any) -> None:
 
     ui.select([p.name for p in notebooks], value=notebooks[0].name, on_change=lambda e: show(e.value)).classes("w-full")
     show(notebooks[0].name)
+
+
+def _lab_link(name: str) -> str:
+    """A link into the running Lab, or the command that starts one.
+
+    The previous version pointed at a `localhost:8888` nobody started, which is
+    what §14 identified as the real gap: the rejection was of *building* an
+    editor, not of linking to one, and the link was never wired up.
+    """
+    try:
+        from tools import lab as lab_tool  # noqa: PLC0415
+
+        state = lab_tool.lab_state()
+        if state.get("running"):
+            return f"http://127.0.0.1:{state['port']}/lab/tree/notebooks/{name}?token={state['token']}"
+    except Exception:  # noqa: BLE001 - a missing jupyter must not break the panel
+        pass
+    return "#"
 
 
 def run(*, native: bool = True, port: int = 8080) -> None:

@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core import gates, ledger_store as ls, paths
+from core import budget, gates, ledger_store as ls, paths
 from core.config import Config
 from core.errors import EXIT_RUNNING, EXIT_USAGE, GradError
 from core.submission import Submission
@@ -23,14 +23,16 @@ from core.submission import Submission
 # ---------------------------------------------------------------------------
 # submit
 # ---------------------------------------------------------------------------
-def check(sub: Submission, expectation_id: str | None, cfg: Config) -> dict[str, Any]:
-    """Run the four gates. Raises `GateRefusal` on the first that refuses.
+def check(
+    sub: Submission, expectation_id: str | None, cfg: Config, *, project: str | None = None
+) -> dict[str, Any]:
+    """Run the gates. Raises `GateRefusal` on the first that refuses.
 
     Called before the backend is even resolved, so a refusal is always the first
     thing a submitter says -- a gate message is more actionable than "install
     huggingface_hub", and the model should hear the gate first.
     """
-    return gates.check_submit(sub, expectation_id, cfg)
+    return gates.check_submit(sub, expectation_id, cfg, project=project)
 
 
 def record_submission(
@@ -41,6 +43,8 @@ def record_submission(
     target: dict[str, Any],
     command: list[str],
     task: str | None = None,
+    project: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Mint the run id and write the in-flight record.
 
@@ -61,6 +65,11 @@ def record_submission(
         "status": "in_flight",
         "smoke": False,
         "submitted_at": ls.now_iso(),
+        # HANDOFF-2 §15: every cost-bearing record carries the dimension. An
+        # unselected project lands as `unassigned` rather than as null, so the
+        # fold has one spelling for "not attributed" and existing ledgers keep
+        # loading unchanged.
+        "project": project or budget.UNASSIGNED,
         "platform": platform,
         "target": target,
         "submission_hash": sub.hash(),
@@ -73,6 +82,7 @@ def record_submission(
         "dataset": sub.dataset,
         "metrics_file": sub.metrics_file,
         "config": sub.config,
+        **(extra or {}),
     }
     ls.append_run_event(record)
     return run_id, record
@@ -86,6 +96,8 @@ def record_smoke_run(
     target: dict[str, Any],
     caps: dict[str, Any],
     command: list[str],
+    project: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> str:
     """Smoke skips the gates but not the ledger.
 
@@ -102,6 +114,7 @@ def record_smoke_run(
             "status": "in_flight",
             "smoke": True,
             "submitted_at": ls.now_iso(),
+            "project": project or budget.UNASSIGNED,
             "platform": platform,
             "target": target,
             "submission_hash": sub.hash(),
@@ -112,6 +125,7 @@ def record_smoke_run(
             "command": command,
             "caps": caps,
             "image": sub.image,
+            **(extra or {}),
         }
     )
     return run_id
