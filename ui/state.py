@@ -131,6 +131,8 @@ class Workspace:
         self._redraw: dict[str, Callable[[], None]] = {}
         self._chrome: list[Callable[[], None]] = []
         self._retile: Callable[[], None] | None = None
+        #: Strong references to in-flight tasks; see `spawn`.
+        self._tasks: set[asyncio.Task[Any]] = set()
 
     # -- wiring -------------------------------------------------------------
     def bind_window(self, window_id: str, redraw: Callable[[], None]) -> None:
@@ -260,6 +262,43 @@ class Workspace:
         self.notice = message
         for redraw in self._chrome:
             _guard(redraw, "chrome")
+
+    # -- async work started from a click ------------------------------------
+    def spawn(self, coro: Any, what: str) -> Any:
+        """Run a coroutine started by a click handler, and do not lose it.
+
+        Two failure modes this closes, both easy to write by accident and both
+        silent:
+
+        * **The task is garbage collected mid-flight.** asyncio keeps only a
+          *weak* reference to a running task, so a bare `create_task(...)` whose
+          result nobody holds can vanish part-way through. The turn simply
+          stops, with nothing on screen and nothing in the log.
+        * **The exception is retrieved and thrown away.** `t.exception()` in a
+          done-callback silences Python's "Task exception was never retrieved"
+          warning by *discarding* the error, which is worse than the warning it
+          suppresses -- a gate approval that failed inside the SDK becomes
+          invisible.
+
+        So: a strong reference until the task settles, and a failure that
+        reaches both the log and the status bar.
+        """
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(lambda t: self._settle(t, what))
+        return task
+
+    def _settle(self, task: Any, what: str) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        # Only the exception class goes on screen: an SDK message can carry a
+        # URL with a token in it, and the status bar is not a log.
+        log.error("%s failed", what, exc_info=error)
+        self.say(f"{what} failed: {type(error).__name__} (details are in the app log)")
 
 
 def _guard(fn: Callable[[], None], what: str) -> None:

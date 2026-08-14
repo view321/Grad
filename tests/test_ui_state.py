@@ -9,6 +9,7 @@ failure cannot stop the other ten redrawing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -186,6 +187,64 @@ async def test_run_tool_reports_a_command_that_produced_nothing_usable(workspace
     payload = await state_mod.run_tool("this_module_does_not_exist_at_all")
     assert payload["ok"] is False
     assert payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_holds_a_reference_until_the_task_settles(workspace):
+    """asyncio keeps only a *weak* reference to a running task, so a bare
+    `create_task` whose result nobody holds can vanish part-way through."""
+    space = workspace_for()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def work() -> None:
+        started.set()
+        await release.wait()
+
+    space.spawn(work(), "unit work")
+    await started.wait()
+    assert len(space._tasks) == 1
+
+    release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert space._tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_task_reaches_the_log_and_the_status_bar(workspace, caplog):
+    """`t.exception()` in a done-callback silences Python's warning by
+    *discarding* the error, which is worse than the warning it suppresses: a
+    gate approval that failed inside the SDK becomes invisible."""
+
+    async def boom() -> None:
+        raise RuntimeError("the SDK said no")
+
+    space = workspace_for()
+    with caplog.at_level("ERROR", logger="grad.ui"):
+        space.spawn(boom(), "gate answer")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert "gate answer" in (space.notice or "")
+    assert "RuntimeError" in space.notice
+    # The message itself stays out of the status bar; an SDK message can carry
+    # a URL with a token in it.
+    assert "the SDK said no" not in space.notice
+    assert any("gate answer failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_task_is_not_reported_as_a_failure(workspace):
+    async def forever() -> None:
+        await asyncio.Event().wait()
+
+    space = workspace_for()
+    task = space.spawn(forever(), "unit work")
+    task.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert space.notice is None
 
 
 def test_envelope_message_prefers_the_fix():

@@ -501,8 +501,11 @@ def test_a_halt_stops_the_loop_at_the_next_generation_boundary(workspace, monkey
     result = evolve.cmd_run(run_args(task_dir, make_expectation(), generations=5, population=2))
 
     assert result["status"] == "halted"
-    # Generation 0 completed; generation 1 never started.
+    # Generation 0 completed; generation 1 never started -- and the folded
+    # campaign has to agree with the returned count, because the evolve window
+    # reads the folded one for its title bar.
     assert result["generations_run"] == 1
+    assert camp.campaign(result["campaign"])["generations_run"] == 1
     assert len(camp.candidates(result["campaign"])) == 2
     # And nothing is left half-evaluated.
     assert all(r.get("metrics") or r.get("error") for r in camp.candidates(result["campaign"]))
@@ -584,3 +587,44 @@ def test_losing_the_halt_race_reports_closed_rather_than_raising(workspace, monk
     assert payload["halted"] is False
     assert payload["status"] == "closed"
     assert camp.halt_requested("camp-1") is False
+
+
+def test_a_boundary_record_does_not_count_as_a_generation_that_ran(workspace):
+    """Both the budget gate and a halt write a generation record at the boundary
+    they stop *before*. Counting it reported a campaign halted after generation
+    0 as having run two -- which is the number the evolve window puts in its
+    title bar."""
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.record_generation("camp-1", 0)
+    assert camp.campaign("camp-1")["generations_run"] == 1
+
+    camp.record_generation("camp-1", 1, halted=True, reason="halt requested")
+    assert camp.campaign("camp-1")["generations_run"] == 1
+    # The boundary is still on the record; it is just not counted as work done.
+    assert camp.campaign("camp-1")["generation_log"][-1]["halted"] is True
+
+
+def test_the_budget_boundary_record_is_not_counted_either(workspace, monkeypatch):
+    """The same off-by-one existed on the pre-existing exhausted path."""
+    budget.create("proj-1", title="t", budget={"gpu_usd": 10.0})
+    task_dir = scaffold(workspace)
+
+    class ConcurrentSpender(FakeMutator):
+        def propose(self, *, generation, population, best):
+            if generation == 1:
+                ls.append_run_event(
+                    {"type": ls.T_RUN_SUBMITTED, "id": ls.new_id("run"), "status": "in_flight",
+                     "submitted_at": ls.now_iso(), "project": "proj-1", "estimate_usd": 9.0}
+                )
+            return super().propose(generation=generation, population=population, best=best)
+
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: ConcurrentSpender())
+    result = evolve.cmd_run(
+        run_args(task_dir, make_expectation(), project="proj-1",
+                 generations=5, population=2, estimate_per_candidate_usd=0.5)
+    )
+    assert result["status"] == "exhausted"
+    folded = camp.campaign(result["campaign"])
+    assert folded["generations_run"] == result["generations_run"]

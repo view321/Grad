@@ -217,18 +217,16 @@ def _gate_card(block: dict[str, Any], workspace: Any) -> None:
 
     def answer(text: str) -> None:
         send = workspace.chat_send
-        workspace.set_agent_state("running")
         if send is None:
+            # Before the state change, not after: leaving `running` set here
+            # would paint the title bar with a live agent and a PAUSE button
+            # while nothing is running and nothing will start.
             workspace.say("no chat session is open to answer the gate")
             return
+        workspace.set_agent_state("running")
         result = send(text)
         if hasattr(result, "__await__"):
-            import asyncio
-
-            # Consumed rather than fire-and-forget: a bare `create_task` drops
-            # any SDK error and Python logs "Task exception was never retrieved".
-            task = asyncio.create_task(result)
-            task.add_done_callback(lambda t: t.exception())
+            workspace.spawn(result, "gate answer")
 
     with kit.el("div", "grad-card gate"):
         with kit.row("head broken", gap=9):

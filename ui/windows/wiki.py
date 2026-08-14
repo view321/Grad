@@ -103,10 +103,7 @@ def _ask(workspace: Any) -> None:
             return
         result = chat_send(f"@wiki {question}")
         if hasattr(result, "__await__"):
-            import asyncio
-
-            task = asyncio.create_task(result)
-            task.add_done_callback(lambda t: t.exception())
+            workspace.spawn(result, "wiki question")
         workspace.focus("chat")
 
     with kit.row("", gap=6, align="flex-end"):

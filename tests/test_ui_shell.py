@@ -176,6 +176,54 @@ def test_a_verify_flips_the_notebook_chip_without_a_retile(rendered):
     assert "CITABLE" in markup
 
 
+def click(element) -> None:
+    """Invoke an element's click handlers, the way the browser would."""
+    for listener in element._event_listeners.values():  # noqa: SLF001 - no public hook
+        if listener.type == "click" and listener.handler is not None:
+            listener.handler()
+
+
+def find_button(client: Client, label: str):
+    """`kit.button` renders through `ui.html(tag="button")`, so the real tag
+    lives in the props rather than on the element."""
+    for element in client.elements.values():
+        if element._props.get("tag") != "button":  # noqa: SLF001 - no public accessor
+            continue
+        if label in str(getattr(element, "content", "")):
+            return element
+    raise AssertionError(f"no button matching {label!r}")
+
+
+def test_answering_a_gate_with_no_session_does_not_claim_the_agent_is_running(rendered):
+    """The guard has to come before the state change: leaving `running` set
+    would paint the title bar with a live agent and a PAUSE button while
+    nothing is running and nothing will start."""
+    client, space = rendered(["chat"])
+    space.chat_send = None
+    with client:
+        from ui.windows.chat import _gate_card
+
+        _gate_card({"kind": "gate", "id": "gate-1", "rows": [("cost", "$18.40")]}, space)
+
+    click(find_button(client, "APPROVE"))
+    assert space.agent_state == "idle"
+    assert "no chat session" in (space.notice or "")
+
+
+def test_answering_a_gate_sends_the_decision_into_the_session(rendered):
+    client, space = rendered(["chat"])
+    sent: list[str] = []
+    space.chat_send = sent.append
+    with client:
+        from ui.windows.chat import _gate_card
+
+        _gate_card({"kind": "gate", "id": "gate-1", "rows": []}, space)
+
+    click(find_button(client, "DENY"))
+    assert space.agent_state == "running"
+    assert sent and "denied" in sent[0]
+
+
 def test_the_focused_window_is_marked(rendered):
     client, space = rendered(["chat", "ledger"])
     space.focus("ledger")

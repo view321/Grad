@@ -153,7 +153,15 @@ def campaigns() -> dict[str, dict[str, Any]]:
             folded[cid] = {**{k: v for k, v in rec.items() if k != "type"}, "generations_run": 0}
         elif cid in folded and kind == T_GENERATION:
             node = folded[cid]
-            node["generations_run"] = max(node["generations_run"], int(rec.get("generation", 0)) + 1)
+            # A record carrying `halted` documents the generation the loop
+            # stopped *before*, not one it ran -- both the budget gate and a
+            # halt request write one at the boundary they break on. Counting it
+            # reported a campaign halted after generation 0 as having run two,
+            # which is the number the evolve window puts in its title bar.
+            if not rec.get("halted"):
+                node["generations_run"] = max(
+                    node["generations_run"], int(rec.get("generation", 0)) + 1
+                )
             node["last_generation_at"] = rec.get("at")
             node.setdefault("generation_log", []).append(
                 {k: v for k, v in rec.items() if k not in ("type", "id")}
