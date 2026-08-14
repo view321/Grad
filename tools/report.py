@@ -368,7 +368,7 @@ def cmd_write(args: argparse.Namespace) -> dict[str, Any]:
         return {"project": project_id, "bundle": bundle, "sent": False}
 
     cfg = config_mod.load()
-    prose = _generate_prose(bundle, model=cfg.model_for("report"))
+    prose = _generate_prose(bundle, model=cfg.model_for("report"), project=project_id)
 
     body = files["tex"].read_text(encoding="utf-8")
     marker = "\\maketitle"
@@ -424,10 +424,15 @@ def _bundle(evidence: dict[str, Any], claims: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _generate_prose(bundle: dict[str, Any], *, model: str) -> str:
+def _generate_prose(bundle: dict[str, Any], *, model: str, project: str | None = None) -> str:
     """One forced-tool call, for the same reason §5 uses one.
 
     "prompting for JSON and parsing it fails silently on the tenth call."
+
+    `project` is threaded through rather than left to default: `--project` can
+    name a project other than the selected one, and charging this report's
+    tokens to whichever happened to be current would attribute the spend to the
+    wrong allocation.
     """
     try:
         import asyncio  # noqa: PLC0415
@@ -491,7 +496,15 @@ def _generate_prose(bundle: dict[str, Any], *, model: str) -> str:
         # fallback for the turn that dies before a result -- adding both would
         # double-count.
         final: Any = None
-        partial = {"input_tokens": 0, "output_tokens": 0}
+        # Every field `from_sdk_usage` knows how to read. Accumulating only the
+        # two uncached counters would silently drop cache traffic from the
+        # fallback, so a failed turn would under-report exactly the tokens a
+        # long prompt spends most of.
+        partial = dict.fromkeys(
+            ("input_tokens", "output_tokens",
+             "cache_read_input_tokens", "cache_creation_input_tokens"),
+            0,
+        )
         try:
             async for message in query(
                 prompt="Evidence bundle:\n\n" + json.dumps(bundle, indent=2, default=str),
@@ -504,14 +517,14 @@ def _generate_prose(bundle: dict[str, Any], *, model: str) -> str:
                     final = usage
                 else:
                     get = usage.get if isinstance(usage, dict) else (lambda k, d=0: getattr(usage, k, d))
-                    partial["input_tokens"] += get("input_tokens", 0) or 0
-                    partial["output_tokens"] += get("output_tokens", 0) or 0
+                    for field in partial:
+                        partial[field] += get(field, 0) or 0
         finally:
             # In a finally block because a failed turn still spent quota, and an
             # unrecorded spend is exactly what §15's ceilings cannot see.
             quota_log.from_sdk_usage(
                 "report.write", final if final is not None else partial,
-                model=model, role="report",
+                model=model, role="report", project=project,
             )
 
     asyncio.run(run())
@@ -692,7 +705,12 @@ def _from_s2(keyword: str, context: str) -> dict[str, Any] | None:
     if not words:
         return None
 
-    best, best_score, best_title = None, 0.0, 0.0
+    # Both gates are applied *before* ranking, not to the winner afterwards.
+    # Ranking first and then testing meant a loosely-related paper with a
+    # keyword-stuffed abstract could win on context overlap, fail the title
+    # gate, and take the genuinely correct paper down with it -- rejecting a
+    # citation that was right there in the candidate list.
+    qualifying = []
     for hit in hits:
         body = _content_words(f"{hit.get('title', '')} {hit.get('abstract', '')}")
         title = _content_words(hit.get("title", ""))
@@ -700,11 +718,12 @@ def _from_s2(keyword: str, context: str) -> dict[str, Any] | None:
             continue
         score = len(words & body) / len(words)
         title_score = (len(words & title) / len(title)) if title else 0.0
-        if score > best_score:
-            best, best_score, best_title = hit, score, title_score
+        if score >= S2_MIN_CONTEXT_OVERLAP and title_score >= S2_MIN_TITLE_OVERLAP:
+            qualifying.append((score, title_score, hit))
 
-    if best is None or best_score < S2_MIN_CONTEXT_OVERLAP or best_title < S2_MIN_TITLE_OVERLAP:
+    if not qualifying:
         return None
+    best_score, best_title, best = max(qualifying, key=lambda row: (row[0], row[1]))
     return {
         "key": _bib_key(best.get("paper_id", keyword), None, best.get("year")),
         "type": "article",

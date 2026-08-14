@@ -546,3 +546,70 @@ def test_shared_jargon_alone_does_not_clear_the_title_test(workspace, project, m
     context = ("Scaling laws relate parameter count and pretraining token budget "
                "to transformer language model loss following a power law.")
     assert report._from_s2("scaling laws", context) is None
+
+
+def test_the_right_paper_is_not_taken_down_by_a_keyword_stuffed_one(workspace, project, monkeypatch):
+    """Both gates are applied before ranking, not to the winner afterwards.
+
+    Ranking first let a loosely-related paper with a keyword-heavy abstract win
+    on context overlap, fail the title gate, and reject the genuinely correct
+    paper sitting next to it in the candidate list.
+    """
+    class FakeS2:
+        def __init__(self, cfg): ...
+        def paper_search(self, keyword, limit=5):
+            return [
+                {"paper_id": "generic", "title": "Miscellaneous Notes",
+                 "abstract": "scaling laws parameter count pretraining token budget power "
+                             "transformer language corpora empirical performance",
+                 "year": 2021},
+                {"paper_id": "right", "title": "Scaling Laws for Neural Language Models",
+                 "abstract": "empirical scaling laws parameter count pretraining token budget",
+                 "year": 2020},
+            ]
+
+    monkeypatch.setattr(report.http, "SemanticScholar", FakeS2)
+    context = ("Empirical scaling laws relate parameter count and pretraining token "
+               "budget to transformer language model performance.")
+    entry = report._from_s2("scaling laws", context)
+    assert entry is not None
+    assert entry["note"] == "S2:right"
+
+
+def test_partial_usage_keeps_cache_counters(workspace, project):
+    """A turn that dies before the result message still spent cache traffic, and
+    a long prompt spends most of its tokens there."""
+    import inspect
+
+    source = inspect.getsource(report._generate_prose)
+    assert "cache_read_input_tokens" in source
+    assert "cache_creation_input_tokens" in source
+
+
+def test_report_usage_is_charged_to_the_reported_project(workspace, monkeypatch):
+    """`--project` can name a project other than the selected one; charging the
+    report's tokens to whichever happened to be current attributes the spend to
+    the wrong allocation."""
+    budget.create("proj-a", title="a", budget={})
+    budget.create("proj-b", title="b", budget={})
+    budget.set_current("proj-a")
+
+    recorded: dict = {}
+
+    def capture(stage, usage, **kw):
+        recorded.update(kw)
+        return None
+
+    monkeypatch.setattr(report.quota_log, "from_sdk_usage", capture)
+    monkeypatch.setattr(
+        report, "_generate_prose",
+        lambda bundle, *, model, project=None: (
+            capture("report.write", {}, project=project, model=model, role="report")
+            or r"\section{Results}" + "\nbody text long enough to pass validation." * 5
+        ),
+    )
+
+    in_range_run("proj-b")
+    report.cmd_draft(args(project="proj-b"))
+    report.cmd_write(args(project="proj-b", section=[], dry_run=False))
+    assert recorded["project"] == "proj-b"

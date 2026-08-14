@@ -340,3 +340,46 @@ def test_an_unsupported_namespace_leaves_no_phantom_smoke_record(workspace, monk
 
     assert ls.in_flight() == []
     assert ls.rolling_spend(30)["total_usd"] == 0.0
+
+
+def test_smoke_attributes_to_the_current_project_when_none_is_passed(workspace, hub):
+    """`preflight.py` calls `run_smoke(sub, cfg)` with no project.
+
+    The namespace was already derived from the current project, so booking the
+    cost as `unassigned` had the two halves of one decision disagreeing: an
+    org's job charged to nobody.
+    """
+    from core import budget, config as config_mod
+    from tools import jobs
+
+    budget.create("proj-1", title="t", budget={"gpu_usd": 100.0})
+    budget.set_current("proj-1")
+
+    sub = make_submission(workspace)
+    jobs.run_smoke(sub, config_mod.load(reload=True))
+
+    assert [r.project for r in ls.runs()] == ["proj-1"]
+    # The run is counted against this project's allocation rather than landing
+    # under `unassigned` where nothing bounds it. (The fake hub reports no
+    # elapsed time, so the amount itself is legitimately zero.)
+    assert budget.spend("proj-1")["runs"] == [r.id for r in ls.runs()]
+
+
+def test_a_missing_token_leaves_no_unfinished_smoke_record(workspace, hub, monkeypatch):
+    """`_token()` sat inside the try, so a missing credential propagated without
+    `finish()` ever running -- leaving an in-flight estimate on the ceiling for a
+    job that never reached the platform."""
+    from core import config as config_mod
+    from tools import jobs
+
+    def no_token():
+        raise ConfigError("no Hugging Face token is stored", fix="credential set hf_token")
+
+    monkeypatch.setattr(jobs, "_token", no_token)
+    sub = make_submission(workspace)
+
+    with pytest.raises(ConfigError):
+        jobs.run_smoke(sub, config_mod.load(reload=True))
+
+    assert ls.in_flight() == []
+    assert ls.rolling_spend(30)["total_usd"] == 0.0

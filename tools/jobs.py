@@ -368,17 +368,26 @@ def run_smoke(
     caps = gates.check_smoke_caps(sub, cfg)
     flavor = sub.target.get("smoke_flavor") or sub.target.get("flavor") or cfg.get("hf", "default_flavor", "a10g-small")
     command = _smoke_command(sub, caps)
+
+    # Resolved once, and used for both the namespace and the accounting.
+    # `preflight.py` calls this with no project at all, and deriving the
+    # namespace from the current project while booking the cost as `unassigned`
+    # meant a smoke run charged an org's job to nobody -- the two halves of the
+    # same decision disagreeing.
+    project = project or budget.current_project()
     if namespace is None:
-        namespace = resolve_namespace(None, sub, cfg, project or budget.current_project())
+        namespace = resolve_namespace(None, sub, cfg, project)
 
     # Everything that can fail for a *configuration* reason resolves before the
-    # ledger record exists. `_hub()` raises when huggingface_hub is missing and
-    # `_ns_kwargs()` raises when the installed one cannot take a namespace;
-    # either one landing after `record_smoke_run` leaves a phantom in-flight
-    # estimate sitting on the monthly ceiling for a job that never reached the
-    # platform -- which then goes stale and blocks every later submission.
+    # ledger record exists. `_hub()` raises when huggingface_hub is missing,
+    # `_ns_kwargs()` raises when the installed one cannot take a namespace, and
+    # `_token()` raises when no credential is stored; any of them landing after
+    # `record_smoke_run` leaves a phantom in-flight estimate sitting on the
+    # monthly ceiling for a job that never reached the platform -- which then
+    # goes stale and blocks every later submission.
     hub = _hub()
     ns_kwargs = _ns_kwargs(namespace)
+    token = _token()
 
     run_id = submit_lib.record_smoke_run(
         sub, cfg=cfg, platform=PLATFORM,
@@ -393,7 +402,7 @@ def run_smoke(
             command=command,
             flavor=flavor,
             env={**_job_env(sub), "GRAD_SMOKE": "1"},
-            token=_token(),
+            token=token,
             timeout=caps["timeout_s"],
             **ns_kwargs,
         )
