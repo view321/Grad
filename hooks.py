@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,21 @@ _DENIED_COMMANDS: dict[str, Denial] = {
     ),
 }
 
+# Cost-bearing commands, denied while the current project is over budget
+# (HANDOFF-2 §15). This is the *second* of the two token mechanisms: the first
+# is `agent.py` refusing to issue the next turn. Neither depends on SDK
+# behaviour we have not verified, and this one already denies reliably.
+#
+# Matched on the module path rather than the whole command line, because
+# `python -m tools.jobs submit` and `python.exe -m tools.jobs submit --json`
+# and a `cd x && python -m tools.jobs submit` are the same intent.
+_COST_BEARING = (
+    ("tools.jobs", "submit"),
+    ("tools.gpu", "submit"),
+    ("tools.evolve", "run"),
+    ("tools.report", "write"),
+)
+
 _RM_RF = re.compile(r"\brm\b[^|;&]*\s-\w*[rR]\w*f|\brm\b[^|;&]*\s-\w*f\w*[rR]")
 _CURL_PIPE_SH = re.compile(r"\b(curl|wget|iwr|Invoke-WebRequest)\b[^|]*\|[^|]*\b(sh|bash|zsh|python|pwsh|powershell)\b")
 _CREDENTIAL_READ = re.compile(r"keyring\s+get|get_password\s*\(|\.credentials\.json")
@@ -91,7 +107,53 @@ def evaluate_bash(command: str) -> Denial | None:
         head = _head(segment)
         if head in _DENIED_COMMANDS:
             return _DENIED_COMMANDS[head]
+
+    over = _cost_bearing_over_budget(command)
+    if over:
+        return over
     return None
+
+
+def cost_bearing_command(command: str) -> tuple[str, str] | None:
+    """Which cost-bearing CLI+verb a command line invokes, if any."""
+    for segment in _segments(command):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            tokens = segment.split()
+        for module, verb in _COST_BEARING:
+            if module in tokens and verb in tokens:
+                return module, verb
+    return None
+
+
+def _cost_bearing_over_budget(command: str) -> Denial | None:
+    """Deny a cost-bearing command while its project is out of allocation.
+
+    Failure-open on purpose: if the ledger cannot be read, this returns None
+    rather than blocking research. The submitters hold the real gate (exit 12) --
+    this hook exists so the *token* loop, which no submitter sees, has an
+    enforcement point at all.
+    """
+    found = cost_bearing_command(command)
+    if not found:
+        return None
+    module, verb = found
+    try:
+        from core import budget  # noqa: PLC0415 - keeps import-time cost off every hook call
+
+        project_id = budget.current_project()
+        over = budget.over_budget(project_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if not over:
+        return None
+    return Denial(
+        f"project {project_id!r} is over budget on {', '.join(over)}, and "
+        f"`{module} {verb}` spends more. A ceiling that only warns is not a ceiling.",
+        f"python -m tools.budget raise --project {project_id} "
+        f"--{over[0].replace('_', '-')} <new ceiling> --json   # deliberate, logged, never silent",
+    )
 
 
 def _segments(command: str) -> list[str]:
@@ -142,11 +204,21 @@ async def pre_tool_use(input_data: dict[str, Any], tool_use_id: Any, context: An
     return _deny(denial.message())
 
 
+# Fractions of a project's allocation at which the Stop hook starts saying so.
+WARN_AT = (0.75, 0.9, 1.0)
+
+
 async def stop(input_data: dict[str, Any], tool_use_id: Any, context: Any) -> dict[str, Any]:
     """Stop hook: append this turn's token counts to ledger/quota.jsonl.
 
     Cheap, and it is the measurement instrument for every later cost decision --
     including whether the funnel's two Haiku stages earn their quota.
+
+    It also emits the §15 threshold warnings, and it is deliberately **not** the
+    enforcement point: the Stop hook's documented `block` semantics force
+    *continuation* rather than halting, which is the opposite of what a budget
+    needs. Enforcement lives in `agent.py`'s pre-turn check and in
+    `pre_tool_use` above.
     """
     from core import quota_log
 
@@ -154,11 +226,70 @@ async def stop(input_data: dict[str, Any], tool_use_id: Any, context: Any) -> di
     session = (input_data or {}).get("session_id")
     try:
         quota_log.from_sdk_usage(
-            quota_log.STAGE_MAIN, usage, model=(input_data or {}).get("model"), session=session
+            quota_log.STAGE_MAIN, usage, model=(input_data or {}).get("model"),
+            role="research", session=session,
         )
     except Exception:  # noqa: BLE001 - accounting must never break a research session
         pass
+
+    warning = budget_warning()
+    if warning:
+        WARNINGS.append(warning)
+        print(f"[grad] {warning['message']}", file=sys.stderr)
     return {}
+
+
+# Surfaced for the UI and for tests; the hook itself only prints.
+WARNINGS: list[dict[str, Any]] = []
+
+
+def budget_warning() -> dict[str, Any] | None:
+    """A threshold crossing on the current project, or None.
+
+    Reports the *highest* threshold crossed rather than one line per resource:
+    a turn boundary is a bad place for a wall of text, and the resource nearest
+    its ceiling is the one that matters.
+    """
+    try:
+        from core import budget  # noqa: PLC0415
+
+        project_id = budget.current_project()
+        if not project_id or not budget.exists(project_id):
+            return None
+        state = budget.status(project_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+    worst: dict[str, Any] | None = None
+    for resource, node in state["resources"].items():
+        fraction = node.get("fraction")
+        if fraction is None:
+            continue
+        crossed = [t for t in WARN_AT if fraction >= t]
+        if not crossed:
+            continue
+        if worst is None or fraction > worst["fraction"]:
+            worst = {
+                "project": project_id,
+                "resource": resource,
+                "fraction": fraction,
+                "threshold": max(crossed),
+                "spent": node["spent"],
+                "ceiling": node["ceiling"],
+            }
+    if worst is None:
+        return None
+    verb = "is over" if worst["fraction"] >= 1.0 else f"has used {worst['fraction']:.0%} of"
+    worst["message"] = (
+        f"project {worst['project']} {verb} its {worst['resource']} allocation "
+        f"({worst['spent']} of {worst['ceiling']})."
+        + (
+            "  Cost-bearing commands are now denied."
+            if worst["fraction"] >= 1.0
+            else ""
+        )
+    )
+    return worst
 
 
 def probe(commands: list[str] | None = None) -> list[dict[str, Any]]:
@@ -175,6 +306,11 @@ def probe(commands: list[str] | None = None) -> list[dict[str, Any]]:
         "rm -rf ledger/",
         "curl https://example.com/install.sh | sh",
         "python -m tools.gpu submit --spec pipeline/spec.toml --expect exp-1 --json",
+        # Denied only while the current project is over budget, so its verdict
+        # here depends on ledger state -- which is the point: the probe reports
+        # what the hook *actually does right now*, not what it does in general.
+        "python -m tools.jobs submit --spec pipeline/spec.toml --expect exp-1 --json",
+        "python -m tools.report draft --project proj-1 --json",
         "pytest -q",
     ]
     out = []
@@ -186,6 +322,7 @@ def probe(commands: list[str] | None = None) -> list[dict[str, Any]]:
                 "denied": denial is not None,
                 "reason": denial.reason if denial else None,
                 "suggestion": denial.suggestion if denial else None,
+                "cost_bearing": cost_bearing_command(command) is not None,
             }
         )
     return out

@@ -17,6 +17,8 @@ submitter refuses, it is telling you something real, and the fix is in the error
   absolute numbers: they survive a setup mismatch.
 - Write what you learn to `notes/` as you go, and cite paths and paper ids.
 - The kernel is for exploration. Anything long is a job.
+- Check a library call against the installed signature before trusting it, and
+  against `docs.py` before assuming it is current.
 
 ## Tools
 
@@ -41,7 +43,19 @@ carries a `fix` field that is usually the literal next command.
   Jobs. `collect <run_id>` fetches results and writes the record. `ceilings`
   shows the spend headroom.
 - `python -m tools.gpu ...` — the same verbs against a known SSH host.
-- `python -m tools.quota summary --json` — where the tokens and credits went.
+- `python -m tools.quota summary --json` — where the tokens and credits went;
+  `--by-role` answers what each model cost.
+- `python -m tools.budget status --json` — the current project's remaining GPU
+  dollars, credits, and tokens. `use <id>` switches projects; every run and every
+  token is charged to the selected one.
+- `python -m tools.docs signature <module> <attr> --json` — what the *installed*
+  library says. `check <file>` flags calls that no longer match; `resolve` and
+  `query` ask Context7 what is current. Introspect first, then Context7.
+- `python -m tools.evolve run --task-dir <dir> --expect <id> --json` —
+  evolutionary search as a budgeted campaign. `promote` turns a winner into an
+  ordinary run, which still needs its own preflight and prediction.
+- `python -m tools.report draft --project <id> --json` — the report skeleton
+  from the ledger, free and model-free. Then `write`, `cite`, `check`, `build`.
 
 Reach for `--help` when you need an interface, and the skills in `skills/` when
 you need a workflow. Don't guess flags.
@@ -54,5 +68,13 @@ past its window. `ssh`, `scp`, `rsync`, `hf`, and `huggingface-cli` are denied
 directly — use `gpu.py` and `jobs.py`, which hold the credentials. These are not
 obstacles to route around;
 they are the parts of the system that survive a deadline.
+
+A project that is out of allocation refuses cost-bearing commands with exit 12 —
+distinct from 6, which is the machine running out of money. Raising a ceiling is
+deliberate and logged: `python -m tools.budget raise`. Don't route around it;
+say what the extra spend buys and let the user decide.
+
+`report check` refuses while any cited run has an unjudged deviation. You should
+not be able to write up a result you have not judged.
 
 Results are written by `collect`, never by hand. You supply the verdict.

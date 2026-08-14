@@ -15,7 +15,7 @@ from __future__ import annotations
 import datetime as _dt
 from typing import Any
 
-from core import jsonl, ledger_store as ls, paths
+from core import budget as budget_mod, jsonl, ledger_store as ls, paths
 from core.config import Config
 from core.errors import (
     EXIT_EXPECTATION,
@@ -141,6 +141,21 @@ def check_spend(estimate_usd: float, cfg: Config, *, now: _dt.datetime | None = 
 
 
 # ---------------------------------------------------------------------------
+# gate 3b: the project's own allocation (HANDOFF-2 §15)
+# ---------------------------------------------------------------------------
+def check_project_spend(project_id: str | None, estimate_usd: float) -> dict[str, Any] | None:
+    """Alongside the global ceiling, not instead of it.
+
+    Submission is a discrete, gateable event, so GPU dollars are the resource
+    this enforces cleanly. It raises with exit **12**, not 6: an organisation's
+    budget and the machine's budget are separate allocations, and telling them
+    apart is what stops "raise monthly_usd" being the reflex fix for the wrong
+    problem.
+    """
+    return budget_mod.check(project_id, gpu_usd=estimate_usd, what="this job")
+
+
+# ---------------------------------------------------------------------------
 # gate 4: no stale uncollected run
 # ---------------------------------------------------------------------------
 def check_stale(cfg: Config, *, now: _dt.datetime | None = None) -> None:
@@ -169,23 +184,44 @@ def check_submit(
     cfg: Config,
     *,
     estimate_usd: float | None = None,
+    project: str | None = None,
     now: _dt.datetime | None = None,
 ) -> dict[str, Any]:
     """Run every gate. Raises `GateRefusal` on the first that refuses.
 
     Order is cheapest-and-most-actionable first: a missing preflight is the most
-    common refusal and the easiest to fix.
+    common refusal and the easiest to fix. The project ceiling runs immediately
+    after the global one -- both are spend gates, and a caller that has blown
+    both should hear about the machine's ceiling first, since that is the one
+    that stops every other project too.
     """
     estimate = sub.estimated_cost_usd() if estimate_usd is None else estimate_usd
     record = check_preflight(sub, cfg)
     expectation = check_expectation(expectation_id, sub)
     spend = check_spend(estimate, cfg, now=now)
+    project_state = check_project_spend(project, estimate)
     check_stale(cfg, now=now)
     return {
         "submission_hash": sub.hash(),
         "preflight": {"checks": list(record.get("checks", {})), "verified_at": record.get("verified_at")},
         "expectation": {"id": expectation.get("id"), "quantity": expectation.get("quantity")},
         "spend": spend,
+        "project": project,
+        # Current state *plus* the projection, because "you have $50 left" and
+        # "you will have $48 left after this" answer different questions and the
+        # caller is about to spend.
+        "project_budget": (
+            None
+            if project_state is None
+            else {
+                **project_state["resources"]["gpu_usd"],
+                "projected_remaining": (
+                    None
+                    if project_state["resources"]["gpu_usd"]["remaining"] is None
+                    else round(project_state["resources"]["gpu_usd"]["remaining"] - estimate, 4)
+                ),
+            }
+        ),
         "estimate_usd": estimate,
     }
 

@@ -23,7 +23,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from core import config as config_mod, credentials, gates, ledger_store as ls, submit as submit_lib
+from core import (
+    budget,
+    config as config_mod,
+    credentials,
+    gates,
+    ledger_store as ls,
+    submit as submit_lib,
+)
 from core.cli import Cli, main
 from core.config import Config, Host
 from core.errors import EXIT_RUNNING, GradError, UpstreamError, UsageError
@@ -147,6 +154,10 @@ def _submit_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--expect", help="expectation id to bind. REQUIRED unless --smoke")
     p.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--task")
+    p.add_argument(
+        "--project",
+        help="project to charge this run to (defaults to the current one; §15)",
+    )
     p.add_argument("--smoke", action="store_true", help="gate-exempt, hard-capped one-step check (§6)")
     p.add_argument("--no-digest", action="store_true", help=argparse.SUPPRESS)
 
@@ -160,11 +171,12 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         resolve_digest=not args.no_digest,
     )
     host = cfg.host(args.host or sub.target.get("host") or "")
+    project_id = budget.resolve(args.project)
 
     if args.smoke:
         if args.expect:
             raise UsageError("--smoke binds no prediction", fix="drop --expect, or drop --smoke")
-        result = run_smoke(sub, cfg, host=host)
+        result = run_smoke(sub, cfg, host=host, project=project_id)
         from tools import preflight
 
         preflight.record_check_result(sub.hash(), "smoke", result)
@@ -180,7 +192,7 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
 
     # Gates first, then the record. Nothing is staged to a host until both the
     # four gates have passed and the run is on the ledger at its estimate.
-    summary = submit_lib.check(sub, args.expect, cfg)
+    summary = submit_lib.check(sub, args.expect, cfg, project=project_id)
     run_id, _ = submit_lib.record_submission(
         sub,
         expectation_id=args.expect,
@@ -188,6 +200,7 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         target={"host": host.name, "platform": "ssh", "rate_usd_per_hour": host.rate_usd_per_hour},
         command=_command_for(sub),
         task=args.task,
+        project=project_id,
     )
     remote_dir = f"{host.workdir}/{run_id}"
     try:
@@ -260,7 +273,9 @@ def _launch(host: Host, sub: Submission, remote_dir: str, command: list[str]) ->
 # ---------------------------------------------------------------------------
 # smoke
 # ---------------------------------------------------------------------------
-def run_smoke(sub: Submission, cfg: Config, *, host: Host | None = None) -> dict[str, Any]:
+def run_smoke(
+    sub: Submission, cfg: Config, *, host: Host | None = None, project: str | None = None
+) -> dict[str, Any]:
     """One step on the real host, capped in code (§6).
 
     This is the only check that sees the remote image, the remote driver stack,
@@ -272,7 +287,7 @@ def run_smoke(sub: Submission, cfg: Config, *, host: Host | None = None) -> dict
     run_id = submit_lib.record_smoke_run(
         sub, cfg=cfg, platform=PLATFORM,
         target={"host": host.name, "platform": "ssh", "rate_usd_per_hour": host.rate_usd_per_hour},
-        caps=caps, command=command,
+        caps=caps, command=command, project=project,
     )
     artifacts = submit_lib.artifacts_dir(run_id)
     remote_dir = f"{host.workdir}/{run_id}"

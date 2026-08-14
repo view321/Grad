@@ -37,12 +37,27 @@ exec_timeout_s = 300
 verify_timeout_s = 1800
 kernel_name = "python3"
 
+[models]
+# HANDOFF-2 §16: selected by role, not scattered across sections. Five surfaces
+# share six roles, and `tools/quota.py summary --by-role` reports what each one
+# cost. The Claude 5 family is Fable 5 / Opus 5 / Sonnet 5; there is no Haiku 5,
+# and 4.5 is the latest Haiku.
+research = "claude-opus-5"      # the main loop (§3)
+evolve   = "claude-sonnet-5"    # ShinkaEvolve mutation operators (§21)
+expand   = "claude-haiku-4-5"   # funnel stage 0 (§5)
+triage   = "claude-haiku-4-5"   # funnel stage 3 (§5)
+report   = "claude-opus-5"      # prose synthesis (§22)
+cite     = "claude-haiku-4-5"   # citation resolution -- mechanical matching (§22)
+
 [retrieval]
+# rerank_model and embed_model stay here on purpose: a different provider on a
+# different billing rail. Voyage costs credits, Haiku costs subscription quota,
+# and the reranker is a dedicated cross-encoder that is better at pairwise
+# relevance than a generative model is. Do not fold these into [models]; that is
+# exactly the substitution §16 argues against.
 rerank_model = "voyageai/rerank-2.5"
 embed_model = "voyage-4"
 embed_dim = 1024
-triage_model = "claude-haiku-4-5"
-expand_model = "claude-haiku-4-5"
 rrf_k = 60
 candidates = 300
 rerank_top = 50
@@ -52,13 +67,38 @@ min_request_interval_s = 1.1
 cache_ttl_s = 604800
 
 [agent]
-model = "claude-opus-4-5"
+# The main loop's model lives in [models] research. This key is still read as an
+# override for one release so existing configs keep working.
 # Verify this empirically after any SDK upgrade: `python agent.py --probe`.
 # Mode names and semantics have changed between releases.
 permission_mode = "dontAsk"
 
+[docs]
+# HANDOFF-2 §18. These REST paths were NOT verified when this was written, which
+# is why they are configuration rather than constants. If `tools.docs resolve`
+# returns 404, read context7.com/docs/api-guide and correct them here -- the
+# error message says so too.
+base = "https://context7.com/api/v1"
+resolve_path = "/search"
+docs_path = "/{library_id}"
+cache_ttl_s = 86400
+
+[report]
+# HANDOFF-2 §22. To use a conference template, drop its .sty into
+# reports/<project>/ and name it here; the default compiles on a stock TeX
+# installation with nothing vendored.
+documentclass = "article"
+classoptions = "11pt"
+style = ""            # e.g. "neurips_2024"
+bibstyle = "plainnat"
+
 [hf]
 default_flavor = "a10g-small"
+# Organization to run jobs under when nothing more specific applies. Resolution
+# order is: --namespace, the spec's [target] namespace, the project's `payer`,
+# then this, then personal. Membership is checked against `whoami` before every
+# submission -- org membership changing is precisely the case worth catching.
+# namespace = "myorg"
 
 [hf.flavor_rates]
 # `collect` prices the platform's own start/end timestamps against this table.

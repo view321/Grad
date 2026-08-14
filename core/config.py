@@ -46,8 +46,10 @@ DEFAULTS: dict[str, Any] = {
         "rerank_model": "voyageai/rerank-2.5",
         "embed_model": "voyage-4",
         "embed_dim": 1024,
-        "triage_model": "claude-haiku-4-5",
-        "expand_model": "claude-haiku-4-5",
+        # triage_model / expand_model moved to [models] triage / expand (§16).
+        # They are still *readable* here as overrides -- see LEGACY_MODEL_KEYS --
+        # but they are no longer defaulted here, so [models] is the one place a
+        # role's default lives.
         "rrf_k": 60,
         "candidates": 300,
         "rerank_top": 50,
@@ -55,6 +57,29 @@ DEFAULTS: dict[str, Any] = {
         "cache_ttl_s": 604800,
         "request_timeout_s": 60,
         "min_request_interval_s": 1.1,  # unauthenticated S2 is ~1 req/s
+    },
+    # HANDOFF-2 §18. The REST paths were NOT verified during the design session,
+    # which is why they are configuration rather than constants: read
+    # context7.com/docs/api-guide and correct them here if a request 404s.
+    "docs": {
+        "base": "https://context7.com/api/v1",
+        "resolve_path": "/search",
+        "docs_path": "/{library_id}",
+        "request_timeout_s": 30,
+        "cache_ttl_s": 86400,
+        "min_request_interval_s": 0.5,
+    },
+    # HANDOFF-2 §22. The handoff says "vendor NeurIPS or ICML style. Not a
+    # decision worth deliberating." Rather than commit a third-party .sty file
+    # into this repo, the class and style are configuration: drop
+    # `neurips_2024.sty` into reports/<project>/ and set
+    # `documentclass = "article"` plus `style = "neurips_2024"` here. The default
+    # compiles with a stock TeX installation and no vendored file.
+    "report": {
+        "documentclass": "article",
+        "classoptions": "11pt",
+        "style": "",
+        "bibstyle": "plainnat",
     },
     "preflight": {
         "checks": ["tests", "dry_run", "smoke"],
@@ -76,13 +101,37 @@ DEFAULTS: dict[str, Any] = {
             "a100-large": 4.13,
         },
     },
+    # HANDOFF-2 §16: models are selected by *role*, not scattered across
+    # [agent] and [retrieval]. Five surfaces, six roles; the rerank and embed
+    # models deliberately stay in [retrieval] because they are a different
+    # provider on a different billing rail, and folding them in here invites
+    # the Voyage-for-Haiku substitution §16 argues against.
+    "models": {
+        "research": "claude-opus-5",        # the main loop (§3)
+        "evolve": "claude-sonnet-5",        # ShinkaEvolve mutation operators (§21)
+        "expand": "claude-haiku-4-5",       # funnel stage 0 (§5)
+        "triage": "claude-haiku-4-5",       # funnel stage 3 (§5)
+        "report": "claude-opus-5",          # prose synthesis (§22)
+        "cite": "claude-haiku-4-5",         # citation resolution -- mechanical matching (§22)
+    },
     "agent": {
-        "model": "claude-opus-4-5",
+        "model": "claude-opus-5",
         "permission_mode": "dontAsk",
         "max_turns": 0,  # 0 = unbounded
     },
     "hosts": {},
 }
+
+# One release of backwards compatibility, so an existing config keeps working.
+# The old key wins over the [models] *default* but not over an explicit
+# [models] entry -- see `model_for`.
+LEGACY_MODEL_KEYS: dict[str, tuple[str, str]] = {
+    "research": ("agent", "model"),
+    "expand": ("retrieval", "expand_model"),
+    "triage": ("retrieval", "triage_model"),
+}
+
+MODEL_ROLES = tuple(DEFAULTS["models"])
 
 
 @dataclass(frozen=True)
@@ -102,12 +151,42 @@ class Host:
 @dataclass(frozen=True)
 class Config:
     raw: dict[str, Any] = field(default_factory=dict)
+    # What the file actually said, before the defaults were merged under it.
+    # `model_for` needs the difference: an explicit [models] entry must beat a
+    # legacy key, while the [models] *default* must not.
+    user: dict[str, Any] = field(default_factory=dict)
 
     def section(self, name: str) -> dict[str, Any]:
         return dict(self.raw.get(name, {}))
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
         return self.raw.get(section, {}).get(key, default)
+
+    def model_for(self, role: str) -> str:
+        """The model for one role (HANDOFF-2 §16).
+
+        Resolution: an explicit `[models] <role>` wins; then the legacy key the
+        role replaced (`[agent] model`, `[retrieval] expand_model` /
+        `triage_model`), readable "for one release so existing configs do not
+        break"; then the `[models]` default.
+        """
+        if role not in DEFAULTS["models"]:
+            raise ConfigError(
+                f"unknown model role {role!r}",
+                fix=f"roles are: {', '.join(MODEL_ROLES)}",
+            )
+        explicit = (self.user.get("models") or {}).get(role)
+        if explicit:
+            return str(explicit)
+        legacy = LEGACY_MODEL_KEYS.get(role)
+        if legacy:
+            value = (self.user.get(legacy[0]) or {}).get(legacy[1])
+            if value:
+                return str(value)
+        return str(self.get("models", role, DEFAULTS["models"][role]))
+
+    def models(self) -> dict[str, str]:
+        return {role: self.model_for(role) for role in MODEL_ROLES}
 
     @property
     def hosts(self) -> dict[str, Host]:
@@ -189,7 +268,7 @@ def load(path: Path | None = None, *, reload: bool = False) -> Config:
                 f"{path} is not valid TOML: {exc}",
                 fix=f"fix the syntax in {path}, or delete it to fall back to defaults",
             ) from exc
-    cfg = Config(raw=_merge(DEFAULTS, user))
+    cfg = Config(raw=_merge(DEFAULTS, user), user=user)
     _validate(cfg, path)
     _cache[key] = cfg
     return cfg
@@ -215,7 +294,7 @@ def _validate(cfg: Config, path: Path) -> None:
     # `Config.get` subscripts the section, so `spend = "lots"` in the file would
     # surface as an AttributeError from inside the loop below -- a traceback that
     # reads like a bug in the loader rather than a typo in a TOML file.
-    for section in (*dict.fromkeys(s for s, _ in _NUMERIC), "hf"):
+    for section in (*dict.fromkeys(s for s, _ in _NUMERIC), "hf", "models"):
         table = cfg.raw.get(section)
         if table is not None and not isinstance(table, dict):
             raise ConfigError(
@@ -235,6 +314,21 @@ def _validate(cfg: Config, path: Path) -> None:
             raise ConfigError(
                 f"[{section}] {key} must not be negative",
                 fix=f"fix {section}.{key} in {path}",
+            )
+    # A model id is a string. An integer or a list here would surface as an
+    # opaque SDK error on the first turn rather than as a typo in a TOML file,
+    # and an unknown role name is a silently ignored setting -- which is worse,
+    # because the model it names is never used and nothing says so.
+    for role, value in (cfg.raw.get("models") or {}).items():
+        if role not in DEFAULTS["models"]:
+            raise ConfigError(
+                f"[models] {role} is not a model role",
+                fix=f"roles are: {', '.join(MODEL_ROLES)} (in {path})",
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"[models] {role} must be a model id string, not {type(value).__name__}",
+                fix=f'write it as {role} = "claude-opus-5" in {path}',
             )
     rates = cfg.get("hf", "flavor_rates", {})
     if not isinstance(rates, dict):

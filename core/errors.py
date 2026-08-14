@@ -24,8 +24,12 @@ EXIT_UPSTREAM = 8          # a remote service failed
 EXIT_CHECK_FAILED = 9      # a check ran and reported failure (preflight, nb verify)
 EXIT_RUNNING = 10          # not an error: the job is still in flight
 EXIT_CONFIG = 11           # missing credential, unknown host, malformed config
+# Distinct from 6 on purpose (HANDOFF-2 §15): "this research ran out of its
+# allocation" is not "the machine is out of money", and conflating them makes
+# the wrong fix look right.
+EXIT_PROJECT_BUDGET = 12   # gate: a project's own budget is exhausted
 
-GATE_CODES = {EXIT_PREFLIGHT, EXIT_EXPECTATION, EXIT_SPEND, EXIT_STALE_RUN}
+GATE_CODES = {EXIT_PREFLIGHT, EXIT_EXPECTATION, EXIT_SPEND, EXIT_STALE_RUN, EXIT_PROJECT_BUDGET}
 
 EXIT_MEANINGS = {
     EXIT_OK: "ok",
@@ -40,6 +44,7 @@ EXIT_MEANINGS = {
     EXIT_CHECK_FAILED: "a check failed",
     EXIT_RUNNING: "job still running",
     EXIT_CONFIG: "configuration or credential problem",
+    EXIT_PROJECT_BUDGET: "gate refusal: project budget exceeded",
 }
 
 

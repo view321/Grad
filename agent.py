@@ -30,6 +30,7 @@ from typing import Any
 
 import hooks
 from core import config as config_mod, credentials, paths, quota_log
+from core.errors import EXIT_PROJECT_BUDGET
 
 BUILTIN_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
@@ -64,7 +65,7 @@ def build_options(cfg: Any, *, permission_mode: str | None = None) -> Any:
         "Stop": [sdk.HookMatcher(hooks=[hooks.stop])],
     }
     return sdk.ClaudeAgentOptions(
-        model=str(cfg.get("agent", "model", "claude-opus-4-5")),
+        model=cfg.model_for("research"),
         system_prompt=system_prompt(),
         allowed_tools=BUILTIN_TOOLS,
         disallowed_tools=DENIED_TOOLS,
@@ -81,11 +82,20 @@ def preflight_environment() -> dict[str, Any]:
     so a stray export silently bills the Developer Platform instead of the
     subscription. It is removed here rather than warned about.
     """
+    from core import budget  # noqa: PLC0415
+
     removed = credentials.scrub_environment()
+    cfg = config_mod.load()
+    project_id = budget.current_project()
     return {
         "removed_env": removed,
         "oauth_token_present": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
         "workspace": str(paths.root()),
+        "models": cfg.models(),
+        # Read from ledger/.current_project, not from the environment -- the
+        # scrub above is exactly why the selection is a file (§15).
+        "project": project_id,
+        "project_status": budget.status(project_id) if budget.exists(project_id) else None,
         "note": (
             "auth should be subscription-backed; confirm with `claude /status`. "
             "--bare mode does not read CLAUDE_CODE_OAUTH_TOKEN, so this runs non-bare."
@@ -106,9 +116,9 @@ async def run_session(prompt: str | None, *, once: bool) -> int:
 
     async with sdk.ClaudeSDKClient(options=build_options(cfg)) as client:
         if prompt:
-            await _turn(client, prompt)
+            ran = await _turn(client, prompt)
             if once:
-                return 0
+                return 0 if ran else EXIT_PROJECT_BUDGET
         while True:
             try:
                 # In a worker thread: a bare input() blocks the event loop, and
@@ -126,7 +136,57 @@ async def run_session(prompt: str | None, *, once: bool) -> int:
             await _turn(client, line)
 
 
-async def _turn(client: Any, prompt: str) -> None:
+def check_turn_budget() -> dict[str, Any] | None:
+    """Refuse the *next* turn when the project is out of token allocation.
+
+    HANDOFF-2 §15, and the honesty is the point: tokens are consumed
+    continuously inside a turn and there is no way to refuse mid-turn, so
+    **token budgets are enforced to a granularity of one turn's overrun.** This
+    check is our code end to end -- it depends on no SDK behaviour -- and it runs
+    before `query`, not after.
+
+    Returns a refusal payload, or None to proceed.
+    """
+    try:
+        from core import budget  # noqa: PLC0415
+
+        project_id = budget.current_project()
+        if not project_id or not budget.exists(project_id):
+            return None
+        state = budget.status(project_id)
+    except Exception:  # noqa: BLE001 - accounting must never strand a session
+        return None
+
+    tokens = state["resources"]["quota_tokens"]
+    if not tokens["over"]:
+        return None
+    overrun = tokens["spent"] - float(tokens["ceiling"])
+    return {
+        "project": project_id,
+        "resource": "quota_tokens",
+        "spent": tokens["spent"],
+        "ceiling": tokens["ceiling"],
+        "overrun": overrun,
+        "message": (
+            f"project {project_id} has used {tokens['spent']:,} of its "
+            f"{int(tokens['ceiling']):,} token allocation -- {overrun:,.0f} over. "
+            "Refusing the next turn; the turn that crossed the ceiling was allowed to "
+            "finish, because there is no way to refuse mid-turn."
+        ),
+        "fix": (
+            f"python -m tools.budget raise --project {project_id} "
+            "--quota-tokens <new ceiling> --json"
+        ),
+    }
+
+
+async def _turn(client: Any, prompt: str) -> bool:
+    """Run one turn. Returns False if the budget refused it."""
+    refusal = check_turn_budget()
+    if refusal:
+        print(f"\n[grad] {refusal['message']}\n[grad] fix: {refusal['fix']}", file=sys.stderr)
+        return False
+
     await client.query(prompt)
     async for message in client.receive_response():
         text = _text_of(message)
@@ -134,8 +194,11 @@ async def _turn(client: Any, prompt: str) -> None:
             print(text, end="", flush=True)
         usage = getattr(message, "usage", None)
         if usage is not None:
-            quota_log.from_sdk_usage(quota_log.STAGE_MAIN, usage)
+            quota_log.from_sdk_usage(
+                quota_log.STAGE_MAIN, usage, model=None, role="research"
+            )
     print()
+    return True
 
 
 def _text_of(message: Any) -> str:

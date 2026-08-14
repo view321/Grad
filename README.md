@@ -3,9 +3,10 @@
 A personal research agent for mathematics and machine learning. Runs on one
 person's Windows desktop, backed by a Claude Max subscription.
 
-This is the implementation of [`HANDOFF.md`](HANDOFF.md), which remains the
-design document of record. Where this README and the handoff disagree, the
-handoff is the intent and this file is the report.
+This is the implementation of [`HANDOFF.md`](HANDOFF.md) and its extension
+[`HANDOFF-2.md`](HANDOFF-2.md), which together remain the design documents of
+record. Where this README and the handoffs disagree, the handoffs are the intent
+and this file is the report.
 
 The design temperament is borrowed from Mario Zechner's *pi*: trust the model,
 keep the system prompt small, keep the tool surface small, prefer files and CLIs
@@ -28,12 +29,35 @@ is a sentence in `prompts/system.md`.
 | Notebooks run clean top-to-bottom | `tools/nb.py verify` on a fresh kernel |
 | No general remote-execution capability | credentials in Windows Credential Manager, read only by `jobs.py` / `gpu.py` |
 | Concurrent ledger writes don't corrupt | one locked `core/jsonl.py:append`; no CLI writes a ledger file directly |
+| Token and credit spend stays bounded, not merely measured | `core/budget.py`, checked at every gateable event |
+| An evolutionary campaign cannot outspend its allocation | the campaign gate in `tools/evolve.py`, before generation 0 and before each generation after it |
+| A job submitted to an org is collectable from that org | the namespace is persisted on the run handle, not just passed at submit |
+| Every number in a report traces to a run record | `tools/report.py check` refuses on an unresolved claim |
+| Every citation in a report is a real paper | `report cite` resolves only against the corpus and verified S2 ids |
+| A result that has not been judged cannot be published | `report check` refuses while any cited run has an unjudged deviation |
+
+### The one thing that is *not* fully mechanical, and why
+
+**Subscription tokens are enforced to a granularity of one turn's overrun.**
+Tokens are consumed continuously inside a turn and there is no way to refuse
+mid-turn, so `agent.py` checks the remaining allocation *before* issuing the
+next turn and `hooks.py` denies cost-bearing Bash once the project is over. The
+turn that crosses the ceiling finishes.
+
+A second honesty note: subscription quota is not linear in tokens, and the real
+limits are rolling windows (5-hour and weekly on Max) that the SDK does not
+expose as a remaining balance. **A token ceiling is a proxy you control, not a
+mirror of Anthropic's limit.** The meter says so on screen.
 
 ## Install
 
 ```bash
 pip install -e ".[agent,notebook,retrieval,remote,ui,math,dev]"
 ```
+
+Optional extras, each pinned and each independently skippable: `lab` (the
+embedded JupyterLab, pinned exactly because the 3→4 break is what killed the
+Tabnine extension), `wiki` (RepoWiki), `evolve` (ShinkaEvolve).
 
 The core — ledger, preflight, gates, submitters — needs only the standard
 library plus a file lock. Everything heavier is optional and imported at the
@@ -57,6 +81,7 @@ Store credentials once; they never enter the agent's environment:
 python -m tools.jobs credential set hf_token
 python -m tools.jobs credential set openrouter_key
 python -m tools.jobs credential set voyage_key
+python -m tools.jobs credential set context7_key   # optional; raises rate limits
 ```
 
 ## Run
@@ -87,7 +112,13 @@ that carry the literal next command.
 | `tools/jobs.py` | Hugging Face Jobs: `submit` / `status` / `collect` / `ceilings` / `credential` |
 | `tools/gpu.py` | the same verbs against a known SSH host |
 | `tools/ledger.py` | `expect` / `query` / `verdict` / `falsify` / `verify` / `reindex` |
-| `tools/quota.py` | measured token and credit usage, summarised by stage |
+| `tools/quota.py` | measured token and credit usage, summarised by stage, role, and project |
+| `tools/budget.py` | projects and their ceilings: `new` / `use` / `status` / `raise` / `close` |
+| `tools/docs.py` | is this library call current? introspection first, then Context7 |
+| `tools/evolve.py` | evolutionary search as a budgeted campaign, over ShinkaEvolve |
+| `tools/report.py` | `draft` / `write` / `cite` / `check` / `build` — the report and its gate |
+| `tools/lab.py` | the embedded JupyterLab server (human editing surface) |
+| `tools/wiki.py` | RepoWiki over `core/` and `tools/` — **human-facing only**, not an agent tool |
 
 ### Exit codes
 
@@ -108,10 +139,17 @@ things, and the model should not have to read prose to tell them apart.
 | 9 | a check ran and failed |
 | 10 | job still running (not an error) |
 | 11 | configuration or credential problem |
+| 12 | **gate**: project budget exceeded |
+
+12 is deliberately distinct from 6: "this research ran out of its allocation" is
+not "the machine is out of money", and conflating them makes the wrong fix look
+right.
 
 ## A full cycle
 
 ```bash
+python -m tools.budget new --id proj-scaling-w2 --title "width vs depth" \
+    --gpu-usd 50 --quota-tokens 5e6 --credits-usd 10 --payer hf:myorg --use --json
 python -m tools.preflight run --spec pipeline/spec.toml --only tests,dry_run --json
 python -m tools.jobs submit --spec pipeline/spec.toml --smoke --json
 python -m tools.ledger expect --task scaling-w2 --quantity val_loss@1e9_tokens \
@@ -122,11 +160,14 @@ python -m tools.jobs submit --spec pipeline/spec.toml --expect exp-... --json
 python -m tools.jobs collect run-... --json
 python -m tools.ledger verdict run-... --quantity val_loss@1e9_tokens \
     --verdict bug --note 'lr schedule off by one step' --json
+python -m tools.report draft --project proj-scaling-w2 --json   # free, no model
+python -m tools.report check --project proj-scaling-w2 --json   # the gate
 ```
 
-Skip any of the first three and the fourth refuses, with the command you skipped
-in its `fix` field. `skills/preflight/SKILL.md` documents the submission spec
-format and what each check catches.
+Skip any of the preflight/expectation steps and `submit` refuses, with the
+command you skipped in its `fix` field. Skip the verdict and `report check`
+refuses. `skills/preflight/SKILL.md` documents the submission spec format and
+what each check catches.
 
 ## Layout
 
@@ -138,30 +179,58 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   cli.py              the §8 CLI contract, implemented once
   jsonl.py            the single locked write path to the ledgers
   submission.py       the resolved submission and its hash
-  gates.py            the four submit gates and the smoke carve-out
+  gates.py            the submit gates and the smoke carve-out
+  budget.py           the project dimension and its three ceilings
   ledger_store.py     event-folded runs, rolling spend, staleness, derived index
   submit.py           shared submitter machinery: record, collect, deviations
+  campaign.py         campaigns, candidates, and the evolve-block escape check
+  report.py           the claim and citation guarantees `report check` enforces
   corpus.py           FTS5 + vectors + reciprocal rank fusion
   haiku.py            funnel stages 0 and 3, via forced SDK tools
-  http.py             Semantic Scholar, rerank, embeddings
+  http.py             Semantic Scholar, rerank, embeddings, Context7
 tools/                the CLIs
-ui/                   NiceGUI app and the four widgets
+ui/                   NiceGUI app and the widgets
+config/jupyter/       the Lab server config: framing headers and overrides
 skills/               loaded on demand, not into the default context
-ledger/               expectations.jsonl, runs.jsonl, quota.jsonl, preflight records
+ledger/               expectations.jsonl, runs.jsonl, quota.jsonl, projects.jsonl,
+                      campaigns.jsonl, candidates.jsonl, preflight records
+reports/<project>/    main.tex, claims.json, references.bib, the PDF
 evals/retrieval.jsonl the arbiter for any change to retrieval
 ```
 
 ## Status
 
-Implemented and tested: the ledger, the submission hash, all four gates, the
-smoke caps, the CLI contract, the hook, the persistent kernel, and notebook
-verification. `pytest` covers these — 85 tests, no network, no SDK required.
+Implemented and tested: the ledger, the submission hash, every gate, the smoke
+caps, the CLI contract, the hook, the persistent kernel, notebook verification,
+the project dimension and its three ceilings, HF organization namespaces,
+library-currency checking, the campaign loop and its budget gate, and the report
+generator with all four of its rules. `pytest` covers these — 295 tests, no
+network, no SDK required.
 
 Implemented but not exercised against a live service: the HF Jobs backend, the
-SSH backend, Semantic Scholar, the OpenRouter reranker, Voyage embeddings, and
-the two Haiku funnel stages. They are written against the documented interfaces
-and fail with actionable errors rather than tracebacks, but a real credential
-and a real run are what will find the mismatches.
+SSH backend, Semantic Scholar, the OpenRouter reranker, Voyage embeddings, the
+two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are written
+against the documented interfaces and fail with actionable errors rather than
+tracebacks, but a real credential and a real run are what will find the
+mismatches.
+
+**Carried over unresolved from [HANDOFF-2 §23](HANDOFF-2.md):**
+
+- **Context7's REST endpoint paths were never verified.** They are configuration
+  (`[docs]` in `config/grad.toml`), not constants, and a 404 says so and points
+  at `context7.com/docs/api-guide` rather than looking like a missing library.
+- **Whether ShinkaEvolve exposes a per-candidate callback** decides driver vs.
+  fork. `python -m tools.evolve capabilities --json` answers it against the
+  installed package; the driver assumes generation-boundary granularity, which
+  is what the budget gate is built around.
+- **Whether `headless/claude` works against a Max subscription specifically** is
+  reported in Shinka's release notes and untested here.
+- **Historical records are left as `"unassigned"`** rather than retrofitted with
+  a project. Cheap to change while the ledger is small.
+- **Phase 2 of the campaign loop (remote evaluation) is not enabled.**
+  `--remote` is refused: the gate is proven locally first, because doing the
+  ledger work and the spend work simultaneously against live GPU jobs is how you
+  learn about exit 7 the hard way.
 
 Two things worth knowing before trusting them:
 

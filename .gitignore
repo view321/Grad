@@ -10,13 +10,37 @@ ledger/ledger.sqlite
 ledger/ledger.sqlite-*
 
 # Local corpus and artifacts. The JSONL ledgers ARE tracked on purpose:
-# they are the source of truth and are meant to be human-diffable.
+# they are the source of truth and are meant to be human-diffable --
+# projects.jsonl, campaigns.jsonl, and candidates.jsonl included.
 data/corpus.sqlite
 data/corpus.sqlite-*
 data/papers/
 ledger/runs/
 figures/
 notebooks/.ipynb_checkpoints/
+
+# Which project is selected is machine-local state, not a fact about the
+# research (HANDOFF-2 §15). Two checkouts should not fight over it.
+ledger/.current_project
+
+# Lab server state: a live port, pid, and token. Never committed.
+data/lab/
+
+# RepoWiki output. Generated, human-facing, and deliberately not competing with
+# the hand-written docs (§20).
+data/wiki/
+
+# LaTeX build byproducts. reports/<project>/main.tex, claims.json, and
+# references.bib ARE tracked: they are the checkable artifacts (§22).
+reports/**/*.pdf
+reports/**/*.aux
+reports/**/*.bbl
+reports/**/*.blg
+reports/**/*.fls
+reports/**/*.log
+reports/**/*.out
+reports/**/*.fdb_latexmk
+reports/**/claims.tex
 
 # Credentials never live in the workspace (HANDOFF §9). This is belt and braces.
 .env

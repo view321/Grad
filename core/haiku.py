@@ -117,6 +117,7 @@ async def _call(
     system_prompt: str,
     user_prompt: str,
     model: str,
+    role: str,
     log_name: str,
 ) -> dict[str, Any]:
     sdk = _sdk()
@@ -149,7 +150,7 @@ async def _call(
         usage = getattr(message, "usage", None) or usage
 
     quota_log.from_sdk_usage(
-        stage, usage, model=model,
+        stage, usage, model=model, role=role,
         detail={"tool": tool_name, "captured": bool(captured)},
     )
     _log_io(log_name, stage, system_prompt, user_prompt, transcript, captured)
@@ -238,6 +239,7 @@ def expand(question: str, *, model: str, log_name: str) -> dict[str, Any]:
             system_prompt=EXPAND_PROMPT,
             user_prompt=f"Research question:\n\n{question}",
             model=model,
+            role="expand",
             log_name=log_name,
         )
     )
@@ -282,6 +284,7 @@ def triage(question: str, candidates: list[dict[str, Any]], *, model: str, log_n
             system_prompt=TRIAGE_PROMPT,
             user_prompt=f"Research question:\n\n{question}\n\nCandidates:\n\n{listing}",
             model=model,
+            role="triage",
             log_name=log_name,
         )
     )
