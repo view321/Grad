@@ -231,9 +231,12 @@ money".
 
 ### UI
 
-The header meter ([ui/widgets/quota_meter.py](ui/widgets/quota_meter.py)) gains a project
-selector and shows three bars rather than one. The Quota tab gains a per-project breakdown by
-stage. Both read the ledger; no new logic in the UI, per §10.
+The header meter ([ui/models.py](ui/models.py) `quota_model`, rendered by
+[ui/windows/quota.py](ui/windows/quota.py)) gains a project selector and shows three bars
+rather than one. The Quota window gains a per-project breakdown by stage. Both read the
+ledger; no new logic in the UI, per §10. (The tab strip and `ui/widgets/*` this section
+originally named were replaced by the window system; the behaviour described here is
+unchanged.)
 
 ---
 
@@ -675,8 +678,16 @@ about exit 7 the hard way.
 python -m tools.evolve init --task-dir pipeline/evolve-lr --json
 python -m tools.evolve run --project proj-scaling-w2 --generations 20 --local --json
 python -m tools.evolve status --campaign camp-... --json
+python -m tools.evolve halt --campaign camp-... --json    # stops at the next generation boundary
 python -m tools.evolve promote --campaign camp-... --candidate 47 --json   # into a normal run
 ```
+
+`halt` is a request written to the ledger, not a signal: `run` holds the loop in
+whatever process started it, so the UI and a second terminal have no handle on
+it. The loop reads the request between generations — the same boundary the
+budget gate stops at, and for the same reason. Killing mid-generation would
+abandon an in-flight candidate, which goes stale and blocks every future
+submission (exit 7).
 
 Default models per §16: Sonnet 5 primary plus Haiku 4.5 explorer.
 

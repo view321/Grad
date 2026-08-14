@@ -20,7 +20,7 @@ import argparse
 import pytest
 
 from core import budget, campaign as camp, config as config_mod, ledger_store as ls, paths
-from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, GradError, UsageError
+from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, GradError, NotFound, UsageError
 from tools import evolve
 
 
@@ -470,3 +470,161 @@ def test_capabilities_names_the_granularity_it_found(workspace):
         assert isinstance(report["driver_viable"], bool)
     else:
         assert "shinka" in report["reason"]
+
+
+# ---------------------------------------------------------------------------
+# halting (the UI's ■ HALT, and the CLI behind it)
+# ---------------------------------------------------------------------------
+class HaltingMutator(FakeMutator):
+    """Requests a halt from inside generation 0, the way a human would from the
+    workspace while the loop is mid-generation."""
+
+    def __init__(self, campaign_getter, **kwargs):
+        super().__init__(**kwargs)
+        self._campaign = campaign_getter
+
+    def propose(self, *, generation, population, best):
+        if generation == 0:
+            camp.request_halt(self._campaign(), reason="halted from the workspace")
+        return super().propose(generation=generation, population=population, best=best)
+
+
+def test_a_halt_stops_the_loop_at_the_next_generation_boundary(workspace, monkeypatch):
+    """Not a kill. Stopping mid-generation would abandon an in-flight candidate,
+    which goes stale and blocks every future submission -- so the check sits at
+    the same boundary the budget gate stops at."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(
+        evolve, "_make_mutator",
+        lambda *a, **k: HaltingMutator(lambda: next(iter(camp.campaigns()))),
+    )
+    result = evolve.cmd_run(run_args(task_dir, make_expectation(), generations=5, population=2))
+
+    assert result["status"] == "halted"
+    # Generation 0 completed; generation 1 never started -- and the folded
+    # campaign has to agree with the returned count, because the evolve window
+    # reads the folded one for its title bar.
+    assert result["generations_run"] == 1
+    assert camp.campaign(result["campaign"])["generations_run"] == 1
+    assert len(camp.candidates(result["campaign"])) == 2
+    # And nothing is left half-evaluated.
+    assert all(r.get("metrics") or r.get("error") for r in camp.candidates(result["campaign"]))
+    assert camp.campaign(result["campaign"])["status"] == "halted"
+
+
+def test_halt_is_a_request_the_ledger_carries(workspace, monkeypatch):
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(run_args(task_dir, make_expectation()))
+    campaign_id = result["campaign"]
+
+    # A closed campaign is told so rather than handed a request nothing reads.
+    payload = evolve.cmd_halt(argparse.Namespace(campaign=campaign_id, reason="", json=True))
+    assert payload["halted"] is False
+    assert "already" in payload["message"]
+    assert camp.halt_requested(campaign_id) is False
+
+
+def test_halt_on_an_open_campaign_records_the_request(workspace):
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    payload = evolve.cmd_halt(argparse.Namespace(campaign="camp-1", reason="too slow", json=True))
+    assert payload["halted"] is True
+    assert camp.halt_requested("camp-1") is True
+    assert camp.campaign("camp-1")["halt_reason"] == "too slow"
+
+
+def test_halting_an_unknown_campaign_is_a_not_found(workspace):
+    with pytest.raises(NotFound):
+        evolve.cmd_halt(argparse.Namespace(campaign="nope", reason="", json=True))
+
+
+def test_a_halt_request_is_validated_inside_the_append_lock(workspace):
+    """The loop closing a campaign and a human halting it are two processes
+    racing over one file, so a check made before the lock is a check the other
+    process can win. Same backstop as `append_run_event`'s binding check."""
+    with pytest.raises(NotFound):
+        camp.request_halt("camp-nope")
+    assert camp.campaign_events() == []
+
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.close_campaign("camp-1", status="closed")
+    before = len(camp.campaign_events())
+
+    with pytest.raises(GradError) as exc:
+        camp.request_halt("camp-1")
+    assert exc.value.code == "campaign_not_open"
+    # Rejected under the lock means nothing was written.
+    assert len(camp.campaign_events()) == before
+    assert camp.halt_requested("camp-1") is False
+
+
+def test_losing_the_halt_race_reports_closed_rather_than_raising(workspace, monkeypatch):
+    """The campaign closed between the CLI's check and the append. That is the
+    halt getting what it wanted a moment early, not a failure."""
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.close_campaign("camp-1", status="closed")
+
+    real = camp.campaign
+    calls = {"n": 0}
+
+    def stale_first(campaign_id):
+        # The pre-check sees a campaign that is still open; the precondition,
+        # reading under the lock, sees the truth.
+        calls["n"] += 1
+        record = dict(real(campaign_id))
+        if calls["n"] == 1:
+            record["status"] = "open"
+        return record
+
+    monkeypatch.setattr(evolve.camp, "campaign", stale_first)
+    payload = evolve.cmd_halt(argparse.Namespace(campaign="camp-1", reason="", json=True))
+    assert payload["halted"] is False
+    assert payload["status"] == "closed"
+    assert camp.halt_requested("camp-1") is False
+
+
+def test_a_boundary_record_does_not_count_as_a_generation_that_ran(workspace):
+    """Both the budget gate and a halt write a generation record at the boundary
+    they stop *before*. Counting it reported a campaign halted after generation
+    0 as having run two -- which is the number the evolve window puts in its
+    title bar."""
+    camp.append_campaign(
+        {"type": camp.T_CAMPAIGN, "id": "camp-1", "status": "open", "at": camp.now_iso()}
+    )
+    camp.record_generation("camp-1", 0)
+    assert camp.campaign("camp-1")["generations_run"] == 1
+
+    camp.record_generation("camp-1", 1, halted=True, reason="halt requested")
+    assert camp.campaign("camp-1")["generations_run"] == 1
+    # The boundary is still on the record; it is just not counted as work done.
+    assert camp.campaign("camp-1")["generation_log"][-1]["halted"] is True
+
+
+def test_the_budget_boundary_record_is_not_counted_either(workspace, monkeypatch):
+    """The same off-by-one existed on the pre-existing exhausted path."""
+    budget.create("proj-1", title="t", budget={"gpu_usd": 10.0})
+    task_dir = scaffold(workspace)
+
+    class ConcurrentSpender(FakeMutator):
+        def propose(self, *, generation, population, best):
+            if generation == 1:
+                ls.append_run_event(
+                    {"type": ls.T_RUN_SUBMITTED, "id": ls.new_id("run"), "status": "in_flight",
+                     "submitted_at": ls.now_iso(), "project": "proj-1", "estimate_usd": 9.0}
+                )
+            return super().propose(generation=generation, population=population, best=best)
+
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: ConcurrentSpender())
+    result = evolve.cmd_run(
+        run_args(task_dir, make_expectation(), project="proj-1",
+                 generations=5, population=2, estimate_per_candidate_usd=0.5)
+    )
+    assert result["status"] == "exhausted"
+    folded = camp.campaign(result["campaign"])
+    assert folded["generations_run"] == result["generations_run"]

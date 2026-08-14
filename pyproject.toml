@@ -25,7 +25,11 @@ agent = ["claude-agent-sdk>=0.1.0"]
 notebook = ["jupyter-client>=8.6", "ipykernel>=6.29", "nbformat>=5.10", "nbconvert>=7.16"]
 retrieval = ["httpx>=0.27", "sqlite-vec>=0.1.6"]
 remote = ["keyring>=25.0", "huggingface-hub>=0.24"]
-ui = ["nicegui>=2.0", "pywebview>=5.0", "nbformat>=5.10", "nbconvert>=7.16"]
+# NiceGUI 3 is a floor, not a preference: the window system needs `Element.move`
+# to reparent a window between panes without rebuilding it, and `shared=True` on
+# `add_head_html`/`add_body_html`, which 3.0 requires when global-scope markup
+# coexists with a `@ui.page` route. On 2.x the shell raises at page build.
+ui = ["nicegui>=3.0", "pywebview>=5.0", "nbformat>=5.10", "nbconvert>=7.16"]
 math = ["sympy>=1.13", "mpmath>=1.3"]
 # HANDOFF-2 §19: the extension set is *declared*, not accumulated, and every pin
 # is exact rather than a floor. The JupyterLab 3->4 break is what killed the
@@ -53,7 +57,13 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 grad = "agent:main"
 
 [tool.setuptools]
-packages = ["core", "tools", "ui", "ui.widgets"]
+packages = ["core", "tools", "ui", "ui.windows"]
+
+# The stylesheet is generated from `ui/tokens.py`, but `tiling.js` and any
+# vendored fonts are real files and have to travel with the wheel -- without
+# them an installed Grad has no pane dragging and no typefaces.
+[tool.setuptools.package-data]
+ui = ["static/*.js", "static/fonts/*", "assets/katex/**/*"]
 # Top-level modules, not packages. Without these the installed `grad` command
 # cannot import `agent:main`, and `hooks` would be missing under it.
 py-modules = ["agent", "hooks"]

@@ -34,15 +34,16 @@ from pathlib import Path
 from typing import Any
 
 from core import jsonl, paths
-from core.errors import NotFound
+from core.errors import EXIT_USAGE, GradError, NotFound
 
 T_CAMPAIGN = "campaign"
 T_GENERATION = "campaign_generation"
 T_CAMPAIGN_CLOSED = "campaign_closed"
+T_HALT_REQUESTED = "campaign_halt_requested"
 T_CANDIDATE = "candidate"
 T_CANDIDATE_PROMOTED = "candidate_promoted"
 
-STATUSES = ("open", "closed", "exhausted", "failed")
+STATUSES = ("open", "closed", "exhausted", "failed", "halted")
 
 # Shinka's own markers, kept verbatim so a task directory works with the
 # upstream tool unmodified.
@@ -152,11 +153,23 @@ def campaigns() -> dict[str, dict[str, Any]]:
             folded[cid] = {**{k: v for k, v in rec.items() if k != "type"}, "generations_run": 0}
         elif cid in folded and kind == T_GENERATION:
             node = folded[cid]
-            node["generations_run"] = max(node["generations_run"], int(rec.get("generation", 0)) + 1)
+            # A record carrying `halted` documents the generation the loop
+            # stopped *before*, not one it ran -- both the budget gate and a
+            # halt request write one at the boundary they break on. Counting it
+            # reported a campaign halted after generation 0 as having run two,
+            # which is the number the evolve window puts in its title bar.
+            if not rec.get("halted"):
+                node["generations_run"] = max(
+                    node["generations_run"], int(rec.get("generation", 0)) + 1
+                )
             node["last_generation_at"] = rec.get("at")
             node.setdefault("generation_log", []).append(
                 {k: v for k, v in rec.items() if k not in ("type", "id")}
             )
+        elif cid in folded and kind == T_HALT_REQUESTED:
+            folded[cid]["halt_requested"] = True
+            folded[cid]["halt_requested_at"] = rec.get("at")
+            folded[cid]["halt_reason"] = rec.get("reason")
         elif cid in folded and kind == T_CAMPAIGN_CLOSED:
             folded[cid]["status"] = rec.get("status", "closed")
             folded[cid]["closed_at"] = rec.get("at")
@@ -189,6 +202,56 @@ def close_campaign(campaign_id: str, *, status: str = "closed", reason: str = ""
         {"type": T_CAMPAIGN_CLOSED, "id": campaign_id, "at": now_iso(),
          "status": status, "reason": reason}
     )
+
+
+def request_halt(campaign_id: str, *, reason: str = "") -> dict[str, Any]:
+    """Ask a running campaign to stop at the next generation boundary.
+
+    A *request*, written to the ledger, rather than a signal: `evolve run` holds
+    the loop in whatever process started it -- usually the agent's -- and the UI
+    or a second terminal has no handle on it. An event both processes can see is
+    the only mechanism that works across all three callers, and it has the
+    side benefit of being diffable afterwards.
+
+    The boundary matters as much as the request. Killing the loop mid-generation
+    abandons an in-flight candidate, which goes stale and blocks every future
+    submission (exit 7) -- so `_drive` checks this exactly where the budget gate
+    already stops cleanly, with every candidate collected.
+
+    The campaign must exist and still be open, and that is checked *inside the
+    append lock* for the same reason `append_run_event` re-checks its binding
+    there: the loop closing a campaign and a human asking it to halt are two
+    processes racing over one file, and a check made before the lock is a check
+    the other process can win. `tools.evolve halt` still checks first, because
+    it produces the better message; this is the backstop, not the explanation.
+    """
+
+    def _still_open() -> None:
+        record = campaigns().get(campaign_id)
+        if record is None:
+            raise NotFound(
+                f"campaign {campaign_id!r} does not exist",
+                fix="python -m tools.evolve status --json   # lists known campaigns",
+            )
+        status = record.get("status")
+        if status != "open":
+            raise GradError(
+                "campaign_not_open",
+                f"campaign {campaign_id!r} is {status}, so there is nothing to halt",
+                exit_code=EXIT_USAGE,
+                fix=f"python -m tools.evolve status --campaign {campaign_id} --json",
+            )
+
+    return jsonl.append(
+        campaigns_path(),
+        {"type": T_HALT_REQUESTED, "id": campaign_id, "at": now_iso(), "reason": reason},
+        precondition=_still_open,
+    )
+
+
+def halt_requested(campaign_id: str) -> bool:
+    record = campaigns().get(campaign_id) or {}
+    return bool(record.get("halt_requested"))
 
 
 # ---------------------------------------------------------------------------
