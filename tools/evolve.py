@@ -116,6 +116,7 @@ def mutator_capabilities() -> dict[str, Any]:
 
     runner = getattr(shinka, "ShinkaEvolveRunner", None)
     hooks: list[str] = []
+    methods: list[str] = []
     if runner is not None:
         try:
             params = inspect.signature(runner.__init__).parameters
@@ -126,19 +127,40 @@ def mutator_capabilities() -> dict[str, Any]:
             for name in params
             if any(word in name for word in ("callback", "hook", "on_", "listener"))
         ]
+        methods = sorted(
+            n for n in dir(runner) if not n.startswith("_") and callable(getattr(runner, n, None))
+        )
+
+    per_generation = next(
+        (n for n in ShinkaMutator.PROPOSE_METHODS if n in methods), None
+    )
+    if hooks:
+        granularity, note = "candidate", (
+            "a per-candidate hook exists; finer budget charging is possible without a fork"
+        )
+    elif per_generation:
+        granularity, note = "generation", (
+            f"no per-candidate hook, but `{per_generation}()` yields one generation at a "
+            "time, so the budget is re-checked at generation boundaries. Driver, not fork."
+        )
+    else:
+        granularity, note = "campaign", (
+            "no per-candidate hook and no per-generation entry point -- the runner exposes "
+            "only whole-loop methods, which own the loop this driver needs to interrupt. "
+            "This is the evidence §21 said a fork should wait for: `evolve run` refuses "
+            "rather than handing control away with the budget unchecked."
+        )
+
     return {
         "installed": True,
         "version": getattr(shinka, "__version__", None),
         "runner": runner is not None,
         "per_candidate_hooks": hooks,
-        "granularity": "candidate" if hooks else "generation",
-        "note": (
-            "no per-candidate hook found; budget is charged at generation boundaries, "
-            "which is what this driver is designed around. A fork is only warranted if "
-            "that granularity proves insufficient."
-            if not hooks
-            else "a per-candidate hook exists; finer budget charging is possible without a fork"
-        ),
+        "per_generation_method": per_generation,
+        "runner_methods": methods[:20],
+        "granularity": granularity,
+        "driver_viable": bool(hooks or per_generation),
+        "note": note,
     }
 
 
@@ -592,6 +614,11 @@ def _evaluate_candidate(
                 "skipped": True,
                 "error": "mutation escaped the evolve block; needs a fresh smoke run",
                 "duration_s": round(time.time() - started, 3),
+                # It never ran, so it cost nothing. Charging the per-candidate
+                # estimate anyway would consume the project's allocation for
+                # work that was declined, and a campaign that mostly escapes
+                # would exhaust its budget having evaluated almost nothing.
+                "cost_usd": 0.0,
             }
         )
         camp.append_candidate(record)
@@ -656,6 +683,13 @@ class ShinkaMutator:
         self.models = models
         self.overrides = overrides
         self._runner: Any = None
+        self._method: str = ""
+
+    # A per-generation entry point, under any of the names an upstream release
+    # might plausibly use. `run` and `run_async` are deliberately NOT here: they
+    # drive the whole campaign themselves, which is precisely the control this
+    # driver needs to keep in order to charge the budget between generations.
+    PROPOSE_METHODS = ("propose", "propose_generation", "step", "ask")
 
     def _build(self) -> Any:
         shinka = _shinka()
@@ -666,30 +700,64 @@ class ShinkaMutator:
             )
             job = shinka.LocalJobConfig(eval_program_path=str(self.task_dir / "evaluate.py"))
             database = shinka.DatabaseConfig()
-            return shinka.ShinkaEvolveRunner(
+            runner = shinka.ShinkaEvolveRunner(
                 evo_config=evolution, job_config=job, db_config=database
             )
         except (AttributeError, TypeError) as exc:
             raise ConfigError(
                 f"the installed shinka-evolve does not match the expected API: {exc}",
                 fix=(
-                    "check ShinkaEvolveRunner's signature against the installed version "
+                    "check the constructor against the installed version "
                     "(`python -m tools.docs signature shinka ShinkaEvolveRunner --json`), "
                     "then adjust ShinkaMutator"
                 ),
             ) from exc
 
+        method = self._propose_method(runner)
+        if method is None:
+            # This is §23 item 1 answered at runtime, and it is the evidence §21
+            # said a fork should wait for: `ShinkaEvolveRunner` exposes `run` and
+            # `run_async`, both of which own the whole loop. A driver cannot
+            # charge the budget between generations through an API that only
+            # offers "run everything", so it refuses rather than either handing
+            # control away or calling a method that does not exist.
+            available = sorted(
+                n for n in dir(runner) if not n.startswith("_") and callable(getattr(runner, n, None))
+            )
+            raise ConfigError(
+                "the installed ShinkaEvolveRunner exposes no per-generation entry point, "
+                "only whole-loop methods, so the campaign budget could not be re-checked "
+                "between generations. HANDOFF-2 §21 defers a fork until exactly this "
+                "evidence appears; this is it. "
+                f"Available: {', '.join(available[:12]) or '(none)'}",
+                fix=(
+                    "run the campaign against a driver you control -- or fork Shinka to "
+                    "expose one generation at a time, which is the point at which §21's "
+                    "'driver, not fork' decision flips. "
+                    "`python -m tools.evolve capabilities --json` reports what was found."
+                ),
+            )
+        self._method = method
+        return runner
+
+    @classmethod
+    def _propose_method(cls, runner: Any) -> str | None:
+        for name in cls.PROPOSE_METHODS:
+            if callable(getattr(runner, name, None)):
+                return name
+        return None
+
     def propose(self, *, generation: int, population: int, best: dict[str, Any] | None) -> list[str]:
         if self._runner is None:
             self._runner = self._build()
-        proposals = self._runner.propose(
+        proposals = getattr(self._runner, self._method)(
             generation=generation, population=population, parent=(best or {}).get("source")
         )
         quota_log.record(
             STAGE_EVOLVE,
             role="evolve",
             model=",".join(self.models),
-            detail={"generation": generation, "population": population},
+            detail={"generation": generation, "population": population, "method": self._method},
         )
         return [str(p) for p in proposals]
 

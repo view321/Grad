@@ -382,3 +382,31 @@ def test_a_non_hf_payer_yields_no_namespace(workspace):
     budget.create("proj-1", title="t", budget={}, payer="lab-account")
     assert budget.hf_namespace("proj-1") is None
     assert budget.hf_namespace(None) is None
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def test_an_unknown_project_is_refused_rather_than_unbounded(workspace):
+    """A typo in --project must not buy an unlimited allocation.
+
+    Every ceiling check treats an unknown id as unbounded, so silently accepting
+    one would make this dimension the easiest way to spend *more* than before it
+    existed.
+    """
+    from core.errors import UsageError
+
+    make_project("proj-1", gpu_usd=1.0)
+    with pytest.raises(UsageError) as exc:
+        budget.resolve("proj-l")           # lowercase L, not a 1
+    assert "does not exist" in str(exc.value)
+    assert "proj-1" in str(exc.value), "the error should name the real projects"
+
+
+def test_no_project_at_all_is_still_fine(workspace):
+    """Work outside a project stays allowed; only a *named* unknown is refused."""
+    assert budget.resolve(None) is None
+    make_project("proj-1", gpu_usd=1.0)
+    budget.set_current("proj-1")
+    assert budget.resolve(None) == "proj-1"
+    assert budget.resolve("proj-1") == "proj-1"

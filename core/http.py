@@ -186,23 +186,29 @@ class Context7:
     fetch and the cache live. Documentation lookups repeat heavily, and
     `core/http.py` already has the TTL cache and the rate limiter.
 
-    **The endpoint paths were not verified during the design session.** They are
-    configurable for exactly that reason: read `context7.com/docs/api-guide` and
-    fix `[docs] resolve_path` / `docs_path` in config/grad.toml rather than
-    editing code. A 404 here reports the path it tried, so the mismatch names
-    itself.
+    The endpoint paths and the response keys below are verified against the live
+    API. They remain configurable because a third-party API can move, and a 404
+    should be a one-line config edit rather than a code change -- the error says
+    which path it tried, so the mismatch names itself.
     """
 
     def __init__(self, cfg: Config) -> None:
-        self.base = str(cfg.get("docs", "base", "https://context7.com/api/v1")).rstrip("/")
-        self.resolve_path = str(cfg.get("docs", "resolve_path", "/search"))
-        self.docs_path = str(cfg.get("docs", "docs_path", "/{library_id}"))
+        self.base = str(cfg.get("docs", "base", "https://context7.com")).rstrip("/")
+        self.resolve_path = str(cfg.get("docs", "resolve_path", "/api/v2/libs/search"))
+        self.docs_path = str(cfg.get("docs", "docs_path", "/api/v2/context"))
         self.timeout = float(cfg.get("docs", "request_timeout_s", 30))
         self.ttl = float(cfg.get("docs", "cache_ttl_s", 86400))
         self.interval = float(cfg.get("docs", "min_request_interval_s", 0.5))
         # Free from their dashboard, and it raises rate limits rather than
-        # unlocking anything -- so its absence is a note, not an error.
-        self.key = credentials.get(credentials.CONTEXT7_KEY, required=False)
+        # unlocking anything -- so its absence is a note, not an error. That
+        # includes the case where the credential *store* is unreachable: on a
+        # machine with no keyring installed, `credentials.get` raises even for
+        # an optional credential, and letting that propagate would make an
+        # anonymous lookup impossible for want of a key it does not need.
+        try:
+            self.key = credentials.get(credentials.CONTEXT7_KEY, required=False)
+        except ConfigError:
+            self.key = None
 
     @property
     def authenticated(self) -> bool:
@@ -243,9 +249,8 @@ class Context7:
             raise UpstreamError(
                 f"Context7 returned 404 for {url}",
                 fix=(
-                    "the REST paths were not verified when this was written -- read "
-                    "context7.com/docs/api-guide and set [docs] resolve_path / docs_path "
-                    "in config/grad.toml"
+                    "the API may have moved: read context7.com/docs/api-guide and set "
+                    "[docs] base / resolve_path / docs_path in config/grad.toml"
                 ),
             )
         if resp.status_code >= 400:
@@ -266,7 +271,7 @@ class Context7:
         The MCP tool this mirrors is `resolve-library-id`; note that the docs
         tool is `query-docs`, and `get-library-docs` in older material is stale.
         """
-        data = self._get(self.resolve_path, {"query": name})
+        data = self._get(self.resolve_path, {"libraryName": name, "query": name})
         results = data.get("results") if isinstance(data, dict) else data
         out = []
         for item in results or []:
@@ -285,12 +290,30 @@ class Context7:
         return [o for o in out if o["library_id"]]
 
     def docs(self, library_id: str, query: str, *, tokens: int = 5000) -> dict[str, Any]:
-        """Documentation for a library, narrowed by a topic query."""
-        path = self.docs_path.format(library_id=library_id.lstrip("/"))
-        data = self._get(path, {"topic": query, "tokens": tokens, "type": "json"})
+        """Documentation for a library, narrowed by a topic query.
+
+        `type=json` matters: without it the endpoint returns markdown prose,
+        which is fine for a human and useless as a `--json` payload.
+        """
+        params = {"libraryId": library_id, "query": query, "tokens": tokens, "type": "json"}
+        # A path template is still honoured, so an older `/{library_id}` style
+        # endpoint keeps working from config alone.
+        if "{library_id}" in self.docs_path:
+            path = self.docs_path.format(library_id=library_id.lstrip("/"))
+            params.pop("libraryId")
+            params["topic"] = params.pop("query")
+        else:
+            path = self.docs_path
+        data = self._get(path, params)
+
         if isinstance(data, dict) and "text" in data and len(data) == 1:
             return {"library_id": library_id, "query": query, "text": data["text"]}
-        snippets = data.get("snippets") if isinstance(data, dict) else None
+        # The key differs by API version -- `codeSnippets` on v2, `snippets` on
+        # v1 -- and reading only one of them turns a working response into an
+        # empty result that looks like "this library has no docs".
+        snippets = None
+        if isinstance(data, dict):
+            snippets = data.get("codeSnippets") or data.get("snippets")
         return {
             "library_id": library_id,
             "query": query,

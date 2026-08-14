@@ -41,10 +41,12 @@ lab = [
 ]
 # §20: human-facing only. Not in the agent's tool list and not in system.md.
 wiki = ["repowiki==0.3.1"]
-# §21: the evolutionary search driver. Optional because `tools/evolve.py` runs
-# its own local loop when Shinka is absent, and the campaign bookkeeping and
-# budget gate -- the parts that matter -- are ours either way.
-evolve = ["shinka-evolve>=0.2"]
+# §21: the evolutionary search driver. Pinned exactly, like the `lab` extra, and
+# to a version that actually exists: 0.0.7 is the latest published release, so
+# the `>=0.2` this originally carried was unsatisfiable and would have failed at
+# install time. Optional because the campaign bookkeeping and the budget gate --
+# the parts that matter -- are ours either way.
+evolve = ["shinka-evolve==0.0.7"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]

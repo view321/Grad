@@ -6,8 +6,16 @@ of wondering why the iframe is blank".
 **Framing.** JupyterLab ships `X-Frame-Options: SAMEORIGIN` and a
 `frame-ancestors 'self'` CSP, both of which block embedding from another origin.
 Lab runs on its own port, so the Grad app *is* another origin. The headers below
-override that for the app's origin only -- not for `*`, which would let any page
+override both for the app's origin only -- not for `*`, which would let any page
 frame a server that can execute code as this user.
+
+`X-Frame-Options` has no origin list (it is SAMEORIGIN or DENY), so it is
+cleared explicitly in the headers dict and the CSP does the scoping. It is
+cleared *here* rather than via `xheaders`: `xheaders` controls whether Tornado
+trusts `X-Forwarded-*` / `X-Real-Ip` from a proxy and has nothing to do with
+framing. Setting `xheaders = False` and expecting the frame header to disappear
+leaves Jupyter emitting `SAMEORIGIN`, and the iframe stays blank in every
+browser that honours it -- the exact failure this file exists to prevent.
 
 **Origin checks.** A cross-origin websocket from the app's port is rejected by
 default, which breaks the kernel connection while the page still renders. That
@@ -31,17 +39,24 @@ c.ServerApp.ip = "127.0.0.1"
 c.ServerApp.open_browser = False
 c.ServerApp.port = int(_LAB_PORT)
 
+# `127.0.0.1:8080` and `localhost:8080` are different origins to a browser, and
+# which one the app is opened on is not something this file gets to decide. The
+# alias is only added when the configured origin actually carries a numeric
+# port: `rsplit(':', 1)[-1]` on a portless origin like `http://example.com`
+# yields `example.com`, and `http://localhost:example.com` is an invalid source
+# that browsers drop silently -- narrowing the allowed ancestors instead of
+# widening them.
+_PORT = _APP_ORIGIN.rsplit(":", 1)[-1]
+_LOCALHOST_ALIAS = f" http://localhost:{_PORT}" if _PORT.isdigit() else ""
+
 # Framing, scoped to the app's origin rather than to `*`.
 c.ServerApp.tornado_settings = {
     "headers": {
-        "Content-Security-Policy": (
-            f"frame-ancestors 'self' {_APP_ORIGIN} http://localhost:{_APP_ORIGIN.rsplit(':', 1)[-1]}"
-        ),
+        "Content-Security-Policy": f"frame-ancestors 'self' {_APP_ORIGIN}{_LOCALHOST_ALIAS}",
+        # Cleared deliberately; the CSP above does the scoping. See the module
+        # docstring for why this is not `xheaders`.
+        "X-Frame-Options": "",
     },
-    # X-Frame-Options has no origin list -- it is SAMEORIGIN or DENY -- so it is
-    # removed and the CSP above does the work. Leaving it set would win over the
-    # CSP in browsers that honour both.
-    "xheaders": False,
 }
 c.ServerApp.allow_origin = _APP_ORIGIN
 c.ServerApp.allow_credentials = True

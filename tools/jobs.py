@@ -370,6 +370,16 @@ def run_smoke(
     command = _smoke_command(sub, caps)
     if namespace is None:
         namespace = resolve_namespace(None, sub, cfg, project or budget.current_project())
+
+    # Everything that can fail for a *configuration* reason resolves before the
+    # ledger record exists. `_hub()` raises when huggingface_hub is missing and
+    # `_ns_kwargs()` raises when the installed one cannot take a namespace;
+    # either one landing after `record_smoke_run` leaves a phantom in-flight
+    # estimate sitting on the monthly ceiling for a job that never reached the
+    # platform -- which then goes stale and blocks every later submission.
+    hub = _hub()
+    ns_kwargs = _ns_kwargs(namespace)
+
     run_id = submit_lib.record_smoke_run(
         sub, cfg=cfg, platform=PLATFORM,
         target={"flavor": flavor, "platform": "hf", "namespace": namespace},
@@ -378,7 +388,6 @@ def run_smoke(
     artifacts = submit_lib.artifacts_dir(run_id)
 
     try:
-        hub = _hub()
         job = hub.run_job(
             image=sub.image,
             command=command,
@@ -386,7 +395,7 @@ def run_smoke(
             env={**_job_env(sub), "GRAD_SMOKE": "1"},
             token=_token(),
             timeout=caps["timeout_s"],
-            **_ns_kwargs(namespace),
+            **ns_kwargs,
         )
     except ConfigError:
         raise

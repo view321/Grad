@@ -74,13 +74,13 @@ cache_ttl_s = 604800
 permission_mode = "dontAsk"
 
 [docs]
-# HANDOFF-2 §18. These REST paths were NOT verified when this was written, which
-# is why they are configuration rather than constants. If `tools.docs resolve`
-# returns 404, read context7.com/docs/api-guide and correct them here -- the
-# error message says so too.
-base = "https://context7.com/api/v1"
-resolve_path = "/search"
-docs_path = "/{library_id}"
+# HANDOFF-2 §18, and §23 item 2 is now closed: these paths are verified against
+# the live Context7 API. They stay configuration rather than constants because a
+# third-party API can move, and a 404 should be a one-line edit here rather than
+# a code change -- the error message says exactly that.
+base = "https://context7.com"
+resolve_path = "/api/v2/libs/search"
+docs_path = "/api/v2/context"
 cache_ttl_s = 86400
 
 [report]

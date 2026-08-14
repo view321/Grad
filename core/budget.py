@@ -91,9 +91,27 @@ def set_current(project_id: str | None) -> None:
 
 
 def resolve(explicit: str | None = None) -> str | None:
-    """`--project` beats the selection file. Neither is an error: work outside
-    a project is allowed and lands under `unassigned`."""
-    return explicit or current_project()
+    """`--project` beats the selection file.
+
+    Having *no* project is fine -- work outside one is allowed and lands under
+    `unassigned`. Naming one that does not exist is not: every ceiling check
+    treats an unknown id as unbounded, so a typo in `--project` would silently
+    buy an unlimited allocation. That is the one way this dimension could make
+    spending *easier* than before it existed, so it is refused here.
+    """
+    if explicit:
+        if not exists(explicit):
+            known = ", ".join(sorted(projects())) or "(none created yet)"
+            raise UsageError(
+                f"project {explicit!r} does not exist, so nothing would bound this spend. "
+                f"known projects: {known}",
+                fix=(
+                    f"python -m tools.budget new --id {explicit} --title '...' "
+                    "--gpu-usd <ceiling> --json"
+                ),
+            )
+        return explicit
+    return current_project()
 
 
 def resolve_or_fail(explicit: str | None, *, what: str) -> str:

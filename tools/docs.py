@@ -6,13 +6,30 @@
 So there are **two oracles, and the order matters**:
 
 1. **Introspection -- what actually exists on this machine.**
-   `importlib.metadata.version()`, `inspect.signature()`, `dir()`. Cheap,
-   offline, definitive. This is how §17's `namespace` parameter was found, in
-   about ten seconds.
+   `importlib.metadata.version()`, `inspect.signature()`, `dir()`. Offline and
+   definitive. This is how §17's `namespace` parameter was found, in about ten
+   seconds.
 2. **Context7 -- what is current.** Deprecations, changed idioms, migration
    paths. Answers what introspection cannot see.
 
 Introspect first. Always.
+
+## `check` imports, and importing runs code
+
+Introspection is not static analysis, and the difference matters. To read a
+signature this has to *import* the module, and importing executes that module's
+top level. `check <file>` therefore imports every module the file names, and
+name resolution goes through `sys.path` -- which includes the working directory.
+A file containing `import helper` runs a sibling `helper.py`.
+
+**So `check` is safe on code you trust and unsafe on code you do not.** Run it
+on your own pipeline, not on a freshly downloaded repository. There is no way to
+have the introspection oracle without this: a checker that does not import can
+only guess at what is installed, which is the failure mode this command exists
+to remove. `signature` has the same property for the one module it is given.
+
+If that boundary ever needs to be tightened, the fix is to run the introspection
+half in a subprocess -- the parse and the reporting stay as they are.
 
 **Why a CLI and not a subagent.** The original plan was a Haiku "reality
 checker" with Context7 and Pyright. It was rejected after the brief narrowed,
@@ -51,10 +68,14 @@ cli = Cli(
         "Two oracles, in this order:\n"
         "  1. introspection -- importlib.metadata + inspect.signature. offline, definitive.\n"
         "  2. Context7      -- deprecations and changed idioms. what introspection cannot see.\n\n"
+        "WARNING: `check` and `signature` IMPORT the modules they inspect, and importing\n"
+        "runs that module's top-level code. Module names resolve through sys.path, which\n"
+        "includes the working directory. Run these on code you trust -- your own pipeline,\n"
+        "not a repository you just downloaded.\n\n"
         "`check` exits 9 when it finds something, so it composes with preflight's\n"
         "declared-check mechanism if a pipeline wants it as a gate.\n\n"
-        "The Context7 REST paths were not verified when this was written. If a request\n"
-        "404s, read context7.com/docs/api-guide and fix [docs] in config/grad.toml."
+        "If a Context7 request 404s the API has moved: read context7.com/docs/api-guide\n"
+        "and fix [docs] base / resolve_path / docs_path in config/grad.toml."
     ),
 )
 
@@ -154,7 +175,16 @@ class _Calls(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            self.aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+            if alias.asname:
+                # `import a.b as x` binds `x` to the submodule itself.
+                self.aliases[alias.asname] = alias.name
+            else:
+                # `import a.b` binds the *top-level package* `a`, not `a.b`, so
+                # a later `a.f()` is `a.f` and not `a.b.f`. Recording the full
+                # dotted path here made `import os.path` turn every `os.<attr>`
+                # call into a false "does not exist on os.path" finding.
+                top = alias.name.split(".")[0]
+                self.aliases[top] = top
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
@@ -355,7 +385,12 @@ def cmd_query(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _check_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("path", help="a Python file whose library calls should be checked")
+    p.add_argument(
+        "path",
+        help="a Python file whose library calls should be checked. NOTE: this imports "
+        "the modules the file names, which runs their top-level code -- use it on "
+        "code you trust",
+    )
     p.add_argument(
         "--offline",
         action="store_true",
@@ -374,6 +409,9 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
 
     Exits 9 -- "a check ran and reported failure" -- so it composes with
     preflight's declared-check mechanism if a pipeline later wants it as a gate.
+
+    This imports the modules the file names, and importing executes them. See
+    the module docstring: safe on code you trust, unsafe on code you do not.
     """
     report = analyse(Path(args.path).resolve())
 
@@ -394,8 +432,20 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
 
 def _currency(modules: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Best-effort: a Context7 outage must not turn an offline-verifiable
-    finding into an unusable command."""
-    client = http.Context7(config_mod.load())
+    finding into an unusable command.
+
+    Construction is inside the guard for the same reason the requests are --
+    a missing credential backend must degrade this to "currency unknown", not
+    discard the introspection results that were already computed.
+    """
+    try:
+        client = http.Context7(config_mod.load())
+    except GradError as exc:
+        return [
+            {"module": m["module"], "installed": m["version"], "error": exc.message}
+            for m in modules
+            if not m["stdlib"]
+        ]
     out = []
     for info in modules:
         if info["stdlib"]:

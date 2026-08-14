@@ -58,13 +58,16 @@ DEFAULTS: dict[str, Any] = {
         "request_timeout_s": 60,
         "min_request_interval_s": 1.1,  # unauthenticated S2 is ~1 req/s
     },
-    # HANDOFF-2 §18. The REST paths were NOT verified during the design session,
-    # which is why they are configuration rather than constants: read
-    # context7.com/docs/api-guide and correct them here if a request 404s.
+    # HANDOFF-2 §18 listed the REST paths as unverified (§23 item 2). They are
+    # now verified against the live API: `/api/v2/libs/search` returns
+    # `{"results": [...]}` and `/api/v2/context` returns `{"codeSnippets": [...]}`
+    # when `type=json` is passed. They stay configuration rather than constants
+    # because a third-party API can move, and a 404 here should be a one-line
+    # config edit rather than a code change.
     "docs": {
-        "base": "https://context7.com/api/v1",
-        "resolve_path": "/search",
-        "docs_path": "/{library_id}",
+        "base": "https://context7.com",
+        "resolve_path": "/api/v2/libs/search",
+        "docs_path": "/api/v2/context",
         "request_timeout_s": 30,
         "cache_ttl_s": 86400,
         "min_request_interval_s": 0.5,

@@ -198,7 +198,9 @@ def test_resolve_returns_library_ids(workspace, fake_httpx):
     client = http.Context7(config_mod.load(reload=True))
     candidates = client.resolve("huggingface_hub")
     assert candidates[0]["library_id"] == "/huggingface/huggingface_hub"
-    assert calls[0]["params"] == {"query": "huggingface_hub"}
+    assert calls[0]["params"] == {
+        "libraryName": "huggingface_hub", "query": "huggingface_hub",
+    }
 
 
 def test_no_key_is_a_note_not_an_error(workspace, fake_httpx):
@@ -287,3 +289,108 @@ def test_context7_env_vars_are_scrubbed(workspace, monkeypatch):
     removed = credentials.scrub_environment()
     assert "CONTEXT7_API_KEY" in removed
     assert "GRAD_CONTEXT7_KEY" in removed
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def test_import_of_a_submodule_binds_the_top_level_package(workspace):
+    """`import os.path` binds `os`, not `os.path`.
+
+    Recording the dotted path made every later `os.<attr>` call resolve against
+    `os.path` and report a missing attribute that is not missing at all.
+    """
+    path = write(workspace, "import os.path\n\nos.getcwd()\n")
+    assert docs.analyse(path)["findings"] == []
+
+
+def test_an_aliased_submodule_import_keeps_the_submodule(workspace):
+    path = write(workspace, "import os.path as p\n\np.no_such_function()\n")
+    findings = docs.analyse(path)["findings"]
+    assert findings and findings[0]["kind"] == "missing_attribute"
+    assert "os.path" in findings[0]["message"]
+
+
+def test_currency_degrades_when_the_credential_store_is_unreachable(workspace, monkeypatch):
+    """A missing keyring must not discard introspection results that already
+    computed successfully."""
+    from core.errors import ConfigError
+
+    def boom(cfg):
+        raise ConfigError("credential store unavailable", fix="install keyring")
+
+    monkeypatch.setattr(http, "Context7", boom)
+    rows = docs._currency([{"module": "nbformat", "stdlib": False, "version": "5.11.0"}])
+    assert rows[0]["error"]
+    assert rows[0]["module"] == "nbformat"
+
+
+def test_context7_constructs_without_a_credential_backend(workspace, monkeypatch):
+    """The key is optional, so an unreachable credential store must degrade to
+    anonymous rather than making the client unbuildable."""
+    from core import config as config_mod, credentials
+    from core.errors import ConfigError
+
+    def boom(name, required=True):
+        raise ConfigError("the `keyring` package is not installed", fix="pip install keyring")
+
+    monkeypatch.setattr(credentials, "get", boom)
+    client = http.Context7(config_mod.load(reload=True))
+    assert client.key is None
+    assert client.authenticated is False
+
+
+def test_the_context7_request_shapes(workspace, monkeypatch):
+    """Both endpoints, as verified against the live API."""
+    from core import config as config_mod
+
+    seen: list[dict] = []
+
+    class FakeHttpx:
+        @staticmethod
+        def get(url, params=None, headers=None, timeout=None):
+            seen.append({"url": url, "params": params})
+            if "libs/search" in url:
+                return FakeResponse(payload={"results": [{"id": "/o/lib", "title": "lib"}]})
+            return FakeResponse(payload={"codeSnippets": [{"codeTitle": "x"}]})
+
+    monkeypatch.setattr(http, "_httpx", lambda: FakeHttpx)
+    monkeypatch.setattr(http.credentials, "get", lambda name, required=True: None)
+    client = http.Context7(config_mod.load(reload=True))
+
+    client.resolve("huggingface_hub")
+    assert seen[-1]["url"].endswith("/api/v2/libs/search")
+    assert seen[-1]["params"] == {"libraryName": "huggingface_hub", "query": "huggingface_hub"}
+
+    out = client.docs("/o/lib", "run_job", tokens=500)
+    assert seen[-1]["url"].endswith("/api/v2/context")
+    assert seen[-1]["params"] == {
+        "libraryId": "/o/lib", "query": "run_job", "tokens": 500, "type": "json",
+    }
+    # v2 names the list `codeSnippets`; reading only `snippets` would turn a
+    # working response into "this library has no docs".
+    assert len(out["snippets"]) == 1
+
+
+def test_a_templated_docs_path_still_works(workspace, monkeypatch):
+    """An older `/{library_id}` style endpoint stays reachable from config."""
+    from core import config as config_mod
+
+    seen: list[dict] = []
+
+    class FakeHttpx:
+        @staticmethod
+        def get(url, params=None, headers=None, timeout=None):
+            seen.append({"url": url, "params": params})
+            return FakeResponse(payload={"snippets": [{"codeTitle": "x"}]})
+
+    monkeypatch.setattr(http, "_httpx", lambda: FakeHttpx)
+    monkeypatch.setattr(http.credentials, "get", lambda name, required=True: None)
+    client = http.Context7(config_mod.load(reload=True))
+    client.docs_path = "/{library_id}"
+    out = client.docs("/o/lib", "run_job", tokens=500)
+
+    assert seen[-1]["url"].endswith("/o/lib")
+    assert "libraryId" not in seen[-1]["params"]
+    assert seen[-1]["params"]["topic"] == "run_job"
+    assert len(out["snippets"]) == 1

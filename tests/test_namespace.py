@@ -285,3 +285,58 @@ def test_the_namespace_is_not_part_of_the_submission_hash(workspace):
     before = sub.hash()
     sub.target["namespace"] = "myorg"
     assert sub.hash() == before
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def test_a_missing_hub_leaves_no_phantom_smoke_record(workspace, monkeypatch):
+    """A configuration problem must not leave an estimate on the ceiling.
+
+    The smoke path wrote its in-flight record before resolving the backend, so a
+    machine without huggingface_hub installed booked spend for a job that never
+    reached the platform -- which then goes stale and blocks every later
+    submission through the §6 gate.
+    """
+    from core import config as config_mod
+    from tools import jobs
+
+    sub = make_submission(workspace)
+
+    def no_hub():
+        raise ConfigError("huggingface_hub is not installed", fix="pip install huggingface_hub")
+
+    monkeypatch.setattr(jobs, "_hub", no_hub)
+    monkeypatch.setattr(jobs, "_token", lambda: "tok")
+
+    with pytest.raises(ConfigError):
+        jobs.run_smoke(sub, config_mod.load(reload=True))
+
+    assert ls.in_flight() == []
+    assert ls.rolling_spend(30)["total_usd"] == 0.0
+
+
+def test_an_unsupported_namespace_leaves_no_phantom_smoke_record(workspace, monkeypatch):
+    """Same rule for the other configuration failure on that path."""
+    from core import config as config_mod
+    from tools import jobs
+
+    class Old:
+        def run_job(self, *, image, command, token=None):
+            ...
+
+        def inspect_job(self, *, job_id, token=None):
+            ...
+
+        def fetch_job_logs(self, *, job_id, token=None):
+            ...
+
+    monkeypatch.setattr(jobs, "_hub", lambda: Old())
+    monkeypatch.setattr(jobs, "_token", lambda: "tok")
+
+    sub = make_submission(workspace)
+    with pytest.raises(ConfigError):
+        jobs.run_smoke(sub, config_mod.load(reload=True), namespace="myorg")
+
+    assert ls.in_flight() == []
+    assert ls.rolling_spend(30)["total_usd"] == 0.0

@@ -214,15 +214,23 @@ against the documented interfaces and fail with actionable errors rather than
 tracebacks, but a real credential and a real run are what will find the
 mismatches.
 
-**Carried over unresolved from [HANDOFF-2 §23](HANDOFF-2.md):**
+**Two of [HANDOFF-2 §23](HANDOFF-2.md)'s open questions are now closed:**
 
-- **Context7's REST endpoint paths were never verified.** They are configuration
-  (`[docs]` in `config/grad.toml`), not constants, and a 404 says so and points
-  at `context7.com/docs/api-guide` rather than looking like a missing library.
-- **Whether ShinkaEvolve exposes a per-candidate callback** decides driver vs.
-  fork. `python -m tools.evolve capabilities --json` answers it against the
-  installed package; the driver assumes generation-boundary granularity, which
-  is what the budget gate is built around.
+- **Context7's REST endpoints** (§23 item 2) are verified against the live API:
+  `/api/v2/libs/search` returns `{"results": […]}`, and `/api/v2/context` with
+  `type=json` returns `{"codeSnippets": […]}`. They stay in `[docs]` config
+  because a third-party API can move; the client reads both the v2 and v1
+  response keys so a config change is sufficient either way.
+- **ShinkaEvolve exposes no per-candidate callback, and no per-generation entry
+  point either** (§23 item 1). `ShinkaEvolveRunner` has `run` and `run_async`,
+  both of which own the whole loop — which is the control the campaign budget
+  gate needs in order to re-check between generations. **This is the evidence
+  §21 said a fork should wait for.** `evolve run` refuses with that explanation
+  rather than handing control away with the budget unchecked;
+  `python -m tools.evolve capabilities --json` reports what it found.
+
+**Still open:**
+
 - **Whether `headless/claude` works against a Max subscription specifically** is
   reported in Shinka's release notes and untested here.
 - **Historical records are left as `"unassigned"`** rather than retrofitted with
@@ -231,6 +239,17 @@ mismatches.
   `--remote` is refused: the gate is proven locally first, because doing the
   ledger work and the spend work simultaneously against live GPU jobs is how you
   learn about exit 7 the hard way.
+
+**One correction to HANDOFF-2 itself.** §20 records `repowiki map` as taking
+`--format html --open`. The 0.3.1 wheel's `map` takes exactly one `path`,
+`--format text|json`, and has neither flag — so `tools/wiki.py` invokes it once
+per scope directory asking for JSON and renders the HTML itself.
+
+**`tools/docs.py check` imports the modules it inspects,** and importing runs
+their top-level code. That is inherent to the introspection oracle — a checker
+that does not import can only guess at what is installed. Run it on your own
+pipeline, not on a repository you just downloaded; the module docstring and
+`--help` both say so.
 
 Two things worth knowing before trusting them:
 

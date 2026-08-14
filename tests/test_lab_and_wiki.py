@@ -208,3 +208,94 @@ def _repo_root():
     from pathlib import Path
 
     return Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def _server_app(monkeypatch, origin: str):
+    """Execute the real Jupyter config and return the ServerApp it configured.
+
+    Asserting on the resulting settings rather than grepping the source: the
+    docstring deliberately *mentions* `xheaders` to record why it is the wrong
+    lever, and a text search cannot tell an explanation from a setting.
+    """
+    source = (_repo_root() / "config" / "jupyter" / "jupyter_server_config.py").read_text(
+        encoding="utf-8"
+    )
+    config = type("Config", (), {})()
+    config.ServerApp = type("ServerApp", (), {})()
+    namespace: dict = {"get_config": lambda: config}
+    monkeypatch.setenv("GRAD_UI_ORIGIN", origin)
+    exec(compile(source, "jupyter_server_config.py", "exec"), namespace)
+    return config.ServerApp
+
+
+def test_x_frame_options_is_cleared_explicitly(workspace, monkeypatch):
+    """`xheaders` controls trust of X-Forwarded-* proxy headers and has nothing
+    to do with framing. Relying on it left Jupyter emitting
+    `X-Frame-Options: SAMEORIGIN`, and since the UI and Lab are different
+    origins the iframe stayed blank -- the exact failure the file prevents.
+    """
+    settings = _server_app(monkeypatch, "http://127.0.0.1:8080").tornado_settings
+    assert settings["headers"]["X-Frame-Options"] == ""
+    assert "xheaders" not in settings, "xheaders is not the lever for this"
+
+
+def test_the_csp_is_well_formed_with_and_without_a_port(workspace, monkeypatch):
+    """`rsplit(':', 1)[-1]` on a portless origin yields the hostname, and
+    `http://localhost:example.com` is an invalid source that browsers drop --
+    silently narrowing the allowed ancestors instead of widening them."""
+    def csp_for(origin: str) -> str:
+        return _server_app(monkeypatch, origin).tornado_settings["headers"][
+            "Content-Security-Policy"
+        ]
+
+    with_port = csp_for("http://127.0.0.1:8080")
+    assert "http://127.0.0.1:8080" in with_port
+    assert "http://localhost:8080" in with_port
+
+    without_port = csp_for("http://example.com")
+    assert "http://example.com" in without_port
+    assert "localhost:example.com" not in without_port
+    # And it must still be a valid, non-empty directive.
+    assert without_port.startswith("frame-ancestors 'self' ")
+
+
+def test_repowiki_is_invoked_with_one_path_and_a_supported_format(workspace, monkeypatch):
+    """repowiki 0.3.1's `map` takes exactly one `path`, `--format text|json`,
+    and has no `--output` / `--open`. HANDOFF-2 §20's `--format html --open`
+    would fail immediately, so the HTML is rendered here instead.
+    """
+    calls: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = '{"files": [{"path": "core/budget.py", "rank": 0.12, "language": "python", "lines": 300}]}'
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return Result()
+
+    (workspace / "core").mkdir(parents=True, exist_ok=True)
+    (workspace / "core" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (workspace / "tools").mkdir(parents=True, exist_ok=True)
+    (workspace / "tools" / "b.py").write_text("y = 2\n", encoding="utf-8")
+
+    monkeypatch.setattr(wiki.shutil, "which", lambda name: "repowiki")
+    monkeypatch.setattr(wiki.subprocess, "run", fake_run)
+
+    result = wiki.cmd_map(argparse.Namespace(top=200, open=False, json=True))
+
+    assert len(calls) == 2, "one invocation per scope directory"
+    for argv in calls:
+        paths_given = [a for a in argv[2:] if not a.startswith("-") and a not in ("json", "200")]
+        assert len(paths_given) == 1, f"map takes exactly one path: {argv}"
+        assert "--format" in argv and argv[argv.index("--format") + 1] == "json"
+        assert "--output" not in argv and "--open" not in argv
+
+    # HTML is produced by us, because repowiki cannot emit it.
+    assert result["html"].endswith("index.html")
+    html = (wiki.output_dir() / "index.html").read_text(encoding="utf-8")
+    assert "core/budget.py" in html

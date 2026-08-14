@@ -411,3 +411,62 @@ def test_capabilities_answers_the_driver_or_fork_question(workspace):
     assert "installed" in report
     if not report["installed"]:
         assert "shinka" in report["reason"]
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def test_an_escaped_candidate_is_not_charged(workspace, monkeypatch):
+    """It never ran, so it cost nothing.
+
+    Charging the per-candidate estimate for declined work would let a campaign
+    that mostly escapes the evolve block exhaust its allocation having evaluated
+    almost nothing.
+    """
+    budget.create("proj-1", title="t", budget={"gpu_usd": 100.0})
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator(escape_at=0))
+    result = evolve.cmd_run(
+        run_args(task_dir, make_expectation(), project="proj-1",
+                 generations=1, population=2, estimate_per_candidate_usd=0.5)
+    )
+
+    rows = camp.candidates(result["campaign"])
+    escaped = [r for r in rows if r["escaped_block"]["escaped"]]
+    evaluated = [r for r in rows if not r["escaped_block"]["escaped"]]
+    assert len(escaped) == 1 and len(evaluated) == 1
+    assert escaped[0]["cost_usd"] == 0.0
+    assert evaluated[0]["cost_usd"] == 0.5
+    # Only the candidate that actually ran reaches the project's allocation.
+    assert budget.spend("proj-1")["gpu_usd"] == 0.5
+
+
+def test_the_shinka_driver_refuses_a_whole_loop_only_runner(workspace):
+    """§23 item 1, answered: `ShinkaEvolveRunner` exposes `run` and `run_async`,
+    both of which own the loop this driver needs to interrupt between
+    generations. Calling a `propose()` that does not exist would be an
+    AttributeError mid-campaign; refusing up front is the honest form, and it is
+    the evidence §21 said a fork should wait for.
+    """
+    class WholeLoopOnly:
+        def run(self): ...
+        def run_async(self): ...
+
+    assert evolve.ShinkaMutator._propose_method(WholeLoopOnly()) is None
+
+
+def test_the_shinka_driver_accepts_a_per_generation_entry_point(workspace):
+    class Steppable:
+        def run(self): ...
+        def propose(self, **kw): ...
+
+    assert evolve.ShinkaMutator._propose_method(Steppable()) == "propose"
+
+
+def test_capabilities_names_the_granularity_it_found(workspace):
+    report = evolve.mutator_capabilities()
+    if report["installed"]:
+        assert report["granularity"] in ("candidate", "generation", "campaign")
+        assert isinstance(report["driver_viable"], bool)
+    else:
+        assert "shinka" in report["reason"]

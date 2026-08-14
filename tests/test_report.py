@@ -465,3 +465,84 @@ def test_a_report_needs_a_project(workspace):
     with pytest.raises(UsageError) as exc:
         report.cmd_draft(args())
     assert "tools.budget use" in (exc.value.fix or "")
+
+
+# ---------------------------------------------------------------------------
+# review fixes
+# ---------------------------------------------------------------------------
+def test_rerunning_cite_preserves_earlier_entries(workspace, project, stub_resolver):
+    r"""`cite` is naturally re-run -- after a new section, or after ingesting a
+    paper that failed to resolve last time. By then the earlier placeholders are
+    already `\cite{}` keys, so a second pass finds nothing to resolve; rewriting
+    the bib from scratch deleted every entry the first pass earned and left
+    `check` refusing on citations that were fine a moment ago.
+    """
+    in_range_run()
+    report.cmd_draft(args())
+    first = report.cmd_cite(args(context_chars=200, no_s2=True))
+    assert first["entries"] == 1
+
+    second = report.cmd_cite(args(context_chars=200, no_s2=True))
+    assert second["entries"] == 1, "the earlier entry must survive"
+    assert second["kept_from_previous_run"] == ["basis2026"]
+    assert report.cmd_check(args())["ok"] is True
+
+
+def test_a_weakly_related_s2_hit_is_rejected(workspace, project, monkeypatch):
+    """An 8% word overlap was close to a rubber stamp: any two ML papers share
+    enough vocabulary to clear it. A citation wrongly accepted is a claim
+    silently attributed to a paper that does not support it."""
+    class FakeS2:
+        def __init__(self, cfg): ...
+        def paper_search(self, keyword, limit=5):
+            return [{"paper_id": "abc", "title": "Convolutional Networks for Image Segmentation",
+                     "abstract": "We segment images using convolutions and pooling layers.",
+                     "year": 2015}]
+
+    monkeypatch.setattr(report.http, "SemanticScholar", FakeS2)
+    context = (
+        "The scaling behaviour of transformer language models under a fixed token "
+        "budget follows a power law in parameter count across pretraining corpora."
+    )
+    assert report._from_s2("scaling laws", context) is None
+
+
+def test_a_genuinely_matching_s2_hit_is_accepted_and_scored(workspace, project, monkeypatch):
+    class FakeS2:
+        def __init__(self, cfg): ...
+        def paper_search(self, keyword, limit=5):
+            return [{"paper_id": "abc",
+                     "title": "Scaling Laws for Neural Language Models",
+                     "abstract": "We study empirical scaling laws for language model "
+                                 "performance as a function of parameter count and "
+                                 "pretraining token budget, finding power-law behaviour.",
+                     "year": 2020}]
+
+    monkeypatch.setattr(report.http, "SemanticScholar", FakeS2)
+    context = (
+        "Empirical scaling laws for language models describe performance as a "
+        "power-law function of parameter count and pretraining token budget."
+    )
+    entry = report._from_s2("scaling laws", context)
+    assert entry is not None
+    assert entry["gradsource"] == "s2"
+    # Both scores recorded, so a borderline resolution is auditable.
+    assert entry["gradmatch"] >= report.S2_MIN_CONTEXT_OVERLAP
+    assert entry["gradtitlematch"] >= report.S2_MIN_TITLE_OVERLAP
+
+
+def test_shared_jargon_alone_does_not_clear_the_title_test(workspace, project, monkeypatch):
+    """The abstract can overlap on generic research vocabulary; the title is
+    where a paper's actual subject lives."""
+    class FakeS2:
+        def __init__(self, cfg): ...
+        def paper_search(self, keyword, limit=5):
+            return [{"paper_id": "abc", "title": "A Dataset of Annotated Radiographs",
+                     "abstract": "scaling laws parameter count pretraining token budget "
+                                 "power law transformer language models corpora",
+                     "year": 2021}]
+
+    monkeypatch.setattr(report.http, "SemanticScholar", FakeS2)
+    context = ("Scaling laws relate parameter count and pretraining token budget "
+               "to transformer language model loss following a power law.")
+    assert report._from_s2("scaling laws", context) is None

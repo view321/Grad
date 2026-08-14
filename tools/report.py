@@ -486,13 +486,33 @@ def _generate_prose(bundle: dict[str, Any], *, model: str) -> str:
     )
 
     async def run() -> None:
-        usage = None
-        async for message in query(
-            prompt="Evidence bundle:\n\n" + json.dumps(bundle, indent=2, default=str),
-            options=options,
-        ):
-            usage = getattr(message, "usage", None) or usage
-        quota_log.from_sdk_usage("report.write", usage, model=model, role="report")
+        # The result message carries a cumulative total, so it wins outright
+        # when it arrives. Assistant-message usage is accumulated only as a
+        # fallback for the turn that dies before a result -- adding both would
+        # double-count.
+        final: Any = None
+        partial = {"input_tokens": 0, "output_tokens": 0}
+        try:
+            async for message in query(
+                prompt="Evidence bundle:\n\n" + json.dumps(bundle, indent=2, default=str),
+                options=options,
+            ):
+                usage = getattr(message, "usage", None)
+                if usage is None:
+                    continue
+                if type(message).__name__ == "ResultMessage":
+                    final = usage
+                else:
+                    get = usage.get if isinstance(usage, dict) else (lambda k, d=0: getattr(usage, k, d))
+                    partial["input_tokens"] += get("input_tokens", 0) or 0
+                    partial["output_tokens"] += get("output_tokens", 0) or 0
+        finally:
+            # In a finally block because a failed turn still spent quota, and an
+            # unrecorded spend is exactly what §15's ceilings cannot see.
+            quota_log.from_sdk_usage(
+                "report.write", final if final is not None else partial,
+                model=model, role="report",
+            )
 
     asyncio.run(run())
     if not captured:
@@ -532,7 +552,18 @@ def cmd_cite(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     tex = files["tex"].read_text(encoding="utf-8")
-    entries: dict[str, dict[str, Any]] = {}
+    # Seeded with what is already there, not started empty. `cite` is naturally
+    # re-run -- after adding a section, after ingesting a paper that previously
+    # failed to resolve -- and by then the earlier placeholders are already
+    # `\cite{}` keys, so a second pass finds nothing to resolve. Rewriting the
+    # file from an empty dict would delete every entry the first pass earned and
+    # leave `check` refusing on citations that were fine a moment ago.
+    entries: dict[str, dict[str, Any]] = (
+        report_lib.parse_bib(files["bib"].read_text(encoding="utf-8"))
+        if files["bib"].exists()
+        else {}
+    )
+    preexisting = set(entries)
     resolved: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
 
@@ -566,6 +597,7 @@ def cmd_cite(args: argparse.Namespace) -> dict[str, Any]:
         "resolved": resolved,
         "unresolved": unresolved,
         "entries": len(entries),
+        "kept_from_previous_run": sorted(preexisting),
         "next": f"python -m tools.report check --project {project_id} --json",
     }
     if unresolved:
@@ -629,6 +661,18 @@ def _from_corpus(keyword: str) -> dict[str, Any] | None:
         con.close()
 
 
+# Two independent conditions, both required. Overlap against the abstract alone
+# is easy to clear on shared jargon -- any two ML papers share "training",
+# "model", "results" -- so a candidate must also connect to the *title*, which is
+# where a paper's actual subject lives. The numbers are deliberately strict: a
+# citation this refuses is one the author adds by hand after reading it, while a
+# citation it wrongly accepts is a claim silently attributed to a paper that does
+# not support it. Recorded on the entry as `gradmatch` / `gradtitlematch` so a
+# borderline resolution is auditable rather than invisible.
+S2_MIN_CONTEXT_OVERLAP = 0.25
+S2_MIN_TITLE_OVERLAP = 0.20
+
+
 def _from_s2(keyword: str, context: str) -> dict[str, Any] | None:
     """Verify the candidate's title and abstract against the surrounding text.
 
@@ -644,17 +688,22 @@ def _from_s2(keyword: str, context: str) -> dict[str, Any] | None:
     if not hits:
         return None
 
-    words = {w.lower() for w in re.findall(r"[a-zA-Z]{5,}", context)}
-    best, best_score = None, 0.0
+    words = _content_words(context)
+    if not words:
+        return None
+
+    best, best_score, best_title = None, 0.0, 0.0
     for hit in hits:
-        text = f"{hit.get('title', '')} {hit.get('abstract', '')}".lower()
-        candidate_words = set(re.findall(r"[a-zA-Z]{5,}", text))
-        if not candidate_words:
+        body = _content_words(f"{hit.get('title', '')} {hit.get('abstract', '')}")
+        title = _content_words(hit.get("title", ""))
+        if not body:
             continue
-        score = len(words & candidate_words) / max(1, len(words))
+        score = len(words & body) / len(words)
+        title_score = (len(words & title) / len(title)) if title else 0.0
         if score > best_score:
-            best, best_score = hit, score
-    if best is None or best_score < 0.08:
+            best, best_score, best_title = hit, score, title_score
+
+    if best is None or best_score < S2_MIN_CONTEXT_OVERLAP or best_title < S2_MIN_TITLE_OVERLAP:
         return None
     return {
         "key": _bib_key(best.get("paper_id", keyword), None, best.get("year")),
@@ -665,6 +714,25 @@ def _from_s2(keyword: str, context: str) -> dict[str, Any] | None:
         "note": f"S2:{best.get('paper_id')}",
         "gradsource": "s2",
         "gradmatch": round(best_score, 3),
+        "gradtitlematch": round(best_title, 3),
+    }
+
+
+# Words short enough to be grammar rather than subject matter carry no signal,
+# and a handful of ubiquitous research words clear any threshold on their own.
+_STOPWORDS = frozenset(
+    """about above after again against because before being below between during
+    further having their there these those through under until where which while
+    model models method methods result results using training train paper approach
+    work works show shows shown study propose proposed""".split()
+)
+
+
+def _content_words(text: str) -> set[str]:
+    return {
+        w.lower()
+        for w in re.findall(r"[a-zA-Z]{5,}", text or "")
+        if w.lower() not in _STOPWORDS
     }
 
 
