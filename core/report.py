@@ -35,7 +35,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from core import ledger_store as ls, paths
+from core import ledger_store as ls, paths, version
 
 # `\gradnum{key}` and `\cite{a,b}` as they appear in the LaTeX source.
 GRADNUM_RE = re.compile(r"\\gradnum\{([^}]*)\}")
@@ -228,6 +228,77 @@ def _values_match(stated: Any, actual: Any) -> bool:
             return abs(stated) < 1e-9
         return abs(stated - actual) / abs(actual) < 1e-3
     return str(stated).strip() == str(actual).strip()
+
+
+def check_code_versions(run_ids: set[str]) -> list[dict[str, Any]]:
+    """Rule 4: the runs this report cites all came from the same Grad.
+
+    The stamp is written at submit time by `core/submit.py`; this is what makes
+    it worth writing. Two failures, and they are different findings:
+
+    *Straddling a version.* A report that cites a run from before an update and
+    one from after is comparing two pieces of code and presenting the difference
+    as a result about the research. That is not always wrong -- a release that
+    changed only the UI cannot have moved a number -- so it is a finding to
+    answer, with the versions named, rather than a refusal to override.
+
+    *Modified code.* A run submitted from a checkout with uncommitted edits has
+    no identifier anyone else can resolve. "Every number traces to a run record"
+    fails at the last step: the record is there, the code it names is not.
+
+    Runs with no stamp at all are silently allowed. They predate this field, and
+    refusing a report because its evidence is *old* would make the rule a reason
+    to avoid updating -- the opposite of what it is for.
+    """
+    stamps: dict[str, dict[str, Any]] = {}
+    for run_id in sorted(run_ids):
+        try:
+            run = ls.run(run_id)
+        except Exception:  # noqa: BLE001 - a missing run is rule 1's finding, not this one
+            continue
+        stamp = run.get("code_version")
+        if isinstance(stamp, dict) and any(stamp.get(k) for k in ("commit", "tag", "version")):
+            stamps[run_id] = stamp
+
+    findings: list[dict[str, Any]] = []
+    dirty = sorted(run_id for run_id, stamp in stamps.items() if stamp.get("dirty"))
+    if dirty:
+        findings.append(
+            {
+                "rule": "version",
+                "run_id": dirty[0],
+                "problem": (
+                    f"{len(dirty)} cited run(s) were submitted from a modified installation "
+                    f"({', '.join(dirty[:3])}); the code that produced them is not identified "
+                    "by any commit"
+                ),
+                "fix": (
+                    "commit the changes in the installation folder and re-run those runs, "
+                    "or say in the report that the code was modified"
+                ),
+            }
+        )
+
+    distinct: list[dict[str, Any]] = []
+    for stamp in stamps.values():
+        if not any(version.same_version(stamp, seen) for seen in distinct):
+            distinct.append(stamp)
+    if len(distinct) > 1:
+        named = ", ".join(sorted({version.label(s) for s in distinct}))
+        findings.append(
+            {
+                "rule": "version",
+                "problem": (
+                    f"this report cites runs from {len(distinct)} different versions of Grad "
+                    f"({named}); a number from one is not comparable to a number from another"
+                ),
+                "fix": (
+                    "re-run the older results on the current version, or state the versions "
+                    "in the report and say why the comparison holds"
+                ),
+            }
+        )
+    return findings
 
 
 def cited_run_ids(tex: str, claims: dict[str, Any]) -> set[str]:

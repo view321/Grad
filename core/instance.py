@@ -153,6 +153,28 @@ def release() -> None:
     clear()
 
 
+def is_running() -> bool:
+    """Whether another Grad holds the lock. Asks, and puts it back.
+
+    The lock rather than `read_state()`, for the reason at the top of this file:
+    a pid file left by a crash says "running" forever. Taking it and dropping it
+    is safe -- if it can be taken, nothing else holds it.
+
+    **`_held.release()` and not `release()`**, which is the whole reason this
+    lives here rather than in the caller. `release` also calls `clear()`, which
+    deletes `instance.json`, and a *probe* has no business doing that: on the
+    one path where `_acquire_windows` cannot create the mutex it reports success
+    by design -- refusing to start over a failure of the guard would be worse
+    than the duplicate it guards against -- so a probe that trusted it would
+    then delete a genuinely running instance's published port and break the
+    handover that file exists for.
+    """
+    if not _held.acquire():
+        return True
+    _held.release()
+    return False
+
+
 def show_running(info: dict[str, Any] | None = None) -> bool:
     """Ask the instance that is already up to raise its window.
 

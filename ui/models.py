@@ -142,6 +142,61 @@ def workspaces_model() -> dict[str, Any]:
     }
 
 
+def update_model() -> dict[str, Any]:
+    """What the project menu says about updating, read from the cache only.
+
+    Never runs git. The background thread in `ui/app.py:_start_update_check`
+    owns the network call and writes `update.json`; this reads it. A model that
+    fetched would freeze the window for as long as the remote took, every time
+    someone opened the menu to switch project.
+
+    So the shape here is "what was true when we last looked", and it says when
+    that was. An installation that has never managed a check renders as unknown
+    rather than as up to date -- claiming the latter on no evidence is the one
+    answer that would stop someone looking.
+    """
+    from core import update as update_mod, version as version_mod  # noqa: PLC0415
+
+    identity, error = _safe(version_mod.identity, {})
+    cached, _ = _safe(update_mod.read_cache, {})
+    cached = cached or {}
+    age, _ = _safe(update_mod.cache_age_s, float("inf"))
+    target = cached.get("target") or {}
+    blockers = cached.get("blockers") or []
+    warnings = cached.get("warnings") or []
+
+    return {
+        "installed": version_mod.label(identity or {}),
+        "commit": (identity or {}).get("commit"),
+        "dirty": bool((identity or {}).get("dirty")),
+        "is_checkout": (identity or {}).get("source") == "git",
+        "available": bool(cached.get("available")) and not blockers,
+        "target": target.get("tag"),
+        "behind": cached.get("behind") or 0,
+        "needs_reinstall": bool(cached.get("needs_reinstall")),
+        "blockers": [
+            {"message": _short(b.get("message"), 160), "fix": _short(b.get("fix"), 160)}
+            for b in blockers
+            if isinstance(b, dict)
+        ],
+        "warnings": [
+            {"message": _short(w.get("message"), 160), "fix": _short(w.get("fix"), 160)}
+            for w in warnings
+            if isinstance(w, dict)
+        ],
+        "checked": "never" if age == float("inf") else _ago(age),
+        "stale": age >= update_mod.CHECK_INTERVAL_S,
+        "error": error or cached.get("fetch_error"),
+    }
+
+
+def _ago(seconds: float) -> str:
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return "just now"
+
+
 def _spend_line(state: dict[str, Any]) -> str:
     """One line per project: what it has spent against what it may.
 
@@ -1723,6 +1778,12 @@ def editor_model(project_id: str | None = None) -> dict[str, Any]:
         lambda: report_mod.check_claims(tex, claims),
         lambda: report_mod.check_citations(tex, bib or {}),
         lambda: report_mod.check_latex(tex),
+        # The same fourth rule `tools/report.py:check` runs. The editor and the
+        # gate have to agree about whether a report is clean: a badge saying
+        # "no findings" over a report that `report check` will refuse is worse
+        # than no badge, because it is the surface someone actually watches
+        # while writing.
+        lambda: report_mod.check_code_versions(report_mod.cited_run_ids(tex, claims)),
     ):
         result, error = _safe(check, [])
         findings.extend(result or [])

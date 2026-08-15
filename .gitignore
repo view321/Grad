@@ -62,6 +62,11 @@ data/ui_storage_secret
 data/ui_session-*.jsonl
 data/layouts/
 data/kernel/
+# The HTTP cache. Regenerable, machine-local, and named by a hash of the request
+# -- which is exactly what makes it dangerous to leave un-ignored: the files look
+# anonymous and hold whole API responses. It moved to the app directory with the
+# rest of this list; the entry stays for checkouts that still have the old one.
+data/cache/
 
 # JupyterLab's own runtime state, written into the config directory it is
 # pointed at rather than into data/. Generated on first start, per machine.

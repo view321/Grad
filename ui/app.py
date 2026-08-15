@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from core import appdata, config as config_mod, instance, paths
+from core import appdata, config as config_mod, instance, migrate, paths
 from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
 ROLES = ("user", "assistant")
 STATIC_URL = "/grad-static"
@@ -789,6 +789,37 @@ def _restart_lab_here() -> None:
         log.exception("could not restart Lab")
 
 
+def _start_update_check() -> None:
+    """Ask the remote whether there is a newer release, once a day, off the loop.
+
+    A thread rather than a NiceGUI timer, and never on a draw. `git fetch`
+    crosses the network and blocks for as long as the network makes it; on the
+    event loop that is a frozen window, and in `models.update_model` it would be
+    a frozen window every time someone opened the project menu. So the check
+    writes `update.json` and the UI only ever reads that file.
+
+    Silent by construction. A machine with no network, a checkout with no
+    remote, a corporate proxy that refuses -- none of them is something to
+    interrupt someone's research to report, and all of them simply leave
+    yesterday's answer in place.
+    """
+    import threading  # noqa: PLC0415
+
+    def _check() -> None:
+        from core import update  # noqa: PLC0415
+
+        try:
+            if update.check_due():
+                update.refresh_cache()
+        except Exception:  # noqa: BLE001 - see the docstring
+            log.debug("the update check did not complete", exc_info=True)
+
+    # Daemon, so a fetch against a black-holed remote cannot keep the process
+    # alive after the window closes; the socket timeout would eventually fire,
+    # but "eventually" is not a quit.
+    threading.Thread(target=_check, name="grad-update-check", daemon=True).start()
+
+
 def run(*, native: bool = True, port: int | None = None) -> None:
     """`ui.run(native=True)` gives a real desktop window via pywebview, so the
     packaging question is answered without Electron or Tauri. Browser mode is
@@ -810,10 +841,11 @@ def run(*, native: bool = True, port: int | None = None) -> None:
     # entirely, and would then open on an empty app directory while the state it
     # wanted sat unmigrated in the workspace. Idempotent, so running twice costs
     # a stat per entry.
-    for name in appdata.migrate_legacy():
-        log.info("moved data/%s into %s", name, appdata.app_dir())
+    for name in migrate.run_pending():
+        log.info("migrated %s (state now under %s)", name, appdata.app_dir())
     paths.ensure_workspace()
     instance.publish(port)
+    _start_update_check()
     build()
     _install_desktop(native)
     # `window_size` is passed *only* in native mode, and that is not a

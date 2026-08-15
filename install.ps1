@@ -27,6 +27,13 @@
     Python to build the environment with. Defaults to whatever `py -3` or
     `python` resolves to.
 
+.PARAMETER Workspace
+    Folder for your research -- the ledger, notebooks, notes and figures.
+    Defaults to %USERPROFILE%\Grad, and keeping it out of the installation is
+    what lets `grad update` be a fast-forward rather than a merge with your own
+    work. Pass the installation folder itself to keep the old single-folder
+    layout.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
 #>
@@ -35,7 +42,8 @@
 param(
     [string] $InstallExtras = "ui,notebook,agent,lab",
     [switch] $NoShortcut,
-    [string] $Python = ""
+    [string] $Python = "",
+    [string] $Workspace = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -134,6 +142,50 @@ if ($WebView2) {
 }
 
 # --------------------------------------------------------------------------
+# 3b. Where the research goes
+# --------------------------------------------------------------------------
+# See install.sh for the reasoning: research committed into the same repository
+# as the code puts your notebooks on the same branch as upstream's releases, and
+# every update becomes a merge. Keeping them apart costs nothing.
+Write-Step "Choosing where your research will live"
+
+$RunsPath = Join-Path $Root "ledger\runs.jsonl"
+if (-not $Workspace) {
+    if ((Test-Path $RunsPath) -and (Get-Item $RunsPath).Length -gt 0) {
+        # Research is already here. Moving it is `tools.workspace move`, which
+        # copies and verifies before deleting anything -- not something an
+        # installer should do quietly.
+        $Workspace = $Root
+        Write-Warn "this folder already holds a ledger, so it stays the workspace"
+        Write-Warn "to separate them later:  .venv\Scripts\python -m tools.workspace move $env:USERPROFILE\Grad"
+    } else {
+        $Default = Join-Path $env:USERPROFILE "Grad"
+        $Reply = Read-Host "  Workspace folder [$Default]"
+        $Workspace = if ($Reply) { $Reply } else { $Default }
+    }
+}
+
+if ($Workspace -eq $Root) {
+    Write-Ok "workspace: $Root (inside the installation)"
+} else {
+    & $VenvPython -m tools.workspace use $Workspace --create | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not use $Workspace as the workspace" }
+    Write-Ok "workspace: $Workspace"
+}
+
+# What the extras were, so `grad update` reinstalls with the same set rather
+# than guessing. Dropping `ui` on an update would take the desktop app off a
+# machine whose owner asked only for an update.
+& $VenvPython -c @"
+import sys
+from core import update
+update.write_install_record(
+    extras=[x.strip() for x in '$InstallExtras'.split(',') if x.strip()],
+    installer='install.ps1',
+)
+"@ 2>$null | Out-Null
+
+# --------------------------------------------------------------------------
 # 4. The shortcut
 # --------------------------------------------------------------------------
 if (-not $NoShortcut) {
@@ -174,11 +226,15 @@ if (-not $NoShortcut) {
 # --------------------------------------------------------------------------
 Write-Host ""
 Write-Step "Done"
-Write-Host "  Workspace (your research, versioned):  $Root"
-Write-Host "  App state (layouts, logs, Lab token):  $AppData"
+Write-Host "  Installation (the code, replaced by updates):  $Root"
+Write-Host "  Workspace (your research, never touched):     $Workspace"
+Write-Host "  App state (layouts, logs, Lab token):         $AppData"
 Write-Host ""
 Write-Host "  Start it from the Start Menu, or:"
 Write-Host "      $VenvPythonW `"$(Join-Path $Root 'agent.py')`" --ui"
+Write-Host ""
+Write-Host "  Update to the newest release:"
+Write-Host "      $VenvPython `"$(Join-Path $Root 'agent.py')`" --update"
 Write-Host ""
 Write-Host "  It opens on port 8080, or the next free port above it, and stays in"
 Write-Host "  the notification area when you close the window. Quit from there."

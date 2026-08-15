@@ -374,6 +374,25 @@ def write_icon(path: str) -> str:
     return str(target)
 
 
+def _available_tag() -> str | None:
+    """The release the last check found, or None. Cheap enough for a menu draw.
+
+    A cached file read and nothing else -- the background thread in `ui/app.py`
+    owns the fetch. Swallows everything: this runs on pystray's own thread while
+    a menu is opening, where an exception is an unhandled error in a
+    third-party event loop rather than something anyone would see.
+    """
+    try:
+        from core import update  # noqa: PLC0415
+
+        cached = update.read_cache()
+        if not cached.get("available") or cached.get("blockers"):
+            return None
+        return (cached.get("target") or {}).get("tag")
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+
 def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
     """Put Grad in the notification area. Returns the icon, or None.
 
@@ -394,6 +413,21 @@ def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
     def _menu() -> Any:
         items = [
             pystray.MenuItem("Open Grad", lambda: show_window(), default=True),
+            # Text and visibility are callables, which is what makes this entry
+            # honest: pystray builds the menu once, at startup, and a fixed
+            # string would name whichever release was current when the app
+            # launched -- or claim one exists when the daily check has since
+            # found nothing. Both are re-read every time the menu is opened.
+            #
+            # It only opens the window. Applying an update from a tray thread
+            # would mean file operations with no way to report a refusal: the
+            # workspace menu has the button, and this is the thing that makes
+            # someone look at it.
+            pystray.MenuItem(
+                lambda _: f"Update available: {_available_tag() or ''}".strip(),
+                lambda: show_window(),
+                visible=lambda _: _available_tag() is not None,
+            ),
         ]
         if on_restart_lab is not None:
             items.append(pystray.MenuItem("Restart Lab for this window", lambda: on_restart_lab()))
