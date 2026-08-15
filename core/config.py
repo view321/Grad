@@ -46,6 +46,13 @@ DEFAULTS: dict[str, Any] = {
         "rerank_model": "voyageai/rerank-2.5",
         "embed_model": "voyage-4",
         "embed_dim": 1024,
+        # Voyage bills per token and returns a token count but no price, so the
+        # rate has to come from somewhere for `credits_usd` to be anything other
+        # than structurally zero -- and a credit ceiling that cannot see one of
+        # the two credit-spending paths is not a ceiling. Publisher's list price
+        # per million tokens; wrong-but-present beats absent, and it is one line
+        # to correct when the price moves.
+        "embed_usd_per_1m_tokens": 0.06,
         # triage_model / expand_model moved to [models] triage / expand (§16).
         # They are still *readable* here as overrides -- see LEGACY_MODEL_KEYS --
         # but they are no longer defaulted here, so [models] is the one place a
@@ -223,12 +230,28 @@ class Config:
                     f"host {name!r} must be a table, not {type(spec).__name__}",
                     fix=f"write it as [hosts.{name}] with hostname/user/rate_usd_per_hour keys",
                 )
+            rate = spec.get("rate_usd_per_hour", 0.0)
+            try:
+                # A negative rate would make `collect` book negative actuals,
+                # which *reduce* rolling spend -- a typo that raises the ceiling.
+                # Zero is legitimate (a host that is free to use is still
+                # ledgered); below zero is not.
+                if float(rate) < 0:
+                    raise ConfigError(
+                        f"host {name!r} has a negative rate_usd_per_hour ({rate})",
+                        fix="use 0 for a host that is free to use; negative spend is not a thing",
+                    )
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(
+                    f"host {name!r} has a malformed rate_usd_per_hour: {rate!r}",
+                    fix="rate_usd_per_hour must be a number",
+                ) from exc
             try:
                 out[name] = Host(
                     name=name,
                     hostname=str(spec.get("hostname", "")),
                     user=str(spec.get("user", "")),
-                    rate_usd_per_hour=float(spec.get("rate_usd_per_hour", 0.0)),
+                    rate_usd_per_hour=float(rate),
                     workdir=str(spec.get("workdir", "~/grad")),
                     key_credential=spec.get("key_credential"),
                     gpus=int(spec.get("gpus", 1)),

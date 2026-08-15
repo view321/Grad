@@ -77,7 +77,14 @@ def _entry(workspace: Any, entry: dict[str, Any]) -> None:
         kit.text(entry["claim"], "").style("font-size: 13.5px; margin: 6px 0")
 
         if entry["state"] == "open" or entry.get("band"):
-            kit.band_strip(entry.get("band"))
+            kit.band_strip(
+                entry.get("band"),
+                reason=(
+                    "no result yet — the band is drawn when the run is collected"
+                    if entry["state"] == "open" and not entry.get("band")
+                    else ""
+                ),
+            )
 
         if entry.get("comparability"):
             kit.note(f"comparability — {entry['comparability']}")

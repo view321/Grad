@@ -141,10 +141,18 @@ class Workspace:
         self.chat_send: Callable[[str], Any] | None = None
         self._fingerprints: dict[str, str] = {}
         self._redraw: dict[str, Callable[[], None]] = {}
+        #: Titlebar redraws, kept apart from the bodies: a titlebar reports live
+        #: state (STREAMING, HALTING, an unjudged count) and has to refresh on
+        #: every tick, including for windows whose body the poll does not build.
+        self._titlebars: dict[str, Callable[[], None]] = {}
         self._chrome: list[Callable[[], None]] = []
         self._retile: Callable[[], None] | None = None
         #: Strong references to in-flight tasks; see `spawn`.
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: The root this client believes it is on. `GRAD_ROOT` is process-wide,
+        #: so another client switching folders moves this one's paths out from
+        #: under it; `tick` compares against `paths.root()` and catches up.
+        self._root = str(paths.root())
 
     # -- wiring -------------------------------------------------------------
     def bind_window(self, window_id: str, redraw: Callable[[], None]) -> None:
@@ -152,6 +160,10 @@ class Workspace:
 
     def unbind_window(self, window_id: str) -> None:
         self._redraw.pop(window_id, None)
+        self._titlebars.pop(window_id, None)
+
+    def bind_titlebar(self, window_id: str, redraw: Callable[[], None]) -> None:
+        self._titlebars[window_id] = redraw
 
     def bind_chrome(self, redraw: Callable[[], None]) -> None:
         self._chrome.append(redraw)
@@ -189,12 +201,35 @@ class Workspace:
         self.models.pop(window_id, None)
 
     def tick(self) -> None:
-        """One poll: rebuild the open windows, redraw the ones that moved."""
+        """One poll: rebuild the open windows, redraw the ones that moved.
+
+        The titlebars are refreshed separately from the bodies. `chat` has no
+        entry in `MODEL_BUILDERS` -- its body redraws from its own stream rather
+        than from this poll -- so a titlebar drawn only when `rebuild` returned
+        True was never redrawn at all for that window: the STREAMING chip and the
+        "N messages" subtitle sat at whatever they said when the pane was last
+        tiled, which is exactly what `_titlebar`'s docstring says must not
+        happen.
+        """
+        if str(paths.root()) != self._root:
+            # Another client switched the workspace. Everything below reads
+            # files under the root, so catching up has to come first.
+            self._root = str(paths.root())
+            self.project = current_project()
+            rebind = getattr(self.session, "rebind", None)
+            if rebind is not None:
+                self.spawn(rebind(), "workspace rebind")
+            self.reload()
+            self.say(f"workspace moved to {paths.root()}")
+            return
         for window_id in self.layout.windows:
             if self.rebuild(window_id):
                 redraw = self._redraw.get(window_id)
                 if redraw is not None:
                     _guard(redraw, window_id)
+        for window_id, redraw in list(self._titlebars.items()):
+            if window_id in self.layout.windows:
+                _guard(redraw, f"{window_id}.titlebar")
         for redraw in self._chrome:
             _guard(redraw, "chrome")
 
@@ -294,6 +329,15 @@ class Workspace:
           and its SDK client's working directory was fixed when it was built.
           A session left alone would keep the old workspace's conversation on
           screen and keep running the agent's tools in the old directory.
+
+        **This is process-global, and every connected client moves.** `GRAD_ROOT`
+        is one environment variable in one process, so a second window cannot
+        stay behind: its paths follow the switch while its `Workspace` goes on
+        believing otherwise, and its next `_persist` would write its conversation
+        into the new root under the old session's name. The other clients catch
+        up on their own next `tick`, which compares `paths.root()` against the
+        root they were built on -- pull rather than push, so a client that has
+        disconnected but not yet been collected is not resurrected to be told.
         """
         from core import config as config_mod, workspace as workspace_mod  # noqa: PLC0415
 
@@ -309,6 +353,7 @@ class Workspace:
         rebind = getattr(self.session, "rebind", None)
         if rebind is not None:
             await rebind()
+        self._root = str(paths.root())
         self.reload()
         self.say(f"workspace: {chosen}")
 
@@ -407,6 +452,20 @@ class Workspace:
         self.step = step
         for redraw in self._chrome:
             _guard(redraw, "chrome")
+
+    def interrupt_turn(self) -> None:
+        """Stop the turn in flight. Bound to the appbar's STOP button.
+
+        The button this replaced only changed the header caption, so the app
+        could say "AGENT PAUSED" while tokens were still streaming. Interrupting
+        is the thing the SDK can actually do, and `Session.interrupt` is already
+        the tested path for it -- Escape and the chat window's own button use it.
+        """
+        session = self.session
+        if session is None or not getattr(session, "busy", False):
+            return
+        session.interrupt()
+        self.say("interrupting the turn…")
 
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""

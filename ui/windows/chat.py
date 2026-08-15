@@ -238,13 +238,34 @@ class _Tail:
             _paint_output(drawn, block)
 
 
+def _has_gate(record: dict[str, Any]) -> bool:
+    """Did this turn end by asking for a decision?
+
+    Parsed the same way the transcript renders it, so the header and the card
+    cannot disagree about what counts as a gate.
+    """
+    blocks = record.get("blocks") or [{"kind": "text", "text": record.get("text") or ""}]
+    for block in blocks:
+        if block.get("kind") == "tool":
+            continue
+        for part in models.parse_message(block.get("text") or ""):
+            if part.get("kind") == "gate":
+                return True
+    return False
+
+
 def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, streaming: Any) -> None:
     session = workspace.session
 
     async def settle(record: dict[str, Any]) -> None:
         tail.clear()
         streaming.style("display: none")
-        workspace.set_agent_state("idle")
+        # `awaiting_gate` was a state nothing ever entered: the header knew how
+        # to render "AWAITING YOUR CALL" and the titlebar had a GATE chip, but
+        # every path set running/paused/idle, so a turn that ended by asking for
+        # a decision looked identical to one that ended by finishing. The turn
+        # that just settled is exactly where that is known.
+        workspace.set_agent_state("awaiting_gate" if _has_gate(record) else "idle")
         if record.get("blocks") or record.get("text"):
             with transcript:
                 _message(record, workspace)

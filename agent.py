@@ -170,7 +170,15 @@ def check_turn_budget() -> dict[str, Any] | None:
         if not project_id or not budget.exists(project_id):
             return None
         state = budget.status(project_id)
-    except Exception:  # noqa: BLE001 - accounting must never strand a session
+    except Exception as exc:  # noqa: BLE001 - accounting must never strand a session
+        # Fails open, and says so. This is the *only* mechanism that bounds
+        # token spend before a turn; if it cannot read the ledger, the honest
+        # report is that the turn is going out ungated.
+        print(
+            f"[grad] token budget check failed ({type(exc).__name__}: {exc}); "
+            "this turn is not gated",
+            file=sys.stderr,
+        )
         return None
 
     tokens = state["resources"]["quota_tokens"]
@@ -196,27 +204,88 @@ def check_turn_budget() -> dict[str, Any] | None:
     }
 
 
-async def _turn(client: Any, prompt: str) -> bool:
-    """Run one turn. Returns False if the budget refused it."""
+class BudgetRefused(Exception):
+    """Raised by `drive_turn` when the project is out of token allocation.
+
+    Carries the payload so a caller can render it: the CLI prints it, the UI
+    puts it in the transcript.
+    """
+
+    def __init__(self, refusal: dict[str, Any]) -> None:
+        super().__init__(refusal["message"])
+        self.refusal = refusal
+
+
+async def drive_turn(
+    client: Any,
+    prompt: str,
+    stream: Any,
+    *,
+    on_chunk: Any = None,
+    session: str | None = None,
+) -> dict[str, Any]:
+    """One turn, for every surface that runs one.
+
+    The CLI loop and the UI's `Session.ask` were the same loop written twice,
+    and only one of them checked the budget or recorded what the turn spent --
+    so everything done through the desktop app, which is the primary surface,
+    accrued no tokens in `ledger/quota.jsonl` and passed no ceiling. The README
+    said the allocation is checked "before issuing the next turn"; that was true
+    of `python agent.py` and false of `python agent.py --ui`. One driver, so
+    there is one answer.
+
+    `on_chunk` is called with each newly-visible piece of text; the UI passes
+    nothing because its renderer reads `stream.blocks` on a timer instead.
+    """
     refusal = check_turn_budget()
     if refusal:
-        print(f"\n[grad] {refusal['message']}\n[grad] fix: {refusal['fix']}", file=sys.stderr)
-        return False
+        raise BudgetRefused(refusal)
 
     await client.query(prompt)
-    stream = TurnStream()
+    sdk_session_id: str | None = None
+    last_usage: Any = None
     async for message in client.receive_response():
         # Whatever has not been printed yet -- a token as it arrives, the tail
         # of a message that was never streamed, or a line naming a tool call.
         # Never both halves of the same text.
         chunk = stream.feed(message)
-        if chunk:
-            print(chunk, end="", flush=True)
+        if chunk and on_chunk is not None:
+            on_chunk(chunk)
+        # Captured from the stream rather than asked for: the SDK assigns it, and
+        # this is the id `resume` takes when a session is reopened. A resumed
+        # conversation can be given a new id, so the latest wins.
+        candidate = getattr(message, "session_id", None)
+        if isinstance(candidate, str) and candidate:
+            sdk_session_id = candidate
+        # The *last* usage seen, recorded once after the loop -- not one record
+        # per message. `ResultMessage` arrives last and carries the turn's
+        # cumulative usage, so summing every message that has a `usage`
+        # attribute would count the same tokens twice.
         usage = getattr(message, "usage", None)
         if usage is not None:
-            quota_log.from_sdk_usage(
-                quota_log.STAGE_MAIN, usage, model=None, role="research"
-            )
+            last_usage = usage
+
+    recorded = None
+    if last_usage is not None:
+        recorded = quota_log.from_sdk_usage(
+            quota_log.STAGE_MAIN, last_usage, model=None, role="research", session=session
+        )
+    return {"sdk_session_id": sdk_session_id, "quota": recorded}
+
+
+async def _turn(client: Any, prompt: str) -> bool:
+    """Run one turn. Returns False if the budget refused it."""
+    stream = TurnStream()
+    try:
+        await drive_turn(
+            client, prompt, stream, on_chunk=lambda c: print(c, end="", flush=True)
+        )
+    except BudgetRefused as exc:
+        print(
+            f"\n[grad] {exc.refusal['message']}\n[grad] fix: {exc.refusal['fix']}",
+            file=sys.stderr,
+        )
+        return False
     print()
     return True
 

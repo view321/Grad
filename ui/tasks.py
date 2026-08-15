@@ -35,6 +35,7 @@ reload -- it is a process on this machine, not a view of one.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import sys
@@ -275,19 +276,27 @@ async def _pump(stream: Any, task: Task, *, tag: str) -> None:
 
     `StreamReader.readline` raises once a single line passes its 64 KiB limit,
     and a training log's progress line can. Chunks cannot hit that.
+
+    The decoder is incremental because chunk boundaries fall wherever the pipe
+    fills, not on character boundaries: decoding each 8 KiB read on its own
+    turned any multi-byte character straddling a boundary into U+FFFD, which in
+    this project means a `≈` or a `→` in a tool's output becoming a replacement
+    character at random.
     """
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     while True:
         chunk = await stream.read(8192)
         if not chunk:
             break
-        pending += chunk.decode("utf-8", "replace")
+        pending += decoder.decode(chunk)
         *complete, pending = pending.split("\n")
         for line in complete:
             task.append(line.rstrip("\r"), tag)
         if len(pending) > MAX_LINE_CHARS:
             task.append(pending, tag)
             pending = ""
+    pending += decoder.decode(b"", final=True)
     if pending:
         task.append(pending.rstrip("\r"), tag)
 

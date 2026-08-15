@@ -235,24 +235,59 @@ def write(
 #: find another client's claim on a file it has never seen.
 _claimed: dict[str, str] = {}
 
+#: Owners with a live connection. A claim held by an owner that is not in here
+#: is stale -- its client is gone -- and may be taken over.
+#:
+#: This exists because the owner key used to be the *browser* id, which is one
+#: cookie shared by every tab: two tabs of one browser claimed the same session
+#: successfully (`held == owner`), which is precisely the two-writers case the
+#: claim was built to prevent. Per-connection owners fix that and break reload,
+#: where the new page connects before the old one's disconnect fires and finds
+#: its own session held by a client that no longer exists. Liveness is what
+#: separates "another window is in this" from "the window that was in this is
+#: gone", and those need different answers.
+_live: set[str] = set()
+
 
 def _key(session_id: str) -> str:
     return str(path_for(session_id))
 
 
+def register(owner: str) -> None:
+    _live.add(owner)
+
+
 def claim(session_id: str, owner: str) -> bool:
-    """Take a session for one client. False if another client already has it."""
+    """Take a session for one client. False if another *live* client has it."""
     key = _key(session_id)
     held = _claimed.get(key)
-    if held is not None and held != owner:
+    if held is not None and held != owner and held in _live:
         return False
     _claimed[key] = owner
+    _live.add(owner)
     return True
 
 
 def release(owner: str) -> None:
+    # Only the claims this owner still holds. A reloaded page re-claims its
+    # session under a new owner, and the old client's late disconnect must not
+    # then drop the live page's claim -- which is what happened when release
+    # matched on owner alone and the two shared a browser-id key.
     for key in [k for k, held in _claimed.items() if held == owner]:
         del _claimed[key]
+    _live.discard(owner)
+
+
+def held_by_other(session_id: str, owner: str) -> bool:
+    """Does a *different, live* client hold this session?
+
+    The question `_persist` needs, and it is not "do I hold it": an unclaimed
+    session is safe to write -- there is no one to overwrite -- while one held
+    by another live client is exactly the file that must not be replaced. A
+    claim left behind by a client that has gone is not a writer either.
+    """
+    held = _claimed.get(_key(session_id))
+    return held is not None and held != owner and held in _live
 
 
 def holder(session_id: str) -> str | None:
@@ -262,6 +297,7 @@ def holder(session_id: str) -> str | None:
 def reset_claims() -> None:
     """Drop every claim. For tests -- module state outlives a fixture."""
     _claimed.clear()
+    _live.clear()
 
 
 def most_recent(owner: str | None = None) -> str | None:

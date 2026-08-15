@@ -25,15 +25,15 @@ is a sentence in `prompts/system.md`.
 | A prediction exists before the result does | `core/gates.py:check_expectation`, bound at submit time |
 | Results get recorded at all | `collect` writes the run record; a stale uncollected run blocks new submissions |
 | Cumulative spend stays bounded | `core/ledger_store.py:rolling_spend` — actuals for collected runs, estimates for in-flight ones |
-| The smoke job cannot become a backdoor | `core/gates.py:check_smoke_caps` clamps steps, wall clock, and cost in code |
+| The smoke job cannot become a backdoor | `core/gates.py:check_smoke_caps` clamps steps and wall clock, and clamps the wall clock again against the target's hourly rate so the cost cap is arithmetic rather than a self-report |
 | Notebooks run clean top-to-bottom | `tools/nb.py verify` on a fresh kernel |
 | No general remote-execution capability | credentials in Windows Credential Manager, read only by `jobs.py` / `gpu.py` |
 | Concurrent ledger writes don't corrupt | one locked `core/jsonl.py:append`; no CLI writes a ledger file directly |
 | Token and credit spend stays bounded, not merely measured | `core/budget.py`, checked at every gateable event |
 | An evolutionary campaign cannot outspend its allocation | the campaign gate in `tools/evolve.py`, before generation 0 and before each generation after it |
 | A job submitted to an org is collectable from that org | the namespace is persisted on the run handle, not just passed at submit |
-| Every number in a report traces to a run record | `tools/report.py check` refuses on an unresolved claim |
-| Every citation in a report is a real paper | `report cite` resolves only against the corpus and verified S2 ids |
+| Every number in a report traces to a run record | `tools/report.py check` refuses on an unresolved claim, on a `claims.tex` that has drifted from `claims.json`, and on a measured-looking number typed into the generated prose |
+| Every citation in a report is a real paper | `report cite` resolves only against the corpus and verified S2 ids, and `check` re-resolves each entry's id rather than trusting its `gradsource` label |
 | A result that has not been judged cannot be published | `report check` refuses while any cited run has an unjudged deviation |
 
 ### The one thing that is *not* fully mechanical, and why
@@ -43,6 +43,13 @@ Tokens are consumed continuously inside a turn and there is no way to refuse
 mid-turn, so `agent.py` checks the remaining allocation *before* issuing the
 next turn and `hooks.py` denies cost-bearing Bash once the project is over. The
 turn that crosses the ceiling finishes.
+
+Both surfaces run the same check because both run the same loop:
+`agent.drive_turn` is the one place a turn is issued, and it checks the budget
+before `query` and records the turn's usage after it. The CLI and the desktop
+app called it independently for a while, and only the CLI accounted — so a
+session held entirely in the app spent tokens that no ledger recorded and no
+ceiling could see.
 
 A second honesty note: subscription quota is not linear in tokens, and the real
 limits are rolling windows (5-hour and weekly on Max) that the SDK does not
@@ -204,7 +211,7 @@ what each check catches.
 
 ```
 agent.py              ClaudeSDKClient loop, permission configuration, the deny probe
-hooks.py              PreToolUse gate (a speed bump) + Stop hook (quota accounting)
+hooks.py              PreToolUse gate (a speed bump) + Stop hook (budget warnings)
 prompts/system.md     under 1000 tokens
 core/                 the machinery the CLIs share, so no tool can forget a rule
   cli.py              the §8 CLI contract, implemented once
@@ -294,7 +301,7 @@ that does not import can only guess at what is installed. Run it on your own
 pipeline, not on a repository you just downloaded; the module docstring and
 `--help` both say so.
 
-Two things worth knowing before trusting them:
+Four things worth knowing before trusting them:
 
 - **The Agent SDK surface is version-sensitive.** `core/haiku.py` and
   `agent.py` are written against the interfaces described in the handoff
@@ -305,6 +312,21 @@ Two things worth knowing before trusting them:
   of one call, because `ssh` needs a key file. That is weaker than never
   materialising it. Prefer an SSH agent or a `~/.ssh/config` host entry and
   leave `key_credential` unset, in which case no key is ever written by us.
+- **The preflight record is a plain JSON file the agent can write.** Gate 1
+  reads `ledger/preflight/<hash>.json` and the model has `Write`. So the
+  cheapest way past the most important gate is not an argument, it is a file —
+  which puts it in the same class as the bypasses `core/credentials.py` already
+  declares out of scope (an agent that can run Python can import `keyring`).
+  Signing the record would not close it either, since the signing key would be
+  readable by the same process. What actually bounds this is that the *spend*
+  gates do not read agent-writable state: the ledger is append-only through one
+  locked path, and `collect` prices runs from the platform's own timestamps.
+- **The S2 half of the citation rule is weaker than the corpus half.** A
+  `corpus` entry is verified by resolving its document id against the local
+  index. An `s2` entry is verified by its `S2:<id>` shape and the overlap scores
+  `report cite` recorded when it accepted the match — re-querying the live
+  service inside a gate would make `check` require the network. Forging one is
+  no longer a single line of BibTeX, but it is not impossible.
 
 The order in §12 of the handoff is deliberate — build the agent, use it for a
 week, *then* harvest `evals/retrieval.jsonl` from what retrieval was actually

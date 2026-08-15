@@ -141,11 +141,19 @@ def _appbar(workspace: Workspace, windows: Any, projects: Any) -> None:
             "paused": "AGENT PAUSED",
         }[state]
         kit.chip(caption, header["accent"], dot=state == "running")
+        # STOP, not PAUSE. The button used to flip the header caption to "AGENT
+        # PAUSED" and nothing else: the turn kept streaming, tools kept running,
+        # and the next settle overwrote the state back to idle. A control that
+        # says the agent is paused while it is spending is worse than no control,
+        # so this one interrupts the turn -- the thing the SDK can actually do --
+        # and is disabled when there is nothing to interrupt.
         kit.button(
-            "■ PAUSE" if state == "running" else "▶ RESUME",
+            "■ STOP",
             tone="ghost",
             classes="grad-appbar-btn",
-            on_click=lambda: workspace.set_agent_state("paused" if state == "running" else "idle"),
+            title="interrupt the turn in flight",
+            on_click=workspace.interrupt_turn,
+            disabled=state != "running",
         )
 
     kit.spacer()
@@ -383,11 +391,18 @@ def _ceilings(ui: Any, workspace: Workspace, model: dict[str, Any], menu: _Menu)
             fields[flag] = field
 
         def raise_them() -> None:
-            argv = ["tools.budget", "raise", current["id"]]
+            # `--project <id>`, not a positional: `tools.budget raise` takes the
+            # project as a flag, and passing it positionally failed with a usage
+            # error on every click -- the one budget-mutating control in the app,
+            # dead since it was written, and the control the over-budget refusal
+            # tells you to use. `tests/test_ui_argv.py` now runs every button's
+            # argv through the real parser.
+            argv = ["tools.budget", "raise", "--project", current["id"]]
+            base = len(argv)
             for flag, field in fields.items():
                 if (field.value or "").strip():
                     argv += [f"--{flag}", str(field.value).strip()]
-            if len(argv) == 3:
+            if len(argv) == base:
                 workspace.say("no ceiling given — fill one of the three fields")
                 return
             menu.close()
@@ -598,8 +613,16 @@ def _frame(
         bar.props(f'data-window="{window_id}"')
         bar.on("click", lambda _=None, wid=window_id: workspace.focus(wid))
         bars[window_id] = bar
-        with bar:
-            _titlebar(workspace, window_id)
+
+        def redraw_titlebar(b=bar, wid=window_id) -> None:
+            b.clear()
+            with b:
+                _titlebar(workspace, wid)
+
+        redraw_titlebar()
+        # Refreshed by the poll, not only by a retile. `chat` has no model
+        # builder, so nothing else would ever redraw its bar.
+        workspace.bind_titlebar(window_id, redraw_titlebar)
 
     # Outside the `with`, on purpose: `move` sets the parent explicitly, and
     # doing it inside the block would append to whatever slot is current.

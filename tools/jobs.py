@@ -261,6 +261,9 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         command=command,
         task=args.task,
         project=project_id,
+        # Re-checks the spend ceilings inside the append lock, so two submitters
+        # racing cannot both pass and both commit.
+        cfg=cfg,
     )
 
     try:
@@ -366,8 +369,13 @@ def run_smoke(
     Unlike a real submission this blocks, because it is bounded to minutes by
     construction and preflight needs the answer.
     """
-    caps = gates.check_smoke_caps(sub, cfg)
+    # The flavor resolves before the caps, because the caps are computed against
+    # its hourly rate: the wall clock is clamped to what the cost cap affords,
+    # and an unpriced flavor is refused rather than assumed free.
     flavor = sub.target.get("smoke_flavor") or sub.target.get("flavor") or cfg.get("hf", "default_flavor", "a10g-small")
+    caps = gates.check_smoke_caps(
+        sub, cfg, rate_usd_per_hour=flavor_rate(flavor, cfg), target_name=f"flavor {flavor!r}"
+    )
     command = _smoke_command(sub, caps)
 
     # Resolved once, and used for both the namespace and the accounting.
@@ -424,7 +432,9 @@ def run_smoke(
     state, info = _poll(job_id, deadline=time.time() + caps["timeout_s"], namespace=namespace)
     logs = _logs(job_id, namespace=namespace)
     (artifacts / "smoke.log").write_text(logs, encoding="utf-8")
-    cost = _actual_cost(info, flavor, cfg)
+    cost, cost_warning = _actual_cost(
+        info, flavor, cfg, estimate_usd=float(caps.get("projected_cost_usd") or 0.0)
+    )
     ok = state == "COMPLETED"
     submit_lib.finish(
         run_id,
@@ -433,7 +443,12 @@ def run_smoke(
         cost_usd_actual=cost,
         artifacts_dir=artifacts,
         expectation=None,
-        extra={"job_state": state, "smoke": True},
+        extra={
+            "job_state": state,
+            "smoke": True,
+            "cost_warning": cost_warning,
+            "cost_basis": "estimate" if cost_warning else "measured",
+        },
     )
     return {
         "ok": ok,
@@ -503,21 +518,53 @@ def _logs(job_id: str, *, namespace: str | None = None) -> str:
         return f"(could not fetch logs: {exc})"
 
 
-def _actual_cost(info: Any, flavor: str, cfg: Config) -> float:
+def flavor_rate(flavor: str, cfg: Config) -> float | None:
+    """The hourly rate for a flavor, or None when the table does not price it.
+
+    None rather than 0.0, and the difference is the whole point: HF serves
+    flavors this table has never heard of (`l4x4`, `h100`, whatever ships next),
+    and pricing an unknown one at zero books a real job as free -- permanently
+    understating rolling spend and the project ceiling, which is exactly the
+    "stale in the optimistic direction makes the ceiling decoration" failure the
+    config comment warns about. Callers must decide what to do with the None;
+    none of them may treat it as free.
+    """
+    rates = cfg.get("hf", "flavor_rates", {}) or {}
+    if flavor not in rates:
+        return None
+    try:
+        rate = float(rates[flavor])
+    except (TypeError, ValueError):
+        return None
+    return rate if rate >= 0 else None
+
+
+def _actual_cost(info: Any, flavor: str, cfg: Config, *, estimate_usd: float = 0.0) -> tuple[float, str | None]:
     """Cost from the platform's own accounting of the run.
 
     HF reports the job's start and end timestamps; the price of a flavor comes
     from the rate table in config/grad.toml. The estimate is never reused here
-    -- that is the whole point of collecting.
+    -- that is the whole point of collecting -- *except* when the flavor is
+    unpriced or the platform reported no start time, where the alternative is
+    booking the run at $0. Falling back to the estimate keeps the ceiling
+    honest, and the returned warning is what says the number is not measured.
     """
     started = _ts(info, "started_at") or _ts(info, "created_at")
     ended = _ts(info, "ended_at") or _dt.datetime.now(_dt.timezone.utc)
+    rate = flavor_rate(flavor, cfg)
+    if rate is None:
+        return round(float(estimate_usd), 4), (
+            f"flavor {flavor!r} is not priced in [hf.flavor_rates]; this run is booked at its "
+            f"estimate of ${float(estimate_usd):.2f} rather than at $0. Add the rate to "
+            "config/grad.toml and re-collect for a measured figure."
+        )
     if not started:
-        return 0.0
+        return round(float(estimate_usd), 4), (
+            "the platform reported no start time for this run, so its duration is unknown; "
+            f"booked at its estimate of ${float(estimate_usd):.2f} rather than at $0."
+        )
     hours = max(0.0, (ended - started).total_seconds() / 3600.0)
-    rates = cfg.get("hf", "flavor_rates", {}) or {}
-    rate = float(rates.get(flavor, 0.0))
-    return round(hours * rate, 4)
+    return round(hours * rate, 4), None
 
 
 def _ts(info: Any, field: str) -> _dt.datetime | None:
@@ -623,7 +670,12 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
         except GradError:
             expectation = None
 
-    cost = _actual_cost(info, (r.get("target") or {}).get("flavor", ""), config_mod.load())
+    cost, cost_warning = _actual_cost(
+        info,
+        (r.get("target") or {}).get("flavor", ""),
+        config_mod.load(),
+        estimate_usd=float(r.get("estimate_usd") or 0.0),
+    )
     record = submit_lib.finish(
         r.id,
         status="completed" if state == "COMPLETED" else "failed",
@@ -631,12 +683,21 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
         cost_usd_actual=cost,
         artifacts_dir=artifacts,
         expectation=expectation,
-        extra={"job_state": state, "metrics_error": metrics_error},
+        extra={
+            "job_state": state,
+            "metrics_error": metrics_error,
+            # On the record, not just in this reply: whether a cost was measured
+            # or fallen back to is a property of the run, and `report` and the
+            # ceiling both read the record rather than this envelope.
+            "cost_warning": cost_warning,
+            "cost_basis": "estimate" if cost_warning else "measured",
+        },
     )
     unjudged = [d for d in record["deviations"] if d.get("in_range") is not True]
     return {
         "run": record,
         "artifacts": str(artifacts),
+        "cost_warning": cost_warning,
         "needs_verdict": unjudged,
         "next": (
             f"python -m tools.ledger verdict {r.id} --quantity {unjudged[0]['quantity']} "

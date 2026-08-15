@@ -257,6 +257,29 @@ def _embed_chunks(con: Any, cfg: Any, chunk_ids: list[int], texts: list[str]) ->
     return len(vectors)
 
 
+def _notes_id(path: Path) -> str:
+    """A stable document id for a notes file: its path relative to the root.
+
+    One file has to have one id however it was named on the command line. The
+    id used to be `path.relative_to(root)` for an absolute path inside the
+    workspace and `path.name` otherwise, so `paper_ingest notes notes/foo.md`
+    and the same file by absolute path produced `notes:foo.md` and
+    `notes:notes\\foo.md` -- two documents, same content, both citable -- while
+    the bare-name form collided between same-named files in different folders.
+
+    Separators are normalised because a corpus id that differs by slash
+    direction is two ids on Windows and one everywhere else.
+    """
+    try:
+        resolved = path.resolve()
+        relative = resolved.relative_to(paths.root().resolve())
+    except (ValueError, OSError):
+        # Outside the workspace: keep the absolute path, which is still one
+        # stable id for one file.
+        relative = path if path.is_absolute() else Path(path).absolute()
+    return str(relative).replace("\\", "/")
+
+
 def _notes_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("path", help="a markdown file or a directory of them")
     p.add_argument("--no-vectors", action="store_true")
@@ -282,7 +305,7 @@ def cmd_notes(args: argparse.Namespace) -> dict[str, Any]:
             ]
             if not chunks:
                 continue
-            doc_id = f"notes:{path.relative_to(paths.root()) if path.is_absolute() and paths.root() in path.parents else path.name}"
+            doc_id = f"notes:{_notes_id(path)}"
             corpus.upsert_document(
                 con,
                 {"id": doc_id, "title": path.stem, "source": "notes", "path": str(path),

@@ -235,7 +235,11 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             "returned": len(survivors),
         },
         "trace": trace,
-        "trace_log": str(paths.notes_dir() / "funnel" / f"{log_name}.md"),
+        # `.json`, which is what `_write_trace` actually writes. The `.md` this
+        # used to return was a path to nothing, and the empty-pool branch above
+        # already got it right -- so the two exits from one function disagreed
+        # about where the trace lives.
+        "trace_log": str(paths.notes_dir() / "funnel" / f"{log_name}.json"),
     }
 
 

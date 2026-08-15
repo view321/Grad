@@ -33,7 +33,7 @@ from core import (
 )
 from core.cli import Cli, main
 from core.config import Config, Host
-from core.errors import EXIT_RUNNING, GradError, UpstreamError, UsageError
+from core.errors import EXIT_RUNNING, ConfigError, GradError, UpstreamError, UsageError
 from core.submission import Submission, parse_override
 
 cli = Cli(
@@ -74,6 +74,16 @@ class _Key:
         if not self.host.key_credential:
             return None
         material = credentials.get(self.host.key_credential)
+        # An empty credential writes a one-newline "key" and ssh fails with
+        # "invalid format", which sends you looking at the key rather than at
+        # the store it is missing from. `credentials.get` normally raises, but
+        # an empty stored value and GRAD_ALLOW_ENV_CREDENTIALS with an unset
+        # variable both arrive here as "".
+        if not (material or "").strip():
+            raise ConfigError(
+                f"credential {self.host.key_credential!r} is empty, so no SSH key can be written",
+                fix=f"python -m tools.jobs credential set {self.host.key_credential}",
+            )
         fd, name = tempfile.mkstemp(prefix="grad-key-")
         os.close(fd)
         path = Path(name)
@@ -201,6 +211,9 @@ def cmd_submit(args: argparse.Namespace) -> dict[str, Any]:
         command=_command_for(sub),
         task=args.task,
         project=project_id,
+        # Re-checks the spend ceilings inside the append lock. jobs.py does the
+        # same; neither backend gets to differ on this.
+        cfg=cfg,
     )
     remote_dir = f"{host.workdir}/{run_id}"
     try:
@@ -282,7 +295,12 @@ def run_smoke(
     the real data path, and the real per-device batch size.
     """
     host = host or cfg.host(sub.target.get("host") or "")
-    caps = gates.check_smoke_caps(sub, cfg)
+    # A host's rate is inventory, not a lookup that can miss -- but it can be
+    # absent or negative in a hand-edited config, and either would make the
+    # cost cap uncomputable. `check_smoke_caps` refuses on both.
+    caps = gates.check_smoke_caps(
+        sub, cfg, rate_usd_per_hour=host.rate_usd_per_hour, target_name=f"host {host.name!r}"
+    )
     command = [*_command_for(sub), "--steps", str(caps["steps"]), "--smoke"]
     run_id = submit_lib.record_smoke_run(
         sub, cfg=cfg, platform=PLATFORM,

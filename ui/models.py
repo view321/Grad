@@ -176,7 +176,10 @@ def header_model(*, agent_state: str = "idle", step: int | None = None) -> dict[
     ceiling = 8.0
     if cfg is not None:
         raw, _ = _safe(lambda: float(cfg.get("spend", "session_usd", 8.0)), 8.0)
-        ceiling = raw or 8.0
+        # `is None`, not `or`: a configured ceiling of 0 is a deliberate "no
+        # credit spend in this session", and coercing it to the 8.0 default
+        # silently granted eight dollars nobody asked for.
+        ceiling = 8.0 if raw is None else raw
 
     window, error = _safe(lambda: _session_window(hours=5), {})
     window = window or {}
@@ -214,6 +217,7 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
     now = _dt.datetime.now(_dt.timezone.utc)
     cutoff = now - _dt.timedelta(hours=hours)
     chat = tool = 0.0
+    chat_tokens = tool_tokens = 0
     tokens = 0
     oldest: _dt.datetime | None = None
     for entry in quota_log.entries():
@@ -222,11 +226,14 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
             continue
         oldest = at if oldest is None or at < oldest else oldest
         credits = float(entry.get("credits_usd", 0.0) or 0.0)
-        tokens += int(entry.get("input_tokens", 0) or 0) + int(entry.get("output_tokens", 0) or 0)
+        entry_tokens = int(entry.get("input_tokens", 0) or 0) + int(entry.get("output_tokens", 0) or 0)
+        tokens += entry_tokens
         if str(entry.get("stage") or "") == quota_log.STAGE_MAIN:
             chat += credits
+            chat_tokens += entry_tokens
         else:
             tool += credits
+            tool_tokens += entry_tokens
     total = chat + tool
     resets_in = "—"
     if oldest is not None:
@@ -234,12 +241,30 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
         if remaining.total_seconds() > 0:
             hrs, rem = divmod(int(remaining.total_seconds()), 3600)
             resets_in = f"{hrs}h {rem // 60:02d}m"
+    # The split falls back to tokens when no credits were spent in the window.
+    # Chat costs subscription quota and never credits, so splitting the strip by
+    # `credits_usd` alone made the chat segment structurally zero: the meter
+    # claimed to show "what chat spent and what tools spent" while only ever
+    # drawing the second. Dollars stay the unit when there are dollars, because
+    # mixing two currencies in one bar is worse than either.
+    token_total = chat_tokens + tool_tokens
+    if total:
+        chat_fraction = chat / total
+        tool_fraction = tool / total
+    elif token_total:
+        chat_fraction = chat_tokens / token_total
+        tool_fraction = tool_tokens / token_total
+    else:
+        chat_fraction = tool_fraction = 0.0
     return {
         "credits_usd": total,
         "chat_usd": chat,
         "tool_usd": tool,
-        "chat_fraction": (chat / total) if total else 0.0,
-        "tool_fraction": (tool / total) if total else 0.0,
+        "chat_tokens": chat_tokens,
+        "tool_tokens": tool_tokens,
+        "chat_fraction": chat_fraction,
+        "tool_fraction": tool_fraction,
+        "split_basis": "credits" if total else ("tokens" if token_total else "empty"),
         "tokens": tokens,
         "resets_in": resets_in,
     }
@@ -385,6 +410,12 @@ def tasks_model() -> dict[str, Any]:
     The output tail is included whole. It is bounded at the source
     (`tasks.TAIL_LINES`), and the poll's fingerprint is what turns "a line
     arrived" into a redraw -- so a task that is quiet costs one comparison.
+
+    Which is why `elapsed` is bucketed rather than exact: rendering "5s" then
+    "7s" changed the fingerprint on every two-second poll, so a *quiet* running
+    task redrew the whole window forever -- the opposite of what the paragraph
+    above claims. Seconds resolution below a minute is finer than anyone reads
+    a background task at, and it makes the docstring true.
     """
     from ui import tasks as tasks_mod
 
@@ -398,7 +429,10 @@ def tasks_model() -> dict[str, Any]:
                 "state": task.state,
                 "tone": tasks_mod.STATE_TONE.get(task.state, "neutral"),
                 "running": task.running,
-                "elapsed": _duration(task.elapsed),
+                # Bucketed while running so a quiet task does not change its own
+                # fingerprint every poll; exact once it has finished, where the
+                # number stops moving and the precision is worth something.
+                "elapsed": _duration(task.elapsed, coarse=task.running),
                 "exit_code": task.exit_code,
                 "stoppable": task.running,
                 # Named so the button can say what stopping will actually do:
@@ -438,8 +472,16 @@ def _tail_runs(tail: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
     return [(tag, "\n".join(lines)) for tag, lines in runs]
 
 
-def _duration(seconds: float) -> str:
+#: How coarsely a *running* duration is reported. The poll is every 2 s and the
+#: fingerprint is the whole model, so any finer and a task that has produced no
+#: output still forces a redraw on every tick.
+COARSE_ELAPSED_S = 15
+
+
+def _duration(seconds: float, *, coarse: bool = False) -> str:
     seconds = max(0.0, float(seconds))
+    if coarse:
+        seconds = (int(seconds) // COARSE_ELAPSED_S) * COARSE_ELAPSED_S
     if seconds < 60:
         return f"{seconds:.0f}s"
     if seconds < 3600:

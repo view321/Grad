@@ -49,18 +49,44 @@ def check_preflight(sub: Submission, cfg: Config, *, required: list[str] | None 
 
     required = required if required is not None else list(cfg.get("preflight", "checks", []))
     results = record.get("checks", {})
+    if not isinstance(results, dict):
+        results = {}
     missing = [c for c in required if c not in results]
-    failing = [c for c in required if results.get(c, {}).get("ok") is False]
-    if missing or failing:
+    # `ok is True`, not `not (ok is False)`. A check whose entry is `{}`, or
+    # `{"ok": null}`, or a bare string is not a check that passed -- it is a
+    # record a crashed writer or a future check left half-written, and the gate
+    # is the part of this system that does not trust its inputs. Enumerating the
+    # known-bad states let every unknown state through.
+    def _entry(name: str) -> dict[str, Any]:
+        value = results.get(name)
+        return value if isinstance(value, dict) else {}
+
+    failing = [c for c in required if c in results and _entry(c).get("ok") is False]
+    # Anything that is neither a pass nor an explicit failure: `{}`, `{"ok":
+    # null}`, a bare string. Reported separately because "this check failed" and
+    # "this check recorded no verdict" send you to different places.
+    unverified = [
+        c
+        for c in required
+        if c in results and c not in failing and _entry(c).get("ok") is not True
+    ]
+    if missing or failing or unverified:
         raise GateRefusal(
             "preflight_failing",
             "preflight for this submission is incomplete or failing: "
             + ", ".join(
-                [f"{c} missing" for c in missing] + [f"{c} failed" for c in failing]
+                [f"{c} missing" for c in missing]
+                + [f"{c} failed" for c in failing]
+                + [f"{c} recorded no pass/fail verdict" for c in unverified]
             ),
             EXIT_PREFLIGHT,
             fix=fix,
-            detail={"submission_hash": h, "missing": missing, "failing": failing},
+            detail={
+                "submission_hash": h,
+                "missing": missing,
+                "failing": failing,
+                "unverified": unverified,
+            },
         )
     return record
 
@@ -89,10 +115,21 @@ def check_expectation(expectation_id: str | None, sub: Submission) -> dict[str, 
             EXIT_EXPECTATION,
             fix=fix,
         ) from None
-    if expectation_id in ls.bound_expectation_ids():
+    if expectation_id in ls.falsified_ids():
+        raise GateRefusal(
+            "expectation_falsified",
+            f"expectation {expectation_id!r} was retracted; a withdrawn prediction is not "
+            "pre-registration, and binding one after the fact is the thing §7 exists to stop",
+            EXIT_EXPECTATION,
+            fix="mint a new expectation for this run: " + fix,
+        )
+    # Runs *and* campaigns: `evolve` consumes an expectation the same way a
+    # submission does, and checking only one of the two ledgers here let one
+    # prediction cover both.
+    if expectation_id in ls.consumed_expectation_ids():
         raise GateRefusal(
             "expectation_bound",
-            f"expectation {expectation_id!r} is already bound to a run; "
+            f"expectation {expectation_id!r} is already bound to a run or campaign; "
             "each prediction covers exactly one run",
             EXIT_EXPECTATION,
             fix="mint a new expectation for this run: " + fix,
@@ -229,7 +266,19 @@ def check_submit(
 # ---------------------------------------------------------------------------
 # the smoke carve-out
 # ---------------------------------------------------------------------------
-def check_smoke_caps(sub: Submission, cfg: Config, *, requested: dict[str, Any] | None = None) -> dict[str, Any]:
+# A smoke that cannot run a minute cannot run one step of anything real, so
+# clamping below this is refusing with extra steps.
+MIN_SMOKE_WALL_S = 60
+
+
+def check_smoke_caps(
+    sub: Submission,
+    cfg: Config,
+    *,
+    requested: dict[str, Any] | None = None,
+    rate_usd_per_hour: float | None = None,
+    target_name: str = "this target",
+) -> dict[str, Any]:
     """Smoke skips the gates above and is hard-capped here instead.
 
     "The caps are what keep the exemption from becoming the way real jobs escape
@@ -237,6 +286,14 @@ def check_smoke_caps(sub: Submission, cfg: Config, *, requested: dict[str, Any] 
 
     The caps are applied, not merely validated: whatever the spec asked for, the
     smoke submission is clamped to one step, minutes of wall clock, and cents.
+
+    `rate_usd_per_hour` is what makes the cost cap real rather than advisory.
+    Without it the only cost refusal was against `estimate.smoke_cost_usd` --
+    a number the spec declares about itself, defaulting to 0.0 -- so a smoke on
+    a $4.13/h flavor could run the full 600 s wall cap and bill $0.69 against a
+    $0.50 ceiling. The wall clock is therefore clamped to what the rate affords,
+    and a rate we cannot look up is a refusal: an unpriced flavor is exactly the
+    one that turns the ceiling into decoration.
     """
     requested = requested or {}
     max_steps = int(cfg.get("smoke", "max_steps", 1))
@@ -265,4 +322,45 @@ def check_smoke_caps(sub: Submission, cfg: Config, *, requested: dict[str, Any] 
             fix="use a smaller instance for the smoke step, or lower estimate.smoke_cost_usd",
             detail=clamped,
         )
+
+    if rate_usd_per_hour is None:
+        raise GateRefusal(
+            "smoke_rate_unknown",
+            f"no hourly rate is known for {target_name}, so the smoke cost cap of "
+            f"${max_cost:.2f} cannot be enforced -- and a cap that cannot be computed "
+            "is not a cap",
+            EXIT_SPEND,
+            fix=(
+                "add the flavor to [hf.flavor_rates] in config/grad.toml (or set the host's "
+                "rate_usd_per_hour), then re-run"
+            ),
+            detail={**clamped, "target": target_name},
+        )
+
+    rate = float(rate_usd_per_hour)
+    if rate < 0:
+        raise GateRefusal(
+            "smoke_rate_invalid",
+            f"the hourly rate for {target_name} is negative (${rate:.2f}/h)",
+            EXIT_SPEND,
+            fix="fix the rate in config/grad.toml; a negative rate would credit spend back",
+            detail={**clamped, "target": target_name},
+        )
+
+    if rate > 0:
+        affordable_s = int((clamped["cost_ceiling_usd"] / rate) * 3600)
+        if affordable_s < MIN_SMOKE_WALL_S:
+            raise GateRefusal(
+                "smoke_too_expensive",
+                f"at ${rate:.2f}/h, {target_name} burns the ${clamped['cost_ceiling_usd']:.2f} "
+                f"smoke cap in {affordable_s}s -- less than the {MIN_SMOKE_WALL_S}s floor a "
+                "one-step run needs",
+                EXIT_SPEND,
+                fix="use a smaller instance for the smoke step",
+                detail={**clamped, "target": target_name, "rate_usd_per_hour": rate},
+            )
+        clamped["timeout_s"] = min(clamped["timeout_s"], affordable_s)
+
+    clamped["rate_usd_per_hour"] = rate
+    clamped["projected_cost_usd"] = round(rate * clamped["timeout_s"] / 3600.0, 4)
     return clamped

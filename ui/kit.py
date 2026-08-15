@@ -202,15 +202,18 @@ def status_square(state: str, glyph: str) -> Any:
     return text(glyph, f"grad-status-square {_tone_class(state)}".strip())
 
 
-def band_strip(geometry: dict[str, Any] | None, *, unit: str = "") -> Any:
+def band_strip(geometry: dict[str, Any] | None, *, unit: str = "", reason: str = "") -> Any:
     """Predicted band, observed tick, falsifier bounds.
 
-    `None` renders the honest thing -- a note saying the prediction is
-    relational and has no band -- rather than an empty box that reads as a
-    missing value.
+    `None` renders the honest thing -- a note saying why there is no band --
+    rather than an empty box that reads as a missing value. `reason` exists
+    because there are two ways to have no geometry and only one of them was
+    being reported: `band_geometry` also returns None for a numeric prediction
+    with no result yet, and calling that "relational" told the reader something
+    false about their own expectation.
     """
     if not geometry:
-        return note("relational prediction — no numeric band to draw")
+        return note(reason or "relational prediction — no numeric band to draw")
     with el("div") as element:
         with el("div", "grad-band"):
             start = geometry.get("band_start")

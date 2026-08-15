@@ -35,6 +35,27 @@ def check(
     return gates.check_submit(sub, expectation_id, cfg, project=project)
 
 
+def spend_precondition(
+    estimate_usd: float, cfg: Config, *, project: str | None
+) -> Any:
+    """Re-run the spend gates inside the append lock.
+
+    `check_spend` and `budget.check` read the ledger, and the run record that
+    makes this job's estimate visible is written afterwards -- so two submitters
+    racing (the agent and a terminal, or the agent and a UI-spawned task) could
+    both pass a $200 ceiling with $100 estimates against $50 spent, and both
+    commit. The binding check already closes this shape of race for
+    expectations; the ceilings get the same treatment rather than a comment
+    explaining why they are the exception.
+    """
+
+    def _still_affordable() -> None:
+        gates.check_spend(estimate_usd, cfg)
+        gates.check_project_spend(project, estimate_usd)
+
+    return _still_affordable
+
+
 def record_submission(
     sub: Submission,
     *,
@@ -45,6 +66,7 @@ def record_submission(
     task: str | None = None,
     project: str | None = None,
     extra: dict[str, Any] | None = None,
+    cfg: Config | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Mint the run id and write the in-flight record.
 
@@ -56,6 +78,9 @@ def record_submission(
     Call this only once the gates have passed and the backend is known to be
     reachable, so a configuration problem never leaves a phantom estimate
     sitting on the ceiling.
+
+    Pass `cfg` to re-check the spend ceilings inside the append lock; without it
+    the ceilings are only as tight as the window between the gate and the write.
     """
     run_id = ls.new_id("run")
     record = {
@@ -84,7 +109,16 @@ def record_submission(
         "config": sub.config,
         **(extra or {}),
     }
-    ls.append_run_event(record)
+    ls.append_run_event(
+        record,
+        precondition=(
+            None
+            if cfg is None
+            # `project`, not the record's `project or UNASSIGNED`: the in-lock
+            # check must ask exactly what the gate asked.
+            else spend_precondition(sub.estimated_cost_usd(), cfg, project=project)
+        ),
+    )
     return run_id, record
 
 
@@ -224,7 +258,14 @@ def compute_deviations(expectation: dict[str, Any] | None, results: dict[str, An
                 "expectation_id": expectation.get("id"),
                 "quantity": quantity,
                 "actual": None,
-                "in_range": False,
+                # None, not False. `Run.unjudged_deviations` documents None as
+                # "the cases no program can settle" and names this one; the
+                # SQLite index stores NULL to separate "needs a verdict" from
+                # "numerically out of range". Writing False put missing-quantity
+                # runs in with the numeric misses, so a query for `in_range = 0`
+                # returned rows that never reported a number at all. Both still
+                # demand a verdict -- the predicate is `is not True`.
+                "in_range": None,
                 "reason": "the run reported no value for the predicted quantity",
             }
         ]

@@ -242,11 +242,48 @@ def test_all_four_gates_pass_together(workspace, cfg):
 def test_smoke_caps_are_applied_not_merely_validated(workspace, cfg):
     """'nothing useful can be trained inside them'"""
     sub = make_submission(workspace)
-    caps = gates.check_smoke_caps(sub, cfg, requested={"steps": 10_000, "timeout_s": 86_400, "cost_usd": 500.0})
+    caps = gates.check_smoke_caps(
+        sub,
+        cfg,
+        requested={"steps": 10_000, "timeout_s": 86_400, "cost_usd": 500.0},
+        rate_usd_per_hour=0.40,
+    )
     assert caps["steps"] == 1
     assert caps["timeout_s"] <= 600
     assert caps["cost_ceiling_usd"] <= 0.50
     assert caps["artifact_upload"] is False
+
+
+def test_the_smoke_wall_clock_is_clamped_to_what_the_cost_cap_affords(workspace, cfg):
+    """The cost cap used to be checked only against the spec's own estimate.
+
+    At $4.13/h the 600 s wall cap costs $0.69 against a $0.50 ceiling, so the
+    exemption billed 38% over its own cap while reporting that it had applied it.
+    """
+    sub = make_submission(workspace)
+    caps = gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=4.13)
+    assert caps["timeout_s"] < 600
+    assert caps["projected_cost_usd"] <= 0.50
+
+
+def test_smoke_refuses_a_target_with_no_known_rate(workspace, cfg):
+    """A flavor absent from the rate table cannot be capped, so it is refused.
+
+    Defaulting it to $0/h is what made an unpriced flavor look free -- to this
+    gate and, before `_actual_cost` was fixed, to the ledger as well.
+    """
+    sub = make_submission(workspace)
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=None, target_name="flavor 'l4x4'")
+    assert exc.value.code == "smoke_rate_unknown"
+    assert "l4x4" in exc.value.message
+
+
+def test_smoke_refuses_a_rate_that_burns_the_cap_immediately(workspace, cfg):
+    sub = make_submission(workspace)
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=500.0)
+    assert exc.value.code == "smoke_too_expensive"
 
 
 def test_smoke_refuses_a_spec_whose_floor_exceeds_the_cap(workspace, cfg):
@@ -260,5 +297,23 @@ def test_smoke_refuses_a_spec_whose_floor_exceeds_the_cap(workspace, cfg):
     )
     sub = Submission.load(d / "spec.toml", resolve_digest=False)
     with pytest.raises(GateRefusal) as exc:
-        gates.check_smoke_caps(sub, cfg)
+        gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=1.05)
     assert exc.value.code == "smoke_too_expensive"
+
+
+def test_a_preflight_check_with_no_verdict_is_not_a_pass(workspace, cfg):
+    """`ok is False` let every *unknown* state through: `{}`, `{"ok": null}`,
+    a bare string. The gate is the part that does not trust its inputs."""
+    sub = make_submission(workspace)
+    for broken in ({}, {"ok": None}, "passed"):
+        jsonl.write_json(
+            paths.preflight_record(sub.hash()),
+            {
+                "submission_hash": sub.hash(),
+                "checks": {"tests": {"ok": True}, "dry_run": broken, "smoke": {"ok": True}},
+            },
+        )
+        with pytest.raises(GateRefusal) as exc:
+            gates.check_submit(sub, make_expectation(), cfg)
+        assert exc.value.exit_code == EXIT_PREFLIGHT
+        assert "dry_run" in exc.value.message

@@ -107,12 +107,19 @@ def stub_resolver(monkeypatch):
     The draft emits `[CITE:<paper>]` for each basis entry, and `check` refuses
     while any placeholder survives -- so a test that wants to exercise a *later*
     rule has to run `cite` first, exactly as a real pipeline does.
+
+    The document is really put in the index, and the entry really points at it:
+    `check_citations` resolves the id now rather than trusting the `gradsource`
+    label, so a stub that skipped that step would be testing a citation the
+    pipeline could not actually produce.
     """
+    doc_id = corpus_document("arxiv:2001.08361")
     monkeypatch.setattr(
         report, "_resolve_citation",
         lambda keyword, context, use_s2: {
             "key": "basis2026", "type": "article", "title": "Scaling Laws",
             "author": "Kaplan", "year": "2020", "gradsource": "corpus",
+            "note": doc_id,
         },
     )
 
@@ -247,18 +254,81 @@ def test_a_bib_entry_with_no_verified_provenance_fails(workspace):
     assert any("verified provenance" in f["problem"] for f in findings)
 
 
+def corpus_document(doc_id: str = "arxiv:2001.08361") -> str:
+    """Put one real document in the local index, so a citation can resolve to it."""
+    from core import corpus
+
+    con = corpus.connect()
+    try:
+        corpus.upsert_document(
+            con,
+            {
+                "id": doc_id,
+                "title": "Scaling Laws",
+                "source": "arxiv",
+                "path": "",
+                "ingested_at": "2026-01-01T00:00:00+00:00",
+                "meta": {},
+            },
+        )
+        con.commit()
+    finally:
+        con.close()
+    return doc_id
+
+
+def corpus_entry(key: str = "real2026", doc_id: str = "arxiv:2001.08361") -> dict:
+    return {"type": "article", "key": key, "gradsource": "corpus", "note": doc_id}
+
+
+def s2_entry(key: str = "real2026") -> dict:
+    return {
+        "type": "article",
+        "key": key,
+        "gradsource": "s2",
+        "note": "S2:0123456789abcdef",
+        "gradmatch": 0.42,
+        "gradtitlematch": 0.31,
+    }
+
+
 def test_a_corpus_backed_entry_passes(workspace):
-    bib = {"real2026": {"type": "article", "key": "real2026", "gradsource": "corpus"}}
-    assert report_lib.check_citations(r"\cite{real2026}", bib) == []
+    doc_id = corpus_document()
+    assert report_lib.check_citations(r"\cite{real2026}", {"real2026": corpus_entry(doc_id=doc_id)}) == []
 
 
 def test_an_s2_verified_entry_passes(workspace):
-    bib = {"real2026": {"type": "article", "key": "real2026", "gradsource": "s2"}}
-    assert report_lib.check_citations(r"\cite{real2026}", bib) == []
+    assert report_lib.check_citations(r"\cite{real2026}", {"real2026": s2_entry()}) == []
+
+
+def test_a_corpus_label_on_a_document_that_does_not_exist_fails(workspace):
+    """The provenance rule used to be satisfied by the *string* `corpus`.
+
+    One line of BibTeX -- `gradsource = {corpus},` -- passed a check whose whole
+    purpose is to make a hallucinated citation impossible, so the id is resolved
+    against the index now rather than the label being taken at its word.
+    """
+    corpus_document()
+    bib = {"fake2026": corpus_entry(key="fake2026", doc_id="arxiv:9999.99999")}
+    findings = report_lib.check_citations(r"\cite{fake2026}", bib)
+    assert any("not in the local index" in f["problem"] for f in findings)
+
+
+def test_an_s2_label_without_overlap_evidence_fails(workspace):
+    bare = {"type": "article", "key": "fake2026", "gradsource": "s2", "note": "S2:abc"}
+    findings = report_lib.check_citations(r"\cite{fake2026}", {"fake2026": bare})
+    assert any("overlap evidence" in f["problem"] for f in findings)
+
+
+def test_an_s2_note_that_is_not_a_paper_id_fails(workspace):
+    entry = {**s2_entry(key="fake2026"), "note": "trust me"}
+    findings = report_lib.check_citations(r"\cite{fake2026}", {"fake2026": entry})
+    assert any("S2:<paper_id>" in f["problem"] for f in findings)
 
 
 def test_multi_key_cites_are_all_checked(workspace):
-    bib = {"a": {"type": "article", "key": "a", "gradsource": "corpus"}}
+    doc_id = corpus_document()
+    bib = {"a": corpus_entry(key="a", doc_id=doc_id)}
     findings = report_lib.check_citations(r"\cite{a,b}", bib)
     assert [f["key"] for f in findings] == ["b"]
 
@@ -269,12 +339,14 @@ def test_citep_and_citet_are_recognised(workspace):
 
 
 def test_the_generated_bib_carries_provenance(workspace):
+    doc_id = corpus_document()
     text = report._render_bib(
         {"k": {"type": "article", "key": "k", "title": "T", "author": "A",
-               "year": "2026", "gradsource": "corpus"}}
+               "year": "2026", "gradsource": "corpus", "note": doc_id}}
     )
     parsed = report_lib.parse_bib(text)
     assert parsed["k"]["gradsource"] == "corpus"
+    assert parsed["k"]["note"] == doc_id
     assert report_lib.check_citations(r"\cite{k}", parsed) == []
 
 
