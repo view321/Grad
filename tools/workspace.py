@@ -124,13 +124,29 @@ def cmd_move(args: argparse.Namespace) -> dict[str, Any]:
             "the destination is the folder the research is already in",
             fix="choose a folder outside the installation, e.g. ~/Grad",
         )
-    if (target / "ledger" / "runs.jsonl").exists():
+    # A destination *inside* the source is the one that does real damage rather
+    # than merely refusing: copying `notebooks/` into `notebooks/new/notebooks/`
+    # descends into the copy it is making and fills the disk. Checked on the
+    # resolved paths, because `validate` has already resolved both and a
+    # relative `./sub` reaches here as an absolute path.
+    if source in target.parents:
         raise UsageError(
-            f"{target} already holds a ledger",
-            fix="choose an empty folder; two ledgers cannot be merged by copying",
+            f"{target} is inside {source}",
+            fix="choose a folder outside the workspace; copying a folder into itself does not end",
         )
 
     planned = _plan_copy(source, target)
+    # Refuse to merge, rather than refusing only when a ledger is in the way.
+    # `_copy_entry` passes `dirs_exist_ok=True` -- it has to, since it copies
+    # into a folder it may have just created -- so an existing `notebooks/` at
+    # the destination would be silently interleaved with this one, and the
+    # result would be a folder whose history is neither workspace's.
+    occupied = sorted(entry["name"] for entry in planned if (target / entry["name"]).exists())
+    if occupied:
+        raise UsageError(
+            f"{target} already has: {', '.join(occupied)}",
+            fix="choose an empty folder; two workspaces cannot be merged by copying",
+        )
     total = sum(entry["files"] for entry in planned)
     if args.dry_run:
         return {
@@ -141,37 +157,59 @@ def cmd_move(args: argparse.Namespace) -> dict[str, Any]:
             "message": f"would copy {total} file(s) in {len(planned)} entr(ies) to {target}",
         }
 
-    copied = [entry for entry in planned if _copy_entry(source, target, entry["name"])]
-    verified, missing = _verify(source, target, [entry["name"] for entry in copied])
+    for entry in planned:
+        entry["copied"] = _copy_entry(source, target, entry["name"])
+
+    # Verified against everything that was *planned*, not against what `copy`
+    # claimed to do. A directory whose copy raised is exactly the case that
+    # matters, and checking only the successful ones would drop its files out of
+    # `missing` entirely -- reporting a complete move whose largest entry never
+    # arrived.
+    verified, missing = _verify(source, target, [entry["name"] for entry in planned])
 
     removed: list[str] = []
+    if missing and args.remove_originals:
+        raise UsageError(
+            f"{len(missing)} file(s) did not arrive; nothing was deleted",
+            fix="re-run without --remove-originals and compare the two folders by hand",
+        )
     if args.remove_originals:
-        if missing:
-            raise UsageError(
-                f"{len(missing)} file(s) did not arrive; nothing was deleted",
-                fix="re-run without --remove-originals and compare the two folders by hand",
-            )
-        removed = _remove(source, [entry["name"] for entry in copied])
+        removed = _remove(source, [entry["name"] for entry in planned])
 
+    # And the pointer moves only for a copy that is whole. Switching to a
+    # workspace that is missing files would leave the app reading a partial
+    # ledger while the complete one sits in the folder it just left -- with
+    # nothing on screen to say which is which.
     moved_pointer = None
-    if not args.keep_pointer:
+    if not args.keep_pointer and not missing:
         moved_pointer = str(workspace_mod.select(target))
         paths.ensure_workspace()
 
     return {
         "from": str(source),
         "to": str(target),
-        "entries": copied,
+        "entries": planned,
         "files_copied": verified,
         "missing": missing[:20],
         "removed": removed,
         "workspace": moved_pointer,
-        "message": _move_message(target, verified, removed, args),
+        "message": _move_message(target, verified, removed, missing, args),
     }
 
 
-def _move_message(target: Path, verified: int, removed: list[str], args: argparse.Namespace) -> str:
+def _move_message(
+    target: Path,
+    verified: int,
+    removed: list[str],
+    missing: list[str],
+    args: argparse.Namespace,
+) -> str:
     head = f"copied {verified} file(s) to {target}"
+    if missing:
+        return (
+            f"{head}, but {len(missing)} did not arrive — the workspace was NOT switched and "
+            f"nothing was removed. First missing: {missing[0]}"
+        )
     if removed:
         return f"{head}; originals removed"
     if args.remove_originals:

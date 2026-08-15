@@ -76,6 +76,14 @@ def _m2_record_installed_extras() -> list[str]:
         return []
     extras = update.detect_extras()
     update.write_install_record(extras=extras, detected=True)
+    if not path.exists():
+        # `write_install_record` swallows OSError, which is right for a caller
+        # that only wants the record kept up to date. Here it is the entire
+        # migration, and recording a step that did not happen is the one thing
+        # this module must not do: the number goes up, nothing ever revisits it,
+        # and `grad update` reinstalls with guessed extras forever. Raising
+        # leaves it pending -- see `run_pending`.
+        raise OSError(f"could not write {path}")
     return [f"install.json (extras: {','.join(extras) or 'none detected'})"]
 
 

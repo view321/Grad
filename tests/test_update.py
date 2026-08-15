@@ -26,6 +26,17 @@ pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not 
 # ---------------------------------------------------------------------------
 # a repository to update
 # ---------------------------------------------------------------------------
+def _outside(tmp_path: Path, name: str) -> Path:
+    """A folder that is not inside the workspace.
+
+    `tests/conftest.py` points `GRAD_ROOT` at `tmp_path` itself, so `tmp_path /
+    "x"` is *inside* the workspace -- which `tools.workspace move` refuses, and
+    rightly: copying a folder into a folder underneath it does not terminate.
+    A sibling, the same shape as the app directory that fixture creates.
+    """
+    return tmp_path.parent / f"{tmp_path.name}-{name}"
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args], cwd=repo, capture_output=True, text=True, check=True
@@ -320,6 +331,66 @@ def test_apply_refuses_over_a_blocker(repo):
     assert version.identity(reload=True)["tag"] == "v0.1.0"
 
 
+def test_a_failed_reinstall_leaves_the_update_resumable(repo, monkeypatch):
+    """The recovery this design exists for. The git move is atomic and the pip
+    step is not, so a failure between them advances the commit -- after which
+    `available` is False and a naive updater says "up to date" forever, with new
+    code running against old dependencies."""
+    from core.errors import GradError
+
+    _git(repo, "checkout", "--quiet", "v0.2.0")
+    _commit(repo, "deps", {"pyproject.toml": '[project]\nversion = "0.3.0"\n'})
+    _git(repo, "tag", "v0.3.0")
+    _git(repo, "checkout", "--quiet", "main")
+    monkeypatch.setattr(update, "instance_running", lambda: False)
+
+    def _explode(chosen):
+        raise GradError("update_reinstall_failed", "pip fell over", exit_code=8)
+
+    monkeypatch.setattr(update, "_reinstall", _explode)
+    with pytest.raises(GradError):
+        update.apply(do_fetch=False)
+
+    # The checkout moved, so nothing derived from the commit can tell that work
+    # is outstanding. The marker can.
+    assert version.identity(reload=True)["tag"] == "v0.3.0"
+    plan = update.plan(do_fetch=False)
+    assert plan["available"] is False
+    assert plan["incomplete"]["tag"] == "v0.3.0"
+    assert "incomplete_update" in [w["code"] for w in plan["warnings"]]
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(update, "_reinstall", lambda chosen: calls.append(chosen))
+    result = update.apply(do_fetch=False)
+    assert result["applied"] is True
+    assert result["resumed"] is True
+    assert result["reinstalled"] is True
+    assert calls, "the reinstall the first run never completed must run"
+    # And once it has, the marker is gone and the next call is a no-op.
+    assert update.incomplete_update() is None
+    assert update.apply(do_fetch=False)["applied"] is False
+
+
+def test_a_successful_update_leaves_no_marker(repo, monkeypatch):
+    """The marker must not survive the common path, or every subsequent check
+    would propose a reinstall that is not needed."""
+    monkeypatch.setattr(update, "_reinstall", lambda chosen: None)
+    update.apply(do_fetch=False)
+    assert update.incomplete_update() is None
+    assert update.plan(do_fetch=False)["incomplete"] is None
+
+
+def test_a_failed_git_move_leaves_no_marker(repo, monkeypatch):
+    """Nothing moved, so nothing is half-done: a resume pointing at an update
+    that never started would demand a reinstall for no reason."""
+    from core.errors import GradError
+
+    monkeypatch.setattr(version, "git_result", lambda *a, **k: None)
+    with pytest.raises(GradError):
+        update.apply(do_fetch=False)
+    assert update.incomplete_update() is None
+
+
 def test_apply_is_idempotent(repo, monkeypatch):
     monkeypatch.setattr(update, "_reinstall", lambda chosen: None)
     update.apply(do_fetch=False)
@@ -415,6 +486,19 @@ def test_a_failing_migration_stays_pending(monkeypatch):
     assert [number for number, _, _ in migrate.pending()] == [2]
 
 
+def test_a_migration_that_could_not_write_is_not_recorded(monkeypatch):
+    """`write_install_record` swallows OSError, which is right for a caller that
+    only wants the record kept current and wrong when the write *is* the
+    migration: the number would go up and nothing would ever revisit it."""
+    monkeypatch.setattr(update, "detect_extras", lambda: ["ui"])
+    monkeypatch.setattr(update, "write_install_record", lambda **kwargs: None)
+    update.install_record_path().unlink(missing_ok=True)
+
+    assert migrate.run_pending() == []
+    assert migrate.current() == 1
+    assert [number for number, _, _ in migrate.pending()] == [2]
+
+
 def test_migration_records_the_extras_of_an_older_install(monkeypatch):
     monkeypatch.setattr(update, "detect_extras", lambda: ["ui", "notebook"])
     update.install_record_path().unlink(missing_ok=True)
@@ -487,7 +571,7 @@ def test_workspace_move_copies_and_keeps_the_originals(tmp_path):
     (source / "data" / "lab").mkdir(parents=True, exist_ok=True)
     (source / "data" / "lab" / "lab.json").write_text('{"token": "secret"}', encoding="utf-8")
 
-    target = tmp_path / "elsewhere"
+    target = _outside(tmp_path, "elsewhere")
     assert workspace_cli.run(["move", str(target), "--keep-pointer", "--json"]) == 0
 
     assert (target / "ledger" / "runs.jsonl").read_text(encoding="utf-8") == '{"id": "run-1"}\n'
@@ -503,11 +587,85 @@ def test_workspace_move_refuses_a_folder_that_already_has_a_ledger(tmp_path):
 
     (paths.root() / "ledger").mkdir(parents=True, exist_ok=True)
     (paths.root() / "ledger" / "runs.jsonl").write_text("{}\n", encoding="utf-8")
-    target = tmp_path / "occupied"
+    target = _outside(tmp_path, "occupied")
     (target / "ledger").mkdir(parents=True)
     (target / "ledger" / "runs.jsonl").write_text("{}\n", encoding="utf-8")
 
     assert workspace_cli.run(["move", str(target), "--json"]) != 0
+
+
+def test_workspace_move_refuses_to_copy_into_itself(tmp_path):
+    """The failure that does damage rather than refusing: copying `notebooks/`
+    into a folder underneath it descends into the copy it is making."""
+    from core import paths
+    from tools.workspace import cli as workspace_cli
+
+    (paths.root() / "notebooks").mkdir(parents=True, exist_ok=True)
+    (paths.root() / "notebooks" / "a.ipynb").write_text("{}", encoding="utf-8")
+
+    inside = paths.root() / "notebooks" / "new-home"
+    assert workspace_cli.run(["move", str(inside), "--json"]) != 0
+    assert not (inside / "notebooks").exists()
+
+
+def test_workspace_move_refuses_to_merge_into_an_occupied_folder(tmp_path):
+    """`copytree(dirs_exist_ok=True)` would interleave the two silently, and the
+    result would be a folder whose history is neither workspace's."""
+    from core import paths
+    from tools.workspace import cli as workspace_cli
+
+    (paths.root() / "notebooks").mkdir(parents=True, exist_ok=True)
+    (paths.root() / "notebooks" / "mine.ipynb").write_text("{}", encoding="utf-8")
+    target = _outside(tmp_path, "someone-elses")
+    (target / "notebooks").mkdir(parents=True)
+    (target / "notebooks" / "theirs.ipynb").write_text("{}", encoding="utf-8")
+
+    assert workspace_cli.run(["move", str(target), "--json"]) != 0
+    assert not (target / "notebooks" / "mine.ipynb").exists()
+
+
+def test_workspace_move_keeps_the_pointer_when_a_file_did_not_arrive(tmp_path, monkeypatch):
+    """A partial copy must not become the workspace: the app would read a
+    partial ledger while the complete one sat in the folder it just left."""
+    import tools.workspace as workspace_tool
+    from core import paths
+    from tools.workspace import cli as workspace_cli
+
+    source = paths.root()
+    (source / "ledger").mkdir(parents=True, exist_ok=True)
+    (source / "ledger" / "runs.jsonl").write_text('{"id": "run-1"}\n', encoding="utf-8")
+    (source / "notebooks").mkdir(parents=True, exist_ok=True)
+    (source / "notebooks" / "a.ipynb").write_text("{}", encoding="utf-8")
+
+    # The notebooks directory fails to copy, the way a locked file or a full
+    # disk would make it fail.
+    real = workspace_tool._copy_entry
+    monkeypatch.setattr(
+        workspace_tool,
+        "_copy_entry",
+        lambda src, dst, name: False if name == "notebooks" else real(src, dst, name),
+    )
+
+    target = _outside(tmp_path, "partial")
+    assert workspace_cli.run(["move", str(target), "--json"]) == 0
+    # It arrived nowhere, it is reported, and neither the pointer nor the
+    # originals moved.
+    assert paths.root() == source
+    assert (source / "notebooks" / "a.ipynb").exists()
+
+
+def test_workspace_move_will_not_delete_originals_after_a_partial_copy(tmp_path, monkeypatch):
+    import tools.workspace as workspace_tool
+    from core import paths
+    from tools.workspace import cli as workspace_cli
+
+    source = paths.root()
+    (source / "notebooks").mkdir(parents=True, exist_ok=True)
+    (source / "notebooks" / "a.ipynb").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_tool, "_copy_entry", lambda src, dst, name: False)
+
+    assert workspace_cli.run(["move", str(_outside(tmp_path, "partial2")), "--remove-originals", "--json"]) != 0
+    assert (source / "notebooks" / "a.ipynb").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +725,70 @@ def test_report_accepts_one_version():
     _run_with_version("run-f", stamp)
     _run_with_version("run-g", dict(stamp))
     assert report.check_code_versions({"run-f", "run-g"}) == []
+
+
+def test_the_editor_runs_the_same_fourth_rule_as_the_gate(monkeypatch):
+    """A badge saying "no findings" over a report `report check` will refuse is
+    worse than no badge: the editor is the surface someone watches while
+    writing."""
+    from core import report as report_mod
+    from ui import models
+
+    seen: list[set] = []
+    monkeypatch.setattr(
+        report_mod,
+        "check_code_versions",
+        lambda run_ids: seen.append(run_ids)
+        or [{"rule": "version", "problem": "two versions", "fix": "re-run"}],
+    )
+    monkeypatch.setattr(models, "SECTION_RE", models.SECTION_RE)
+
+    from core import paths
+
+    project = "proj-1"
+    tex_dir = paths.root() / "reports" / project
+    tex_dir.mkdir(parents=True, exist_ok=True)
+    (tex_dir / "main.tex").write_text("\\section{One}\n", encoding="utf-8")
+
+    model = models.editor_model(project)
+    assert seen, "the editor must ask the ledger-backed rule too"
+    assert any(f.get("rule") == "version" for f in model["findings"])
+
+
+def test_the_stamp_cannot_be_overridden_by_a_backend(monkeypatch):
+    """`extra` is backend-specific fields from a submitter. The stamp is what
+    `report check` rests on, so it is not a default a caller may replace."""
+    from core import submit
+
+    monkeypatch.setattr(
+        version, "stamp", lambda: {"version": "1.2.3", "tag": None, "commit": "real", "dirty": False}
+    )
+
+    class _Sub:
+        spec_path = Path("specs/x/submission.json")
+        config = {"task": "t"}
+        image = None
+        dataset = None
+        metrics_file = None
+
+        def hash(self) -> str:
+            return "h" * 12
+
+        def estimated_cost_usd(self) -> float:
+            return 1.0
+
+        def estimated_duration_s(self) -> float:
+            return 60.0
+
+    _, record = submit.record_submission(
+        _Sub(),
+        expectation_id=None,
+        platform="test",
+        target={},
+        command=["true"],
+        extra={"code_version": {"commit": "forged"}},
+    )
+    assert record["code_version"]["commit"] == "real"
 
 
 def test_submitted_runs_carry_the_stamp(monkeypatch):

@@ -116,6 +116,57 @@ def write_install_record(*, extras: list[str] | tuple[str, ...], **fields: Any) 
         log.debug("could not write %s", install_record_path())
 
 
+def begin_update(target: dict[str, Any], *, needs_reinstall: bool, chosen: list[str]) -> None:
+    """Record an update that is about to start, before anything moves.
+
+    An update is three steps -- move the checkout, reinstall, migrate -- and
+    only the first is atomic. Without this marker a pip failure in step 2 is
+    unrecoverable *by the updater*: the commit has already advanced, so the next
+    `plan()` computes `available = head != target` as False, `apply` answers
+    "already up to date", and the environment is left running new code against
+    old dependencies with no path back. The migrations, which run after the
+    reinstall, are skipped for the same reason and never revisited.
+
+    Version strings cannot substitute for this. With an editable install the
+    metadata is written at `pip install` time, so after any successful update
+    that *correctly* skipped the reinstall it is permanently behind
+    `pyproject.toml` -- a mismatch that would then demand a reinstall forever.
+    What is needed is not "do the versions agree" but "did the step I started
+    finish", and that is a fact only the updater can record.
+    """
+    write_install_record(
+        extras=chosen,
+        incomplete={
+            "tag": target.get("tag"),
+            "commit": target.get("commit"),
+            "needs_reinstall": bool(needs_reinstall),
+            "extras": list(chosen),
+            "started_at": now_iso(),
+        },
+    )
+
+
+def finish_update() -> None:
+    """Clear the marker. Called only once every step has actually run."""
+    record = read_install_record()
+    record.pop("incomplete", None)
+    appdata.ensure()
+    try:
+        install_record_path().write_text(
+            json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        # The update completed; only the bookkeeping failed. The cost is one
+        # unnecessary reinstall on the next `grad update`, which is idempotent.
+        log.debug("could not clear the incomplete-update marker")
+
+
+def incomplete_update() -> dict[str, Any] | None:
+    """The update that started and did not finish, if there is one."""
+    value = read_install_record().get("incomplete")
+    return value if isinstance(value, dict) else None
+
+
 def detect_extras() -> list[str]:
     """Which optional dependency sets are actually present."""
     found: list[str] = []
@@ -229,7 +280,19 @@ def plan(*, do_fetch: bool = True, to: str | None = None) -> dict[str, Any]:
         "blockers": [],
         "warnings": [],
         "fetch_error": None,
+        "incomplete": incomplete_update(),
     }
+    if result["incomplete"]:
+        result["warnings"].append(
+            {
+                "code": "incomplete_update",
+                "message": (
+                    f"an update to {result['incomplete'].get('tag')} moved the checkout but did "
+                    "not finish installing its dependencies"
+                ),
+                "fix": "grad update   # picks up where it stopped",
+            }
+        )
 
     if not version.is_checkout():
         result["blockers"].append(
@@ -356,23 +419,17 @@ def plan(*, do_fetch: bool = True, to: str | None = None) -> dict[str, Any]:
 def instance_running() -> bool:
     """Whether a Grad is up, asked the only way that can be trusted.
 
-    The lock, not the state file, for the reason `core/instance.py` gives: a pid
-    file left by a crash says "running" forever. Taking the lock and dropping it
-    immediately is safe -- if it can be taken, nothing else holds it -- and the
-    window in which a launch could lose the race to us is microseconds wide and
-    fails loudly rather than quietly.
+    `core/instance.py:is_running` owns the mechanism, including why the probe
+    must not go through `release()`. The window in which a launch could lose the
+    race to the probe is microseconds wide and fails loudly rather than quietly.
     """
     from core import instance  # noqa: PLC0415
 
     try:
-        instance.acquire()
-    except instance.AlreadyRunning:
-        return True
+        return instance.is_running()
     except Exception:  # noqa: BLE001 - a guard that cannot run must not block an update
         log.debug("could not probe the instance lock", exc_info=True)
         return False
-    instance.release()
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -402,15 +459,29 @@ def apply(
             fix=first.get("fix"),
             detail={"blockers": blockers},
         )
-    if not proposal["available"]:
+
+    # A previous run that moved the checkout and then failed leaves work behind
+    # that `available` cannot see -- the commit is already the target. Resuming
+    # is the whole reason the marker exists; see `begin_update`.
+    resuming = proposal["incomplete"]
+    if not proposal["available"] and not resuming:
         return {
             **proposal,
             "applied": False,
             "message": f"already up to date ({proposal['label']})",
         }
 
-    target = proposal["target"]
-    needs_reinstall = bool(proposal["needs_reinstall"])
+    # The marker is the fallback, not just a flag: `plan` reports no target at
+    # all when the remote has no release tags, and a resume must still know
+    # which release it was finishing.
+    target = proposal["target"] or {
+        "tag": (resuming or {}).get("tag"),
+        "commit": (resuming or {}).get("commit"),
+        "direction": "forward",
+    }
+    needs_reinstall = bool(proposal["needs_reinstall"]) or bool(
+        resuming and resuming.get("needs_reinstall")
+    )
     if needs_reinstall and not force and instance_running():
         raise GradError(
             "update_running",
@@ -421,30 +492,46 @@ def apply(
         )
 
     before = proposal["current"].get("commit")
+    chosen = [x.strip() for x in (with_extras or ",".join(extras())).split(",") if x.strip()]
     steps: list[str] = []
 
+    # Written before anything moves, and cleared only once every step below has
+    # run. A failure between the two leaves a marker the next `apply` resumes
+    # from -- see `begin_update`.
+    begin_update(target, needs_reinstall=needs_reinstall, chosen=chosen)
+
     # -- move the tree ------------------------------------------------------
-    if target["direction"] == "forward":
-        result = version.git_result("merge", "--ff-only", target["tag"], timeout=60.0)
+    if not proposal["available"]:
+        # Resuming: the checkout is already where it was asked to go, and
+        # re-running the move would either be a no-op or fail on a tree that has
+        # since been touched. Neither is worth risking to repeat a step that
+        # demonstrably succeeded.
+        steps.append(f"checkout was already at {target.get('tag')}")
     else:
-        # A pin or a rollback. Detached on purpose: the checkout is *at* that
-        # release rather than on a branch that happens to contain it, which is
-        # the honest state and the one `git status` explains.
-        result = version.git_result(
-            "-c", "advice.detachedHead=false", "checkout", "--detach", target["tag"], timeout=60.0
-        )
-    if result is None or result.returncode != 0:
-        detail = (result.stderr if result else "") or "git could not be run"
-        raise GradError(
-            "update_failed",
-            f"could not move the checkout to {target['tag']}: {detail.strip()[:300]}",
-            exit_code=EXIT_UPSTREAM,
-            fix="run git in the installation folder to see what it objects to",
-        )
-    steps.append(f"moved to {target['tag']}")
+        if target["direction"] == "forward":
+            result = version.git_result("merge", "--ff-only", target["tag"], timeout=60.0)
+        else:
+            # A pin or a rollback. Detached on purpose: the checkout is *at* that
+            # release rather than on a branch that happens to contain it, which is
+            # the honest state and the one `git status` explains.
+            result = version.git_result(
+                "-c", "advice.detachedHead=false", "checkout", "--detach", target["tag"],
+                timeout=60.0,
+            )
+        if result is None or result.returncode != 0:
+            detail = (result.stderr if result else "") or "git could not be run"
+            # Nothing moved, so nothing is half-done: drop the marker rather
+            # than leave a resume pointing at an update that never started.
+            finish_update()
+            raise GradError(
+                "update_failed",
+                f"could not move the checkout to {target['tag']}: {detail.strip()[:300]}",
+                exit_code=EXIT_UPSTREAM,
+                fix="run git in the installation folder to see what it objects to",
+            )
+        steps.append(f"moved to {target['tag']}")
 
     # -- the environment, only if it has to change --------------------------
-    chosen = [x.strip() for x in (with_extras or ",".join(extras())).split(",") if x.strip()]
     if needs_reinstall:
         _reinstall(chosen)
         steps.append(f"reinstalled with extras: {','.join(chosen)}")
@@ -456,6 +543,7 @@ def apply(
     migrated = migrate.run_pending()
     if migrated:
         steps.append(f"migrated: {', '.join(migrated)}")
+    finish_update()
 
     after = version.identity(reload=True)
     summary = {
@@ -468,10 +556,11 @@ def apply(
         "steps": steps,
         "current": after,
         "label": version.label(after),
+        "resumed": bool(resuming),
         "message": (
-            f"updated to {target['tag']} — restart Grad to load it"
-            if instance_running()
-            else f"updated to {target['tag']}"
+            ("finished the interrupted update to " if resuming else "updated to ")
+            + str(target.get("tag"))
+            + (" — restart Grad to load it" if instance_running() else "")
         ),
     }
     write_cache(plan(do_fetch=False))

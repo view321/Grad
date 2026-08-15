@@ -1778,6 +1778,12 @@ def editor_model(project_id: str | None = None) -> dict[str, Any]:
         lambda: report_mod.check_claims(tex, claims),
         lambda: report_mod.check_citations(tex, bib or {}),
         lambda: report_mod.check_latex(tex),
+        # The same fourth rule `tools/report.py:check` runs. The editor and the
+        # gate have to agree about whether a report is clean: a badge saying
+        # "no findings" over a report that `report check` will refuse is worse
+        # than no badge, because it is the surface someone actually watches
+        # while writing.
+        lambda: report_mod.check_code_versions(report_mod.cited_run_ids(tex, claims)),
     ):
         result, error = _safe(check, [])
         findings.extend(result or [])

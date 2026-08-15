@@ -95,13 +95,6 @@ def record_submission(
         # fold has one spelling for "not attributed" and existing ledgers keep
         # loading unchanged.
         "project": project or budget.UNASSIGNED,
-        # Which Grad submitted this. The README's claim is that every number in
-        # a report traces to a run record; that is only complete if the record
-        # says which code produced it, because a run from before an update and
-        # one from after are two different experiments and nothing else in here
-        # can tell them apart. `report check` refuses a report that averages
-        # across a version -- see `core/report.py:check_code_versions`.
-        "code_version": version.stamp(),
         "platform": platform,
         "target": target,
         "submission_hash": sub.hash(),
@@ -115,6 +108,17 @@ def record_submission(
         "metrics_file": sub.metrics_file,
         "config": sub.config,
         **(extra or {}),
+        # After the spread, and that ordering is the point. Which Grad submitted
+        # this is what `core/report.py:check_code_versions` rests on, so it is
+        # not a default a backend may override: a submitter that happened to put
+        # `code_version` in `extra` would silently decide what the ledger says
+        # about the code that produced a number.
+        #
+        # The README's claim is that every number in a report traces to a run
+        # record; that is only complete if the record says which code produced
+        # it, because a run from before an update and one from after are two
+        # different experiments and nothing else in here can tell them apart.
+        "code_version": version.stamp(),
     }
     ls.append_run_event(
         record,
@@ -156,9 +160,6 @@ def record_smoke_run(
             "smoke": True,
             "submitted_at": ls.now_iso(),
             "project": project or budget.UNASSIGNED,
-            # Smoke skips the gates but not the ledger, and not this either: a
-            # record without it would be the one hole in "which code ran this".
-            "code_version": version.stamp(),
             "platform": platform,
             "target": target,
             "submission_hash": sub.hash(),
@@ -170,6 +171,10 @@ def record_smoke_run(
             "caps": caps,
             "image": sub.image,
             **(extra or {}),
+            # After the spread, for the reason `record_submission` gives. Smoke
+            # skips the gates but not the ledger, and not this either: a record
+            # without it would be the one hole in "which code ran this".
+            "code_version": version.stamp(),
         }
     )
     return run_id
