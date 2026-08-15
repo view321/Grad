@@ -106,14 +106,35 @@ def read_install_record() -> dict[str, Any]:
 
 def write_install_record(*, extras: list[str] | tuple[str, ...], **fields: Any) -> None:
     """Record what this installation was installed with. Never raises."""
+    _write_record({**read_install_record(), "extras": list(extras), **fields})
+
+
+def _write_record(payload: dict[str, Any]) -> None:
+    """The whole record, verbatim. Never raises.
+
+    Separate from `write_install_record` because two callers need to *remove*
+    keys rather than merge them, and a merging writer cannot: `finish_update`
+    drops the marker, and `restore_install_record` puts an earlier record back
+    exactly as it was.
+    """
     appdata.ensure()
-    payload = {**read_install_record(), "extras": list(extras), **fields}
     try:
         install_record_path().write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     except OSError:
         log.debug("could not write %s", install_record_path())
+
+
+def restore_install_record(record: dict[str, Any]) -> None:
+    """Put back the record as it was before this run touched it.
+
+    For a run that overwrote an earlier update's marker and then failed before
+    changing anything. Verbatim rather than merged, and the whole record rather
+    than just `incomplete`, because `begin_update` also rewrites `extras` -- a
+    `--extras` passed to the run that failed must not outlive it.
+    """
+    _write_record(record)
 
 
 def begin_update(target: dict[str, Any], *, needs_reinstall: bool, chosen: list[str]) -> None:
@@ -147,18 +168,15 @@ def begin_update(target: dict[str, Any], *, needs_reinstall: bool, chosen: list[
 
 
 def finish_update() -> None:
-    """Clear the marker. Called only once every step has actually run."""
+    """Clear the marker. Called only once every step has actually run.
+
+    A write that fails here is not worth reporting: the update completed, and
+    the cost is one unnecessary reinstall on the next `grad update`, which is
+    idempotent.
+    """
     record = read_install_record()
     record.pop("incomplete", None)
-    appdata.ensure()
-    try:
-        install_record_path().write_text(
-            json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError:
-        # The update completed; only the bookkeeping failed. The cost is one
-        # unnecessary reinstall on the next `grad update`, which is idempotent.
-        log.debug("could not clear the incomplete-update marker")
+    _write_record(record)
 
 
 def incomplete_update() -> dict[str, Any] | None:
@@ -495,6 +513,14 @@ def apply(
     chosen = [x.strip() for x in (with_extras or ",".join(extras())).split(",") if x.strip()]
     steps: list[str] = []
 
+    # The record as it stands *before* this run touches it. `begin_update`
+    # overwrites the marker, so without this a run that started while an earlier
+    # update was still outstanding -- a new release having appeared in the
+    # meantime -- would destroy the older one's marker and then, on its own
+    # failure, clear what it had replaced. The outstanding reinstall would be
+    # forgotten by the one mechanism that knew about it.
+    prior_record = read_install_record()
+
     # Written before anything moves, and cleared only once every step below has
     # run. A failure between the two leaves a marker the next `apply` resumes
     # from -- see `begin_update`.
@@ -520,9 +546,11 @@ def apply(
             )
         if result is None or result.returncode != 0:
             detail = (result.stderr if result else "") or "git could not be run"
-            # Nothing moved, so nothing is half-done: drop the marker rather
-            # than leave a resume pointing at an update that never started.
-            finish_update()
+            # Nothing moved, so *this* run left nothing half-done -- but an
+            # earlier one may have, and `begin_update` has just overwritten its
+            # marker. Putting the record back is both cases at once: it clears
+            # a marker this run invented, and preserves one it inherited.
+            restore_install_record(prior_record)
             raise GradError(
                 "update_failed",
                 f"could not move the checkout to {target['tag']}: {detail.strip()[:300]}",

@@ -391,6 +391,40 @@ def test_a_failed_git_move_leaves_no_marker(repo, monkeypatch):
     assert update.incomplete_update() is None
 
 
+def test_a_failed_move_does_not_forget_an_earlier_interrupted_update(repo, monkeypatch):
+    """The marker this run overwrote is not this run's to discard.
+
+    A release appearing while an earlier update is still outstanding is exactly
+    when both are in play: `begin_update` replaces the old marker, and clearing
+    it on a failure would lose the reinstall nothing else knows about.
+    """
+    from core.errors import GradError
+
+    # An earlier update moved the checkout and never finished its reinstall.
+    _git(repo, "checkout", "--quiet", "v0.2.0")
+    _commit(repo, "deps", {"pyproject.toml": '[project]\nversion = "0.3.0"\n'})
+    _git(repo, "tag", "v0.3.0")
+    _git(repo, "checkout", "--quiet", "main")
+    monkeypatch.setattr(update, "instance_running", lambda: False)
+    monkeypatch.setattr(
+        update, "_reinstall", lambda chosen: (_ for _ in ()).throw(GradError("x", "pip fell over"))
+    )
+    with pytest.raises(GradError):
+        update.apply(do_fetch=False)
+    assert update.incomplete_update()["tag"] == "v0.3.0"
+
+    # A newer release lands, and this run cannot even move the tree.
+    _git(repo, "tag", "v0.4.0")
+    monkeypatch.setattr(version, "git_result", lambda *a, **k: None)
+    with pytest.raises(GradError):
+        update.apply(do_fetch=False)
+
+    outstanding = update.incomplete_update()
+    assert outstanding is not None, "the earlier update's marker must survive"
+    assert outstanding["tag"] == "v0.3.0"
+    assert outstanding["needs_reinstall"] is True
+
+
 def test_apply_is_idempotent(repo, monkeypatch):
     monkeypatch.setattr(update, "_reinstall", lambda chosen: None)
     update.apply(do_fetch=False)
