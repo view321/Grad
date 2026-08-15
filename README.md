@@ -100,26 +100,47 @@ the only thing that forced a shell open beside the app on a fresh machine. The
 value goes down a pipe rather than in an argument — an argv is visible to
 anything that can list processes.
 
-### Retrieval without an institutional email
+### Retrieval without an institutional email, and without waiting
 
-Tier 1 defaults to **Ai2's Asta** (`asta-tools.allen.ai`) rather than to the
-Semantic Scholar REST API. It is the same corpus and it exposes the same
-`snippet_search` the funnel is built around, but Semantic Scholar
-[no longer issues API keys to free-domain email addresses][s2-keys], which
-leaves a personal account on a shared anonymous pool that is rate limited often
-enough that "no results" and "no key" are hard to tell apart.
+Tier 1 defaults to **Papers with Code** (`paperswithcode.co/api/v1`) — the
+catalogue as revived by Hugging Face, not the `.com` site Meta shut down. It is
+anonymous and read-only: no account, no key, nothing to store. The endpoints are
+those of [`huggingface/pwc-cli`][pwc-cli], which is the reference client for
+this API.
 
-Asta is reached over streamable HTTP without adopting MCP as an architecture,
-which is what §5 already said about that endpoint. Its key is optional and
-raises limits rather than unlocking anything. Set `[retrieval] tier1` to `s2`
-or `both` to change it, or pass `--tier1` per search.
+The choice is about latency, and the numbers are measured rather than assumed:
 
-**The endpoint, the transport and the tool names are from Ai2's documentation;
-the shape of each tool's result is not verified against the live service.**
-`core/http.py:_rows` reads both plausible shapes and raises on anything else,
-because a search that quietly returns nothing reads as "the literature has
-nothing on this".
+| tier 1 | one search | key | text |
+| --- | --- | --- | --- |
+| `pwc` *(default)* | **1–2 s** | none | title only; abstracts fetched separately |
+| `asta` | ~121 s, and ~283 s to report a backend failure | optional | full-text snippets |
+| `s2` | fast when it answers | institutional addresses only | full-text snippets |
 
+Stage 0 turns one question into ~6 queries and each goes to two endpoints, so
+Asta's per-call latency is twenty minutes of discovery before anything is
+ranked — and every caller gives up first: the agent's own Bash tool backgrounds
+a command at 120 s, and a shell `timeout` kills it. Semantic Scholar
+[no longer issues API keys to free-domain email addresses][s2-keys], leaving a
+personal account on a shared anonymous pool that is rate limited often enough
+that "no results" and "no key" are hard to tell apart.
+
+**What the default costs.** Asta is the only one of the three with genuine
+full-text snippets, which is what §5 designed stage-3 triage around. Under `pwc`,
+triage reads the *abstract* instead — fetched from arXiv in one batched request
+for the whole candidate pool (`core/http.py:arxiv_abstracts`), because nearly
+every row is an arXiv paper and `id_list` takes a hundred ids at once. A
+candidate that ends up with no abstract is reranked on its title, and the trace
+says how many did. `pwc`'s expansion is also a *dense neighbour* rather than a
+citation edge, and `neighbours` reports it as one rather than claiming the
+citation graph §5 asks for.
+
+Set `[retrieval] tier1` to `asta`, `s2`, `both` (the two Semantic Scholar doors)
+or `all`, or pass `--tier1` per search. Two wall clocks bound a run either way:
+`request_deadline_s` caps one request, and `stage1_budget_s` caps the whole of
+stage 1 — when it is spent the funnel keeps what it retrieved and records how
+many queries it actually searched.
+
+[pwc-cli]: https://github.com/huggingface/pwc-cli
 [s2-keys]: https://www.semanticscholar.org/product/api
 
 ## Run
@@ -258,11 +279,38 @@ autouse fixture in `tests/conftest.py` replaces `core.http._httpx`, because a
 suite that reaches the network does not fail, it *hangs*.
 
 Implemented but not exercised against a live service: the HF Jobs backend, the
-SSH backend, Asta, Semantic Scholar, the OpenRouter reranker, Voyage embeddings,
-the two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are
-written against the documented interfaces and fail with actionable errors rather
-than tracebacks, but a real credential and a real run are what will find the
+SSH backend, Semantic Scholar, the OpenRouter reranker, Voyage embeddings, the
+two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are written
+against the documented interfaces and fail with actionable errors rather than
+tracebacks, but a real credential and a real run are what will find the
 mismatches.
+
+Tier-1 discovery is no longer in that list. A live run of the default funnel
+returns 118 candidates from two rankings in 3.1 seconds, fills 99 abstracts in
+one arXiv request, and hands 15 survivors to triage.
+
+Papers with Code and Asta are both exercised against the live services now, and
+what that found is worth recording, because none of it could have been reasoned
+out from the documentation:
+
+* **Asta's `search_papers_by_relevance` takes `keyword`** where `snippet_search`
+  takes `query`, so tier 1 lost that endpoint on every search — the server
+  answers in about a second with a validation error, which the slower endpoint's
+  latency hid.
+* **Asta answers `tools/call` with an event stream it holds open**, pinging every
+  15 seconds. `httpx`'s timeout is per socket read, so every ping reset it: a
+  buffered read waited for a close the server never promised, and discovery did
+  not fail, it never returned. The client now streams the response, stops at the
+  reply to its own request, and enforces a total deadline.
+* **Asta wraps its hits under `result`** (singular), a key `_rows` did not know —
+  so even with the argument fixed, every hit was discarded as an unrecognised
+  envelope. And its `limit` must be ≤ 100, which `--no-expand` exceeded by
+  dividing the candidate ceiling across one query instead of six.
+* **Papers with Code returns no abstract with a search row**, which is why
+  `arxiv_abstracts` exists.
+
+The *shapes* the remaining tools answer in are still read defensively, and an
+unrecognised one still raises rather than returning an empty list.
 
 **Two of [HANDOFF-2 §23](HANDOFF-2.md)'s open questions are now closed:**
 

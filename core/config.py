@@ -43,6 +43,13 @@ DEFAULTS: dict[str, Any] = {
     "retrieval": {
         "s2_base": "https://api.semanticscholar.org/graph/v1",
         "asta_base": "https://asta-tools.allen.ai/mcp/v1",
+        # Papers with Code, as revived by Hugging Face. The `.com` site Meta
+        # shut down is gone; this is the `.co` one, and its v1 API is anonymous,
+        # read-only and documented by `github.com/huggingface/pwc-cli`.
+        "pwc_base": "https://paperswithcode.co/api/v1",
+        # arXiv's Atom API, used for one thing: abstracts in bulk. See
+        # `arxiv_abstracts`.
+        "arxiv_base": "https://export.arxiv.org/api/query",
         "openrouter_base": "https://openrouter.ai/api/v1",
         "rerank_model": "voyageai/rerank-2.5",
         "embed_model": "voyage-4",
@@ -64,17 +71,44 @@ DEFAULTS: dict[str, Any] = {
         "triage_top": 15,
         "cache_ttl_s": 604800,
         "request_timeout_s": 60,
-        "min_request_interval_s": 1.1,  # unauthenticated S2 is ~1 req/s
-        # Which tier-1 client does discovery: "asta", "s2", or "both".
+        # The ceiling on ONE request end to end, as distinct from
+        # `request_timeout_s`, which httpx applies per socket read.
         #
-        # Asta by default because it is the one that *works*. Both reach the
-        # same Semantic Scholar corpus and both expose snippet search, but S2's
-        # own API stopped issuing keys to free-domain email addresses, leaving a
-        # personal account on the shared anonymous pool -- which is rate limited
+        # The distinction is the whole bug it exists to stop. Asta answers a
+        # `tools/call` with an event stream and holds it open while it works,
+        # sending `: ping` comments every 15s. Every ping resets the per-read
+        # timeout, so a 60s read timeout never fires no matter how long the
+        # server takes, and a buffered read of that stream waits for a close
+        # that may never come. A total deadline is the only thing that bounds
+        # it. 300s because a live `search_papers_by_relevance` measured 121s
+        # and a bound below the real latency is just an outage.
+        "request_deadline_s": 300,
+        # Wall clock for the whole of stage 1, as distinct from the per-request
+        # deadline above. Stage 0 turns one question into six queries and each
+        # goes to two endpoints, so a five-minute request deadline is a one-hour
+        # stage -- and the caller kills it long before the endpoints that work
+        # can contribute anything. When this is spent the funnel stops issuing
+        # tier-1 calls, keeps what it retrieved, and writes into the trace how
+        # many queries it actually searched.
+        "stage1_budget_s": 300,
+        "min_request_interval_s": 1.1,  # unauthenticated S2 is ~1 req/s
+        # Which tier-1 client does discovery: "pwc", "asta", "s2", "both"
+        # (the two Semantic Scholar doors) or "all".
+        #
+        # Papers with Code by default because it is the one that *answers*.
+        # Measured against the live services: pwc returns in 1-2s; Asta takes
+        # ~121s for a search and ~283s to report that its own backend refused a
+        # connection, and stage 0 multiplies that by six queries and two
+        # endpoints, so every caller gives up before discovery finishes. S2's
+        # own API stopped issuing keys to free-domain addresses, leaving a
+        # personal account on the shared anonymous pool, which is rate limited
         # often enough that "no results" and "no key" are hard to tell apart.
-        # Asta's key is optional. "both" is for comparing them, and it doubles
-        # the request count for candidates that mostly fuse back together.
-        "tier1": "asta",
+        #
+        # The trade is real and worth knowing: Asta is the only one of the three
+        # with genuine full-text snippets, which is what §5 designed stage-3
+        # triage around. Under pwc, triage reads the abstract -- fetched from
+        # arXiv in one batched request, see `core/http.py:arxiv_abstracts`.
+        "tier1": "pwc",
     },
     # HANDOFF-2 §18 listed the REST paths as unverified (§23 item 2). They are
     # now verified against the live API: `/api/v2/libs/search` returns
@@ -139,6 +173,17 @@ DEFAULTS: dict[str, Any] = {
         "model": "claude-opus-5",
         "permission_mode": "dontAsk",
         "max_turns": 0,  # 0 = unbounded
+        # Whether the reasoning arrives as *text*, which is what the chat
+        # window's statusline switches on and off.
+        #
+        # This is not the same question as whether the model thinks. Opus 4.7+
+        # defaults `display` to "omitted" and sends thinking blocks with a
+        # signature and no text, so a client that captures reasoning correctly
+        # still has nothing to show -- which is exactly what a toggle over an
+        # empty transcript looks like. "summarized" is the only value that
+        # actually produces text; "omitted" is the SDK's own default and is here
+        # so turning the feature off is a config edit rather than a code one.
+        "reasoning": "summarized",
     },
     "hosts": {},
 }

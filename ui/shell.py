@@ -208,44 +208,17 @@ def _statusbar(workspace: Workspace) -> None:
     kit.text(f"{len(workspace.layout.windows)} open", "count", tag="span")
 
 
-class _Menu:
-    """A dialog whose body is rebuilt each time it opens.
-
-    `ui.dialog` builds its contents once. These menus list projects, folders and
-    open windows, and all three change *because of* what the dialog does --
-    create a project and the list it was read from is already stale, open a
-    window and the mark beside its name is wrong. Redrawing on open is cheaper
-    than binding every row to the poll, and it cannot go stale between the click
-    and the dialog appearing.
-
-    `draw` is handed the menu so a control *inside* it can call `redraw` after
-    changing what the menu is listing -- which is what lets the window menu stay
-    open across several toggles instead of closing after each one.
-    """
-
-    def __init__(self, dialog: Any, draw: Any) -> None:
-        self._dialog = dialog
-        self._draw = draw
-
-    def open(self) -> None:
-        self.redraw()
-        self._dialog.open()
-
-    def redraw(self) -> None:
-        self._draw(self)
-
-    def close(self) -> None:
-        self._dialog.close()
+# `_Menu` moved to `kit.Menu`: the chat window's session picker is the fourth of
+# these, and a dialog helper that only the shell can reach is what kept that
+# picker a Quasar `select`.
+_Menu = kit.Menu
 
 
-def _project_menu(ui: Any, workspace: Workspace) -> _Menu:
+def _project_menu(ui: Any, workspace: Workspace) -> kit.Menu:
     """The workspace menu: which folder, which project, and how to change both."""
-    with ui.dialog() as dialog, kit.el("div", "grad-app"):
-        body = kit.el(
-            "div", "grad-card", style="background: var(--grad-paper); min-width: 540px"
-        )
-
-    return _Menu(dialog, lambda menu: _draw_project_menu(ui, workspace, body, menu))
+    return kit.menu(
+        lambda body, menu: _draw_project_menu(ui, workspace, body, menu), width=540
+    )
 
 
 def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> None:
@@ -526,7 +499,7 @@ PRESET_ROWS = (
 )
 
 
-def _windows_menu(ui: Any, workspace: Workspace) -> _Menu:
+def _windows_menu(ui: Any, workspace: Workspace) -> kit.Menu:
     """`⋯` and `⌘K`: which windows are open, and how they are arranged.
 
     This is the only opener. It replaced a permanent strip of eleven names,
@@ -539,13 +512,10 @@ def _windows_menu(ui: Any, workspace: Workspace) -> _Menu:
     same button; `menu.redraw()` re-reads the layout in place so the marks stay
     honest without the dialog going away.
     """
-    with ui.dialog() as dialog, kit.el("div", "grad-app"):
-        body = kit.el("div", "grad-card", style="background: var(--grad-paper); min-width: 460px")
-
-    return _Menu(dialog, lambda menu: _draw_windows_menu(workspace, body, menu))
+    return kit.menu(lambda body, menu: _draw_windows_menu(workspace, body, menu))
 
 
-def _draw_windows_menu(workspace: Workspace, body: Any, menu: _Menu) -> None:
+def _draw_windows_menu(workspace: Workspace, body: Any, menu: kit.Menu) -> None:
     open_ids = set(workspace.layout.windows)
     body.clear()
 
@@ -558,29 +528,22 @@ def _draw_windows_menu(workspace: Workspace, body: Any, menu: _Menu) -> None:
         with kit.el("div", "body"):
             for window in registry.WINDOWS:
                 is_open = window.id in open_ids
-                row = kit.el("button", f"grad-menu-row {'open' if is_open else ''}".strip())
-                row.props(f'title="{kit.attr(window.hint)}"')
+                # A filled square for open, an empty one for closed. The opener
+                # strip said the same thing by inverting the whole cell, which is
+                # louder than a list of eleven can carry.
+                row = kit.menu_row(
+                    "■" if is_open else "□", window.name, window.hint,
+                    open=is_open, title=window.hint,
+                )
                 row.on(
                     "click",
                     lambda _=None, wid=window.id: (workspace.toggle(wid), menu.redraw()),
                 )
-                with row:
-                    # A filled square for open, an empty one for closed. The
-                    # opener strip said the same thing by inverting the whole
-                    # cell, which is louder than a list of eleven can carry.
-                    kit.text("■" if is_open else "□", "mark", tag="span")
-                    kit.text(window.name, "name", tag="span")
-                    kit.text(window.hint, "hint", tag="span")
 
             kit.text("ARRANGEMENT", "grad-caption").style("margin-top: 14px")
             for name, caption, chord, hint in PRESET_ROWS:
-                row = kit.el("button", "grad-menu-row")
-                row.props(f'title="{kit.attr(hint)}"')
+                row = kit.menu_row(chord, caption, hint, title=hint)
                 row.on("click", lambda _=None, p=name: (workspace.preset(p), menu.close()))
-                with row:
-                    kit.text(chord, "mark", tag="span")
-                    kit.text(caption, "name", tag="span")
-                    kit.text(hint, "hint", tag="span")
 
             kit.text(
                 "drag a title bar to move a window · drop it on another to swap them",

@@ -331,3 +331,106 @@ async def test_run_tool_reports_a_command_that_printed_no_envelope(workspace):
     payload = await tasks_mod.run_tool(name)
     assert payload["ok"] is False
     assert "something went wrong" in payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# the agent's own calls
+# ---------------------------------------------------------------------------
+class FakeSession:
+    """A `ui.app.Session` as far as the tasks model is concerned: the turn in
+    flight, and the turns that settled."""
+
+    def __init__(self, blocks=None, settled=None) -> None:
+        self.blocks = blocks or []
+        self.settled = settled or []
+
+
+def call(cid, name="Bash", title="ls", status="running", result="", started=None):
+    import time as _t
+
+    block = {
+        "kind": "tool", "id": cid, "name": name, "title": title,
+        "status": status, "result": result,
+    }
+    block["started"] = _t.time() if started is None else started
+    return block
+
+
+def test_the_turn_in_flight_is_what_the_tasks_window_shows_first():
+    """Every capability in this project is reached by a Bash into `tools/`, so
+    the agent's calls are the other half of "what is running on this machine".
+    Until this they were visible only in the transcript, which is the wrong
+    place to look once the conversation has scrolled on."""
+    from ui import models
+
+    session = FakeSession(
+        blocks=[{"kind": "text", "text": "checking"}, call("tu_2", title="pytest -q")],
+        settled=[{"role": "assistant", "blocks": [call("tu_1", status="ok", result="one\ntwo")]}],
+    )
+    rows = models.agent_calls_model(session)
+    assert [r["id"] for r in rows] == ["tu_2", "tu_1"]
+    assert rows[0]["state"] == "running"
+    assert rows[1]["state"] == "ok"
+
+
+def test_a_call_left_running_by_a_settled_turn_is_not_reported_as_running():
+    """The turn died or was interrupted mid-call. Whatever it started is not
+    this app's to know about, and saying "running" of something nothing is
+    waiting for is the same lie as a tail that silently forgets."""
+    from ui import models
+
+    session = FakeSession(settled=[{"role": "assistant", "blocks": [call("tu_1")]}])
+    row = models.agent_calls_model(session)[0]
+    assert row["state"] == "unfinished"
+    assert row["running"] is False
+    assert row["elapsed"] == ""
+
+
+def test_only_a_live_call_is_given_a_clock():
+    from ui import models
+
+    session = FakeSession(blocks=[call("tu_1", started=None)])
+    assert models.agent_calls_model(session)[0]["elapsed"] != ""
+
+
+def test_a_call_from_a_transcript_written_before_calls_were_stamped_still_lists():
+    """The session file outlives the version that wrote it. The row is worth
+    showing; the clock is the part that is not known."""
+    from ui import models
+
+    block = call("tu_1")
+    del block["started"]
+    assert models.agent_calls_model(FakeSession(blocks=[block]))[0]["elapsed"] == ""
+
+
+def test_the_call_list_is_bounded_so_the_window_is_not_a_second_transcript():
+    from ui import models
+
+    settled = [
+        {"role": "assistant", "blocks": [call(f"tu_{i}", status="ok")]}
+        for i in range(models.AGENT_CALLS * 2)
+    ]
+    assert len(models.agent_calls_model(FakeSession(settled=settled))) == models.AGENT_CALLS
+
+
+def test_the_two_lists_are_counted_apart():
+    """A task is a process this app started and can stop; a call is one the
+    agent made and only the agent can stop. Merging them would imply a STOP
+    button that does not exist."""
+    from ui import models, tasks
+
+    tasks.start("a wiki rebuild", "tools.wiki", "map")
+    model = models.tasks_model(agent=models.agent_calls_model(FakeSession(blocks=[call("tu_1")])))
+    assert model["running"] == 1
+    assert model["agent_running"] == 1
+    assert [r["id"] for r in model["rows"]] != [c["id"] for c in model["agent"]]
+
+
+def test_the_tasks_model_without_a_session_is_unchanged():
+    """`tasks_model` is called from the poll and from tests with no session at
+    all; the agent half is additive."""
+    from ui import models
+
+    model = models.tasks_model()
+    assert model["agent"] == []
+    assert model["agent_running"] == 0

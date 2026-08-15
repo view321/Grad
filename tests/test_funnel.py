@@ -135,7 +135,8 @@ def test_a_healthy_stage_still_returns_its_payload(monkeypatch):
     "source, client, expected_fix",
     [
         # Each door's dead end points at the one that is not a dead end.
-        ("s2", "SemanticScholar", "--tier1 asta"),
+        ("pwc", "PapersWithCode", "--tier1 asta"),
+        ("s2", "SemanticScholar", "--tier1 pwc"),
         ("asta", "Asta", "credential set asta_api_key"),
     ],
 )
@@ -191,7 +192,7 @@ def test_an_empty_run_still_writes_the_trace_the_funnel_view_reads(
     from tools import paper_search
 
     # The default source, so this covers the path a real run takes.
-    monkeypatch.setattr(http, "Asta", lambda cfg: _RateLimited())
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: _RateLimited())
     paper_search.cli.run(
         ["search", "efficient optimizers", "--no-expand", "--no-triage", "--no-local", "--json"]
     )
@@ -202,7 +203,7 @@ def test_an_empty_run_still_writes_the_trace_the_funnel_view_reads(
     written = json.loads(traces[0].read_text(encoding="utf-8"))
     assert written["stages"]["1_retrieve"] == {"rankings": 0, "candidates": 0}
     # Which client was asked, so "no results" can be read against who was down.
-    assert written["stages"]["1_sources"] == ["asta"]
+    assert written["stages"]["1_sources"] == ["pwc"]
     assert any("rate-limited" in w for w in written["warnings"])
 
 
@@ -311,3 +312,191 @@ def test_the_fix_the_error_prints_is_a_command_that_exists():
     assert credentials.CLAUDE_TOKEN in CREDENTIAL_NAMES
     assert credentials.CLAUDE_TOKEN in credentials.status()
     assert credentials.CLAUDE_TOKEN in haiku.AUTH_FIX
+
+
+# ---------------------------------------------------------------------------
+# stage 1: what a slow tier-1 costs, and what bounds it
+# ---------------------------------------------------------------------------
+class _Counted:
+    """A tier-1 client that counts calls and fails a chosen verb.
+
+    `snippet_search` is the one that was down when this was written -- Asta's own
+    backend refusing a connection -- and the number that matters is not that it
+    failed but that it took 283 seconds to say so.
+    """
+
+    def __init__(self, fails=("snippet_search",), hits=1, seconds=0.0) -> None:
+        self.fails = set(fails)
+        self.hits = hits
+        self.seconds = seconds
+        self.calls: list[str] = []
+
+    def _call(self, verb: str, query: str, limit: int = 20):
+        import time
+
+        self.calls.append(verb)
+        if self.seconds:
+            time.sleep(self.seconds)
+        if verb in self.fails:
+            raise UpstreamError(f"Asta's {verb} failed: ConnectionRefusedError", fix="retry")
+        return [
+            {"id": f"s2:{query[:4]}-{i}", "paper_id": f"p{i}", "title": f"paper {i}",
+             "year": 2024, "snippet": "an excerpt", "source": "asta.paper", "external": {}}
+            for i in range(self.hits)
+        ]
+
+    def snippet_search(self, query, limit=20):
+        return self._call("snippet_search", query, limit)
+
+    def paper_search(self, query, limit=20):
+        return self._call("paper_search", query, limit)
+
+    def neighbours(self, *_a, **_k):
+        return []
+
+
+def _expand_to(monkeypatch, queries):
+    """Stage 0, without Haiku: what matters here is how many queries stage 1 is
+    handed, because that is the multiplier on every tier-1 failure."""
+    from core import haiku
+
+    monkeypatch.setattr(
+        haiku, "expand", lambda *a, **k: {"queries": list(queries), "hyde": None}
+    )
+
+
+def test_a_dead_endpoint_is_dropped_after_one_failure_rather_than_per_query(
+    workspace, capsys, monkeypatch
+):
+    """The run-killer. Stage 0 turns one question into six queries, and asking a
+    down endpoint once per query cost 283 seconds each time to learn the same
+    thing six times -- so the funnel was killed by its caller before the
+    endpoint that *was* working could return anything."""
+    from core import http
+    from tools import paper_search
+
+    client = _Counted(fails=("snippet_search",))
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: client)
+    _expand_to(monkeypatch, ["q1", "q2", "q3", "q4", "q5", "q6"])
+
+    code = paper_search.cli.run(
+        ["search", "efficient optimizers", "--no-triage", "--no-rerank",
+         "--no-local", "--no-citations", "--json"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert client.calls.count("snippet_search") == 1, "asked once, not once per query"
+    assert client.calls.count("paper_search") == 6, "the working endpoint is not punished"
+    assert payload["data"]["results"], "the run returns what the live endpoint found"
+
+
+def test_what_was_dropped_is_written_into_the_trace(workspace, capsys, monkeypatch):
+    """A funnel that quietly searched one endpoint of two looks exactly like a
+    corpus that had little to say."""
+    from core import http
+    from tools import paper_search
+
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: _Counted(fails=("snippet_search",)))
+    _expand_to(monkeypatch, ["q1", "q2"])
+    paper_search.cli.run(
+        ["search", "efficient optimizers", "--no-triage", "--no-rerank",
+         "--no-local", "--no-citations", "--json"]
+    )
+    capsys.readouterr()
+
+    written = json.loads(next((paths.notes_dir() / "funnel").glob("*.json")).read_text("utf-8"))
+    assert written["stages"]["1_discovery"]["dropped"] == ["pwc.snippet_search"]
+    assert written["stages"]["1_discovery"]["queries_searched"] == 2
+    assert any("dropped for the rest of this run" in w for w in written["warnings"])
+
+
+def test_stage_one_stops_when_its_wall_clock_is_spent_and_says_how_far_it_got(
+    workspace, capsys, monkeypatch
+):
+    """`core/http.py` bounds one request; this bounds the run. Six queries over
+    two endpoints under a five-minute request deadline is a one-hour stage, and
+    the caller kills it long before it ends."""
+    from core import http
+    from tools import paper_search
+
+    config = paths.root() / "config" / "grad.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("[retrieval]\nstage1_budget_s = 0.05\n", encoding="utf-8")
+
+    client = _Counted(fails=(), seconds=0.03)
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: client)
+    _expand_to(monkeypatch, [f"q{i}" for i in range(20)])
+
+    code = paper_search.cli.run(
+        ["search", "efficient optimizers", "--no-triage", "--no-rerank",
+         "--no-local", "--no-citations", "--json"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0, "stopping early is not failing"
+    assert payload["data"]["results"], "what was retrieved is kept"
+    written = json.loads(next((paths.notes_dir() / "funnel").glob("*.json")).read_text("utf-8"))
+    searched = written["stages"]["1_discovery"]["queries_searched"]
+    assert 0 < searched < 20
+    assert any("stage1_budget_s" in w for w in written["warnings"])
+
+
+def test_progress_reaches_stderr_so_a_pipe_can_see_the_run_moving(
+    workspace, capsys, monkeypatch
+):
+    """Everything that runs this reads a pipe -- the tasks window streams the
+    tail, and the agent's own Bash gives up at 120s and backgrounds the command.
+    A run that prints nothing until its envelope is indistinguishable from a
+    hung one in both."""
+    from core import http
+    from tools import paper_search
+
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: _Counted(fails=()))
+    _expand_to(monkeypatch, ["q1"])
+    paper_search.cli.run(
+        ["search", "efficient optimizers", "--no-triage", "--no-rerank",
+         "--no-local", "--no-citations", "--json"]
+    )
+    captured = capsys.readouterr()
+    assert "stage 1: pwc.paper_search" in captured.err
+    assert "stage 1" not in captured.out, "the --json contract stays one object on stdout"
+
+
+def test_the_advice_matches_what_actually_failed(workspace):
+    """A live run failed with `ConnectionRefusedError` raised inside Asta's own
+    backend, and the fix said "discovery is rate limited" and pointed at a key.
+    No key affects that, and advice that cannot be followed is followed first."""
+    from tools import paper_search
+
+    limited = paper_search._tier1_fix(["asta"], ["asta.snippet_search: rate-limited"])
+    assert "credential set asta_api_key" in limited
+
+    refused = paper_search._tier1_fix(
+        ["pwc"], ["pwc.paper_search: ConnectionRefusedError inside the service"]
+    )
+    assert "credential set" not in refused
+    assert "--local-only" in refused
+
+
+def test_one_endpoint_being_down_does_not_hide_what_the_other_found(
+    workspace, capsys, monkeypatch
+):
+    """The state of the service as this was written: `snippet_search` refuses
+    and `search_papers_by_relevance` works. A funnel that reports "every
+    retrieval call failed" in that situation is claiming the literature has
+    nothing on the question."""
+    from core import http
+    from tools import paper_search
+
+    monkeypatch.setattr(http, "PapersWithCode", lambda cfg: _Counted(fails=("snippet_search",), hits=3))
+    _expand_to(monkeypatch, ["q1", "q2"])
+    code = paper_search.cli.run(
+        ["search", "efficient optimizers", "--no-triage", "--no-rerank",
+         "--no-local", "--no-citations", "--json"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["ok"] is True
+    assert len(payload["data"]["results"]) == 6
+    assert any("snippet_search" in w for w in payload["data"]["trace"]["warnings"])

@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
+import time
 from typing import Any
 
 from core import config as config_mod, corpus, credentials, haiku, http, paths, quota_log
@@ -40,28 +42,82 @@ cli = Cli(
 
 
 #: `tier1` value -> the clients it selects, in the order they are queried.
-TIER1_SOURCES = ("asta", "s2", "both", "none")
+#: `both` predates `pwc` and still means what it meant: the two Semantic Scholar
+#: doors, for comparing them.
+TIER1_SOURCES = ("pwc", "asta", "s2", "both", "all", "none")
+
+
+class _Budget:
+    """A wall clock over the whole of stage 1.
+
+    `core/http.py` bounds one *request*; this bounds the run. They are different
+    numbers because stage 0 turns one question into six queries and each is put
+    to two endpoints, so a per-request deadline of five minutes is a
+    one-hour stage. What made that concrete: a live `snippet_search` took 283
+    seconds to report that Asta's own backend had refused a connection, and the
+    funnel was killed by its caller long before the endpoints that *were*
+    working could contribute anything.
+
+    Stopping early is not the same as failing. What has been retrieved is kept,
+    what was skipped is written into the trace, and the caller gets results --
+    which is the whole difference between a slow funnel and a broken one.
+    """
+
+    def __init__(self, limit: float) -> None:
+        self.limit = max(0.0, limit)
+        self._started = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started
+
+    @property
+    def spent(self) -> bool:
+        return bool(self.limit) and self.elapsed >= self.limit
+
+
+def _progress(message: str) -> None:
+    """A line of progress on stderr, where a `--json` contract cannot see it.
+
+    The funnel prints nothing until its envelope, which is minutes later, and
+    everything that runs it reads a pipe: the tasks window streams the tail, and
+    the agent's own Bash call gives up at 120 seconds and moves the command to
+    the background. A run with no output is indistinguishable from a hung one in
+    all three places, and that is how a slow stage got read as a broken tool.
+    """
+    print(message, file=sys.stderr, flush=True)
 
 
 def tier1_clients(cfg: Any, override: str | None = None) -> list[tuple[str, Any]]:
     """The discovery clients for this run, named so a trace can say which spoke.
 
-    Both reach the same Semantic Scholar corpus and both answer in the same
-    vocabulary (`core/http.py:_row`), so a candidate found by either fuses to
-    one entry. What differs is whether the door opens: S2's own API no longer
-    issues keys to free-domain addresses, so a personal account falls back to
-    the shared anonymous pool.
+    All three answer in the same vocabulary (`core/http.py:_row`, `_pwc_row`),
+    so the funnel does not know which tier a candidate came from and does not
+    have to. What differs is whether the door opens, and how fast:
+
+    * **pwc** -- Papers with Code, as revived by Hugging Face. Anonymous, one to
+      two seconds, and two genuinely different rankings (lexical and dense) that
+      RRF was built to fuse. The default, because it is the one that answers.
+    * **asta** -- the same Semantic Scholar corpus as `s2`, through a door that
+      opens without an institutional address, and the only one of the three with
+      real full-text snippets. Measured live at 121s for a search and 283s to
+      report a backend failure, which is why it is no longer the default.
+    * **s2** -- the REST API directly. Its own keys are only issued to
+      institutional addresses, so a personal account falls back to the shared
+      anonymous pool, which is near-permanently rate limited.
     """
-    chosen = str(override or cfg.get("retrieval", "tier1", "asta")).lower()
+    chosen = str(override or cfg.get("retrieval", "tier1", "pwc")).lower()
     if chosen not in TIER1_SOURCES:
         raise UsageError(
             f"unknown tier-1 source {chosen!r}",
             fix=f"one of: {', '.join(TIER1_SOURCES)}",
         )
     out: list[tuple[str, Any]] = []
-    if chosen in ("asta", "both"):
+    if chosen in ("pwc", "all"):
+        out.append(("pwc", http.PapersWithCode(cfg)))
+    if chosen in ("asta", "both", "all"):
         out.append(("asta", http.Asta(cfg)))
-    if chosen in ("s2", "both"):
+    if chosen in ("s2", "both", "all"):
         out.append(("s2", http.SemanticScholar(cfg)))
     return out
 
@@ -120,19 +176,60 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
 
     if tier1:
         per_query = max(5, ceiling // max(1, len(queries) * 2 * len(tier1)))
+        budget = _Budget(float(cfg.get("retrieval", "stage1_budget_s", 300)))
+        #: `(source, verb)` pairs that have already failed once. See `_Budget`.
+        dropped: set[tuple[str, str]] = set()
+        searched = 0
         for query in queries:
+            if budget.spent:
+                break
+            searched += 1
             for name, client in tier1:
                 for verb in ("snippet_search", "paper_search"):
+                    if (name, verb) in dropped or budget.spent:
+                        continue
+                    _progress(f"stage 1: {name}.{verb} q{searched}/{len(queries)}")
                     try:
                         hits = getattr(client, verb)(query, limit=per_query)
                     except GradError as exc:
+                        # Dropped for the rest of the run, not merely skipped for
+                        # this query. A tier-1 endpoint that is down is down for
+                        # every query, and finding that out costs a *request* --
+                        # a live snippet_search took 283 seconds to report that
+                        # Asta's own backend had refused a connection, so trying
+                        # it once per expanded query spent 28 minutes learning
+                        # the same thing six times and got the run killed before
+                        # the stages that were working could return anything.
+                        dropped.add((name, verb))
                         trace.setdefault("warnings", []).append(f"{name}.{verb}: {exc}")
                         upstream_failures.append(f"{name}.{verb}: {exc}")
+                        _progress(f"stage 1: {name}.{verb} failed; not retried this run")
                         continue
                     rankings.append(hits)
+                    _progress(f"stage 1: {name}.{verb} returned {len(hits)}")
                     for hit in hits:
                         candidates.setdefault(hit["id"], hit)
-        if not args.no_citations:
+        # Both caps are reported rather than left to be inferred from a thin
+        # result set: a funnel that quietly searched two of six queries looks
+        # exactly like a corpus that had little to say.
+        if dropped:
+            trace.setdefault("warnings", []).append(
+                "dropped for the rest of this run after one failure each: "
+                + ", ".join(sorted(f"{n}.{v}" for n, v in dropped))
+            )
+        if budget.spent:
+            trace.setdefault("warnings", []).append(
+                f"tier-1 discovery stopped after {budget.limit:.0f}s having searched "
+                f"{searched} of {len(queries)} queries — raise [retrieval] "
+                "stage1_budget_s, or --no-expand to search one query instead of six"
+            )
+        trace["stages"]["1_discovery"] = {
+            "queries_searched": searched,
+            "queries": len(queries),
+            "dropped": sorted(f"{n}.{v}" for n, v in dropped),
+            "seconds": round(budget.elapsed, 1),
+        }
+        if not args.no_citations and not budget.spent:
             seeds = [c for c in list(candidates.values())[:5] if c.get("paper_id")]
             for seed in seeds:
                 for name, client in tier1:
@@ -156,6 +253,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
 
     fused = corpus.rrf(rankings, k=int(cfg.get("retrieval", "rrf_k", 60)))
     pool = [candidates[f["id"]] | {"rrf": f["rrf"]} for f in fused if f["id"] in candidates][:ceiling]
+    _fill_abstracts(pool, cfg, trace)
     quota_log.record(
         quota_log.STAGE_RETRIEVE, unit="quota", detail={"queries": len(queries), "candidates": len(pool)}
     )
@@ -177,7 +275,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             raise UpstreamError(
                 "every retrieval call failed, so the search returned nothing: "
                 + "; ".join(dict.fromkeys(upstream_failures)),
-                fix=_tier1_fix(trace["stages"]["1_sources"]),
+                fix=_tier1_fix(trace["stages"]["1_sources"], upstream_failures),
             )
         return {
             "question": args.question,
@@ -260,29 +358,103 @@ def apply_rerank(pool: list[dict[str, Any]], scored: list[dict[str, Any]]) -> li
     ]
 
 
-def _tier1_fix(sources: list[str]) -> str:
-    """What to actually do when discovery is down, per source.
+def _tier1_fix(sources: list[str], failures: list[str] | None = None) -> str:
+    """What to actually do when discovery is down, per source *and per failure*.
 
     This used to say "store a Semantic Scholar API key -- it is free", which
     stopped being true: Ai2 no longer accept key requests from free-domain email
     addresses, so for a personal account that instruction has no ending. Advice
     that cannot be followed is worse than no advice, because it is followed
     first and the real fix is found second.
+
+    The Asta branch had the same problem one step down. It said "discovery is
+    rate limited, not broken" whatever had happened, and pointed at a key -- but
+    a live run failed with `ConnectionRefusedError` raised inside Asta's own
+    backend, which no key affects. So the advice is now chosen by what the
+    failures actually say rather than assumed.
     """
-    if sources == ["s2"]:
+    joined = " ".join(failures or [])
+    local = "Meanwhile --local-only searches what is already ingested."
+    elsewhere = (
+        "python -m tools.paper_search search '<question>' --tier1 {} --json   "
+        '(or set [retrieval] tier1 = "{}" in config/grad.toml)'
+    )
+    # The cause first where there is one, because a rate limit has a fix of its
+    # own and it is not the same fix as an endpoint being down.
+    if "rate-limited" in joined or "429" in joined:
+        if "asta" in sources:
+            return (
+                "retry -- discovery is rate limited, not broken. A key raises Asta's limits "
+                "and is requested from a form rather than reviewed: "
+                f"python -m tools.jobs credential set {credentials.ASTA_KEY}. {local}"
+            )
+        if "pwc" in sources:
+            return (
+                "retry -- discovery is rate limited, not broken. This catalogue is "
+                "anonymous, so there is no key that raises it; the same literature is "
+                "reachable more slowly through " + elsewhere.format("asta", "asta") + f". {local}"
+            )
         return (
-            "Semantic Scholar's own API only issues keys to institutional addresses, so "
-            "this is the shared anonymous pool. Switch to Ai2's Asta, which serves the "
-            "same corpus and does not require one: "
-            "python -m tools.paper_search search '<question>' --tier1 asta --json   "
-            "(or set [retrieval] tier1 = \"asta\" in config/grad.toml)"
+            "retry -- Semantic Scholar's anonymous pool is shared and its own keys are only "
+            "issued to institutional addresses. Papers with Code is anonymous and answers in "
+            "about a second: " + elsewhere.format("pwc", "pwc") + f". {local}"
+        )
+    if sources == ["pwc"]:
+        return (
+            "this catalogue is anonymous, so there is no key to add and nothing to "
+            "configure -- it is down or unreachable. Retry, or reach the same literature "
+            "more slowly through " + elsewhere.format("asta", "asta") + f". {local}"
+        )
+    if sources in (["s2"], ["asta"]):
+        # Both doors onto the Semantic Scholar corpus point at the one that is
+        # neither rate limited nor minutes slow.
+        return (
+            "Semantic Scholar's own API only issues keys to institutional addresses, and "
+            "Asta answers in minutes rather than seconds. Papers with Code is anonymous and "
+            "answers in about a second: " + elsewhere.format("pwc", "pwc") + f". {local}"
         )
     return (
-        "retry -- discovery is rate limited, not broken. A key raises Asta's limits and "
-        "is requested from a form rather than reviewed: "
-        f"python -m tools.jobs credential set {credentials.ASTA_KEY}. "
-        "Meanwhile --local-only searches what is already ingested."
+        "the message above is the service's own and names the endpoint that refused -- no "
+        f"key affects it. The endpoints fail independently, so retrying is worth it even "
+        f"when one of them is down. {local}"
     )
+
+
+def _fill_abstracts(pool: list[dict[str, Any]], cfg: Any, trace: dict[str, Any]) -> None:
+    """Give the candidates that have no text an abstract, in one request.
+
+    Stage 2 reranks on `title + snippet-or-abstract` and stage 3 triages on the
+    same, so a pool of bare titles is a measurably worse funnel -- and the fast
+    corpus does not return abstracts with its search results. Nearly every row
+    it does return is an arXiv paper, and arXiv takes a hundred ids at once, so
+    the whole pool costs one call rather than one per candidate.
+
+    Degrades rather than fails: a candidate with no abstract ranks on its title,
+    which is what would have happened without this. What it must not do is go
+    unrecorded -- a funnel silently reranking titles looks exactly like one
+    reranking abstracts, and only one of them is the retrieval §5 evaluates.
+    """
+    wanted = {
+        c["external"]["ArXiv"]: c
+        for c in pool[: http.ARXIV_BATCH]
+        if not (c.get("snippet") or c.get("abstract"))
+        and isinstance(c.get("external"), dict)
+        and c["external"].get("ArXiv")
+    }
+    if not wanted:
+        return
+    _progress(f"stage 1: fetching {len(wanted)} abstracts from arXiv")
+    found = http.arxiv_abstracts(list(wanted), cfg=cfg)
+    for arxiv_id, abstract in found.items():
+        if arxiv_id in wanted:
+            wanted[arxiv_id]["abstract"] = abstract
+    missing = len(wanted) - len(found)
+    trace["stages"]["1_abstracts"] = {"wanted": len(wanted), "found": len(found)}
+    if missing:
+        trace.setdefault("warnings", []).append(
+            f"{missing} of {len(wanted)} candidates were reranked and triaged on their "
+            "title alone — arXiv returned no abstract for them"
+        )
 
 
 def _local_ranked(question: str, hyde: str | None, cfg: Any, trace: dict[str, Any]) -> list[dict[str, Any]]:

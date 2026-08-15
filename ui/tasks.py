@@ -232,6 +232,13 @@ async def _run(task: Task) -> None:
     try:
         task._process = await asyncio.create_subprocess_exec(  # noqa: SLF001 - its own field
             sys.executable,
+            # `-u`, and it is load-bearing rather than tidy. Python block-buffers
+            # stdout when it is a pipe, and every one of these is a pipe -- so a
+            # command that printed progress for ten minutes delivered all of it
+            # at exit, and this window, whose whole premise is "output is
+            # streamed here as it arrives", showed an empty tail for the entire
+            # run. A slow command and a hung one looked identical.
+            "-u",
             "-m",
             *task.argv,
             cwd=str(paths.root()),
@@ -406,6 +413,7 @@ async def run_tool(*argv: str, timeout: float = 120.0, stdin: str | None = None)
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
+            "-u",  # see `_run`: every one of these is a pipe
             "-m",
             *argv,
             cwd=str(paths.root()),

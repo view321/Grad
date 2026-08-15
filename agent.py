@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -73,22 +75,50 @@ def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str |
         "PreToolUse": [sdk.HookMatcher(matcher="Bash", hooks=[hooks.pre_tool_use])],
         "Stop": [sdk.HookMatcher(hooks=[hooks.stop])],
     }
-    return sdk.ClaudeAgentOptions(
-        resume=resume,
-        model=cfg.model_for("research"),
-        system_prompt=system_prompt(),
-        allowed_tools=BUILTIN_TOOLS,
-        disallowed_tools=DENIED_TOOLS,
-        permission_mode=mode,
-        cwd=str(paths.root()),
-        hooks=hook_matchers,
+    options: dict[str, Any] = {
+        "resume": resume,
+        "model": cfg.model_for("research"),
+        "system_prompt": system_prompt(),
+        "allowed_tools": BUILTIN_TOOLS,
+        "disallowed_tools": DENIED_TOOLS,
+        "permission_mode": mode,
+        "cwd": str(paths.root()),
+        "hooks": hook_matchers,
         # Off by default in the SDK, and the default is why an answer used to
         # arrive in one lump: without it `receive_response` yields nothing until
         # a whole `AssistantMessage` is finished. With it the same turn also
         # emits `StreamEvent`s carrying token deltas. `TextStream` is what turns
         # the two into one transcript -- see the warning in its docstring.
-        include_partial_messages=True,
-    )
+        "include_partial_messages": True,
+    }
+    options.update(thinking_option(cfg, sdk))
+    return sdk.ClaudeAgentOptions(**options)
+
+
+def thinking_option(cfg: Any, sdk: Any) -> dict[str, Any]:
+    """Ask for the reasoning as text, when the installed SDK can be asked.
+
+    Capturing thinking blocks is not enough to *have* any: Opus 4.7+ defaults
+    `display` to "omitted" and sends them with a signature and no text. So the
+    chat window's reasoning switch had nothing to reveal no matter how correctly
+    the stream was read -- the bug was one flag away from the feature, and it
+    looked exactly like a toggle that did nothing.
+
+    Feature-detected rather than assumed, for the same reason `agent.py probe`
+    exists: this option is newer than the permission mode and the SDK's shape has
+    changed between releases. An SDK without it gets the options it understands
+    and a session with no reasoning, which is what it would have had anyway.
+    """
+    display = str(cfg.get("agent", "reasoning", "summarized")).lower()
+    if display not in ("summarized", "omitted"):
+        display = "summarized"
+    fields = {f.name for f in dataclasses.fields(sdk.ClaudeAgentOptions)}
+    if "thinking" not in fields:
+        return {}
+    # `adaptive` rather than a fixed budget: the model decides how much thinking
+    # a turn is worth, which is the right call for a session that ranges from
+    # "what is in the ledger" to a campaign design.
+    return {"thinking": {"type": "adaptive", "display": display}}
 
 
 def preflight_environment() -> dict[str, Any]:
@@ -222,6 +252,7 @@ async def drive_turn(
     stream: Any,
     *,
     on_chunk: Any = None,
+    on_session_id: Any = None,
     session: str | None = None,
 ) -> dict[str, Any]:
     """One turn, for every surface that runs one.
@@ -236,6 +267,13 @@ async def drive_turn(
 
     `on_chunk` is called with each newly-visible piece of text; the UI passes
     nothing because its renderer reads `stream.blocks` on a timer instead.
+
+    `on_session_id` is called the moment the SDK names this conversation, and it
+    exists because the return value is not reached on every path this function
+    can take. A turn that is *interrupted* raises, so a caller reading the id
+    off the return value learned it only for turns that finished -- and an
+    interrupted turn is precisely the one after which the client is rebuilt, so
+    that was the case where losing the id cost the whole conversation.
     """
     refusal = check_turn_budget()
     if refusal:
@@ -258,6 +296,8 @@ async def drive_turn(
             # A resumed conversation can be given a new id, so the latest wins.
             candidate = getattr(message, "session_id", None)
             if isinstance(candidate, str) and candidate:
+                if candidate != sdk_session_id and on_session_id is not None:
+                    on_session_id(candidate)
                 sdk_session_id = candidate
             # The *last* usage seen, recorded once after the loop -- not one
             # record per message. `ResultMessage` arrives last and carries the
@@ -324,6 +364,37 @@ def _delta_of(message: Any) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _thinking_delta_of(message: Any) -> str:
+    """The reasoning a partial-message stream event carries, if any.
+
+    The mirror of `_delta_of`, and a separate function rather than a parameter on
+    it: the two feed different halves of the transcript, and the whole reason
+    `_delta_of` filters as hard as it does is that mixing them makes the stream
+    say something the settled message does not.
+    """
+    event = getattr(message, "event", None)
+    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+        return ""
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "thinking_delta":
+        return ""
+    text = delta.get("thinking")
+    return text if isinstance(text, str) else ""
+
+
+def _thinking_of(message: Any) -> str:
+    """The reasoning in a finished message.
+
+    A `ThinkingBlock` carries `.thinking`, not `.text`, which is exactly why
+    `_text_of` misses it -- and why the reasoning needed a second pair of
+    accessors rather than a looser filter on the first.
+    """
+    content = getattr(message, "content", None)
+    if not isinstance(content, list):
+        return ""
+    return "".join(getattr(b, "thinking", "") or "" for b in content)
+
+
 class TextStream:
     """One turn's visible text, assembled from deltas *and* finished messages.
 
@@ -343,22 +414,29 @@ class TextStream:
     `feed` returns only the text that has not been shown yet, so a CLI can print
     its return value directly; `text` is the whole answer so far, for a UI that
     re-renders from it.
+
+    The two accessors are parameters because the *reasoning* half of a turn
+    arrives the same way and has the same trap: `thinking_delta` events followed
+    by a `ThinkingBlock` containing all of them. One class, given the other pair
+    of accessors, is what keeps the no-duplication rule stated once.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, delta_of: Any = None, whole_of: Any = None) -> None:
         self.text = ""
         #: The tail of `text` contributed by deltas since the last finished
         #: message -- the part a finished message is entitled to overwrite.
         self._streamed = ""
+        self._delta_of = delta_of or _delta_of
+        self._whole_of = whole_of or _text_of
 
     def feed(self, message: Any) -> str:
-        delta = _delta_of(message)
+        delta = self._delta_of(message)
         if delta:
             self.text += delta
             self._streamed += delta
             return delta
 
-        text = _text_of(message)
+        text = self._whole_of(message)
         # A message with no text at all -- a tool result, a system message, the
         # final result -- must leave a half-streamed block alone.
         if not text:
@@ -521,6 +599,13 @@ def tool_block(use: dict[str, Any]) -> dict[str, Any]:
         "rows": rows[:MAX_ROWS],
         "status": "running",
         "result": "",
+        # Wall clock rather than `time.monotonic`, because this is written into
+        # the session file and read back in another process, where a monotonic
+        # reading from a previous boot means nothing at all. What reads it is the
+        # tasks window, which reports how long the call in flight has been
+        # running -- the difference between a spinner and knowing a forty-minute
+        # job is still going.
+        "started": time.time(),
     }
 
 
@@ -539,23 +624,42 @@ class TurnStream:
     happened. Text assembly is delegated to `TextStream` unchanged, including
     its rule that a finished message replaces the deltas that built it.
 
+    Reasoning is a third kind of block, kept beside the prose rather than folded
+    into it. It is *not* part of `text`: the answer and the working are different
+    claims, the transcript's `text` is what the agent said, and a UI that wants
+    the working can ask for the blocks. Which is exactly what the chat window's
+    statusline toggles.
+
     `feed` returns what a CLI should print next; a UI re-renders from `blocks`.
     """
 
     def __init__(self) -> None:
         self.blocks: list[dict[str, Any]] = []
         self._text = TextStream()
+        self._think = TextStream(_thinking_delta_of, _thinking_of)
         #: The block the current run of prose is accumulating into, if open.
         self._open: dict[str, Any] | None = None
+        #: The same, for the current run of reasoning.
+        self._open_thought: dict[str, Any] | None = None
         #: Tool blocks by call id, so a result can find the call it answers.
         self._calls: dict[str, dict[str, Any]] = {}
 
     @property
     def text(self) -> str:
-        """The turn's prose, tool cards left out -- what a plain transcript says."""
+        """The turn's prose, tool cards and reasoning left out -- what a plain
+        transcript says."""
         return "".join(b["text"] for b in self.blocks if b["kind"] == "text")
 
+    @property
+    def thinking(self) -> str:
+        """The turn's reasoning, for a caller that wants only that half."""
+        return "".join(b["text"] for b in self.blocks if b["kind"] == "thinking")
+
     def feed(self, message: Any) -> str:
+        # Reasoning first, because that is the order the API sends it in: a
+        # message carrying both a `ThinkingBlock` and a `TextBlock` reasoned
+        # before it answered, and `blocks` is read top to bottom.
+        self._feed_thinking(message)
         printed = self._feed_text(message)
         for use in _tool_uses(message):
             block = tool_block(use)
@@ -563,8 +667,12 @@ class TurnStream:
             self._calls[block["id"]] = block
             # A tool call ends the run of prose above it: whatever the agent says
             # next belongs *below* the card, because that is when it said it.
+            # The reasoning run ends with it, for the same reason -- interleaved
+            # thinking resumes *after* the call, not inside the block above it.
             self._text = TextStream()
             self._open = None
+            self._think = TextStream(_thinking_delta_of, _thinking_of)
+            self._open_thought = None
             printed += _tool_line(block)
         for result in _tool_results(message):
             block = self._calls.get(result["id"])
@@ -583,6 +691,8 @@ class TurnStream:
         if not text:
             return
         self._text = TextStream()
+        self._think = TextStream(_thinking_delta_of, _thinking_of)
+        self._open_thought = None
         self._open = {"kind": "text", "text": text}
         self.blocks.append(self._open)
 
@@ -603,6 +713,19 @@ class TurnStream:
                 self.blocks.append(self._open)
             self._open["text"] = self._text.text
         return chunk
+
+    def _feed_thinking(self, message: Any) -> None:
+        """The same shape as `_feed_text`, over the reasoning accessors.
+
+        Nothing is returned: `feed`'s return value is what a CLI prints, and the
+        reasoning is not that. It is a block a UI can choose to draw.
+        """
+        self._think.feed(message)
+        if self._think.text:
+            if self._open_thought is None:
+                self._open_thought = {"kind": "thinking", "text": ""}
+                self.blocks.append(self._open_thought)
+            self._open_thought["text"] = self._think.text
 
 
 def _tool_line(block: dict[str, Any]) -> str:

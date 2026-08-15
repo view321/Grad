@@ -427,14 +427,66 @@ def test_a_new_turn_clears_the_tail_rather_than_stacking_onto_it(rendered):
 
 def test_the_status_line_names_the_call_in_flight(rendered):
     """A spinner says something is happening; naming the command says a
-    40-minute job is running and which one."""
+    40-minute job is running and which one.
+
+    The fallbacks changed with the statusline: `running …` was the only thing it
+    could say when no call was in flight, which covered "reasoning", "writing"
+    and "nothing has come back yet" with one word. Each is now named, because
+    each is a different answer to "why is nothing on screen".
+    """
     from ui.windows.chat import _activity
 
-    assert _activity([]) == "running …"
+    assert _activity([]) == "waiting for the model"
     assert _activity([
         {"kind": "tool", "name": "Bash", "title": "python -m tools.jobs run", "status": "running"},
     ]) == "running Bash python -m tools.jobs run"
-    assert _activity([{"kind": "tool", "name": "Bash", "title": "ls", "status": "ok"}]) == "running …"
+    # A finished call is not an activity; what is happening is whatever came
+    # after it, and the reasoning is as specific as that gets.
+    assert _activity([
+        {"kind": "tool", "name": "Bash", "title": "ls", "status": "ok"},
+        {"kind": "thinking", "text": "one entry, so the claim holds"},
+    ]) == "thinking"
+    assert _activity([
+        {"kind": "thinking", "text": "working it out"},
+        {"kind": "text", "text": "The answer is"},
+    ]) == "writing"
+
+
+def test_the_statusline_switches_the_reasoning_without_redrawing_the_transcript(rendered):
+    """A toggle that rebuilt the transcript would take its scroll position with
+    it, which is the same reason the poll never touches this window. So the
+    blocks are always in the DOM and a class decides whether they are painted."""
+    client, space = rendered(["chat"])
+    with client:
+        assert space.show_reasoning is False
+        roots = [
+            e for e in client.elements.values() if "grad-chat" in getattr(e, "classes", [])
+        ]
+        assert roots, "the chat root carries the class the switch writes"
+        assert "reasoning-on" not in roots[0].classes
+
+        bars = [
+            e for e in client.elements.values()
+            if "grad-statusline" in getattr(e, "classes", [])
+        ]
+        assert len(bars) == 1
+
+        assert space.toggle_reasoning() is True
+        roots[0].classes(add="reasoning-on")
+        assert "reasoning-on" in roots[0].classes
+
+
+def test_the_session_picker_is_the_workspaces_own_menu(rendered):
+    """The last Quasar control in the workspace. A `select` has one string per
+    option, so "another window has this open" arrived as a ` · ` fragment glued
+    onto the title and looked exactly like the rows that can be opened."""
+    client, space = rendered(["chat"])
+    with client:
+        selects = [
+            e for e in client.elements.values() if type(e).__name__ == "Select"
+        ]
+        assert selects == []
+        assert "grad-session-btn" in html_of(client)
 
 
 def test_the_focused_window_is_marked(rendered):

@@ -262,6 +262,19 @@ def _shell() -> str:
 .grad-menu-row.open { background: var(--grad-ink); color: var(--grad-paper); }
 .grad-menu-row.open .mark, .grad-menu-row.open .hint { opacity: 0.7; }
 .grad-menu-row.open:hover { background: var(--grad-broken); color: #fff; }
+/* A session is called whatever was first asked in it, so its name gets the row
+   and the count beside it gets what it needs -- the reverse of a window list,
+   where the names are one word and the hints are the sentence. */
+.grad-menu-row.wide .name { flex: 1 1 auto; min-width: 0; text-transform: none;
+                            letter-spacing: 0; overflow: hidden;
+                            white-space: nowrap; text-overflow: ellipsis; }
+.grad-menu-row.wide .hint { flex: 0 0 auto; }
+/* A row that cannot be opened: the current one, and one another window holds.
+   It is dimmed rather than hidden, because "in use elsewhere" is the answer to
+   the question the list is being read to answer. */
+.grad-menu-row.disabled { opacity: 0.45; cursor: default; }
+.grad-menu-row.disabled:hover { background: transparent; }
+.grad-menu-row.open.disabled { opacity: 1; }
 
 .grad-statusbar {
     display: flex; align-items: center; gap: 14px; padding: 0 12px;
@@ -582,16 +595,62 @@ def _chat() -> str:
 .grad-card.tool > .body .out { margin-top: 9px; }
 .grad-card.tool > .body .out .grad-label { opacity: 0.5; margin-bottom: 4px; }
 
-.grad-streaming { display: flex; align-items: center; gap: 9px; margin: 9px 14px;
-                  border: var(--grad-pending); padding: 9px 11px;
-                  font-family: var(--grad-font-mono); font-size: 12px; }
-.grad-streaming .block { width: 8px; height: 8px; background: var(--grad-ink);
-                         animation: gradblink 1.1s steps(1) infinite; }
+/* The agent statusline: always on screen, and the switch for the reasoning
+   below it. The strip it replaced was `.grad-streaming`, which appeared only
+   while a turn ran -- so the one piece of state worth reading at a glance was
+   the one that came and went, and an idle session had nothing saying so.
+
+   A `<button>`, because the whole bar is the click target, which means undoing
+   the four properties a `<button>` arrives with. */
+.grad-statusline {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 7px 14px; cursor: pointer; text-align: left;
+    border: 0; border-top: var(--grad-border); flex: 0 0 auto;
+    background: var(--grad-paper-sunk); color: var(--grad-ink);
+    font: inherit; font-family: var(--grad-font-mono); font-size: 11px;
+}
+.grad-statusline:hover { background: var(--grad-paper-raised); }
+.grad-statusline .block { width: 8px; height: 8px; flex: 0 0 8px;
+                          background: var(--grad-rule-mid); }
+.grad-statusline.running .block { background: var(--grad-ink);
+                                  animation: gradblink 1.1s steps(1) infinite; }
+.grad-statusline .state { font-weight: 700; letter-spacing: 0.14em; flex: 0 0 auto; }
+.grad-statusline .activity { opacity: 0.62; min-width: 0; overflow: hidden;
+                             white-space: nowrap; text-overflow: ellipsis; }
+.grad-statusline .clock { opacity: 0.62; flex: 0 0 auto; }
+/* The one part of the bar that is a control rather than a report, so it is the
+   one part drawn as one. */
+.grad-statusline .reasoning { flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
+                              padding: 1px 7px; letter-spacing: 0.08em; }
+.grad-chat.reasoning-on .grad-statusline .reasoning {
+    background: var(--grad-ink); color: var(--grad-paper); }
+
+/* Reasoning is drawn either way and painted only when it is switched on: a
+   toggle that rebuilt the transcript would take its scroll position with it,
+   which is the same reason the poll never touches this window. */
+.grad-reasoning { display: none; border: var(--grad-secondary); margin: 9px 14px 9px 37px;
+                  background: var(--grad-paper-sunk); }
+.grad-chat.reasoning-on .grad-reasoning { display: block; }
+.grad-reasoning > .head {
+    font-family: var(--grad-font-mono); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.14em; opacity: 0.5;
+    padding: 5px 10px 0;
+}
+.grad-reasoning > .body { padding: 4px 10px 9px; font-size: 12.5px; opacity: 0.72; }
+.grad-reasoning > .body > *:first-child { margin-top: 0; }
+.grad-reasoning > .body > *:last-child { margin-bottom: 0; }
 
 .grad-composer { border-top: var(--grad-border); background: var(--grad-paper-sunk);
                  padding: 10px 14px; flex: 0 0 auto; }
 .grad-composer .field { border: var(--grad-border); background: var(--grad-paper-raised); }
 .grad-mention { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.55; }
+
+/* Which conversation this is, and the opener for the rest of them. */
+.grad-session-btn {
+    font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
+    border: 1.5px solid var(--grad-ink); padding: 5px 9px;
+    max-width: 320px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
 """
 
 

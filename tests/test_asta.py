@@ -28,16 +28,47 @@ from core.errors import UpstreamError
 
 
 class FakeResponse:
+    """A streamed response, because that is what the client now opens.
+
+    `read()` and `iter_lines()` are the two halves of `httpx`'s streaming API the
+    client uses, and they are not interchangeable: the JSON path buffers, and the
+    event-stream path must *not*, because the server keeps the stream open after
+    answering. `lines` counts how far a test's reader actually got, which is what
+    makes "it stopped at the reply" assertable.
+    """
+
     def __init__(self, status_code=200, payload=None, text="", content_type="application/json",
-                 headers=None):
+                 headers=None, hang=False):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.text = text or (json.dumps(self._payload) if payload is not None else "")
         self.headers = {"content-type": content_type, **(headers or {})}
+        self.content = b""
+        #: A server that never closes the stream: `iter_lines` keeps yielding
+        #: keepalive comments after the body, the way Asta's does.
+        self.hang = hang
+        self.lines = 0
+
+    def read(self):
         self.content = self.text.encode()
+        return self.content
+
+    def iter_lines(self):
+        for line in self.text.splitlines():
+            self.lines += 1
+            yield line
+        while self.hang:
+            self.lines += 1
+            yield ": ping"
 
     def json(self):
         return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
 
 
 def rpc(result) -> dict:
@@ -58,8 +89,8 @@ def transport(monkeypatch):
 
     class FakeHttpx:
         @staticmethod
-        def post(url, json=None, headers=None, timeout=None):
-            posts.append({"url": url, "body": json, "headers": headers})
+        def stream(method, url, json=None, headers=None, timeout=None):
+            posts.append({"url": url, "method": method, "body": json, "headers": headers})
             if queue:
                 return queue.pop(0)
             return FakeResponse(payload=rpc({"protocolVersion": "2025-06-18"}))
@@ -438,12 +469,14 @@ def test_the_tier_one_selector_builds_the_clients_the_config_names(workspace):
     from tools import paper_search
 
     cfg = config_mod.load(reload=True)
+    assert [n for n, _ in paper_search.tier1_clients(cfg, "pwc")] == ["pwc"]
     assert [n for n, _ in paper_search.tier1_clients(cfg, "asta")] == ["asta"]
     assert [n for n, _ in paper_search.tier1_clients(cfg, "s2")] == ["s2"]
     assert [n for n, _ in paper_search.tier1_clients(cfg, "both")] == ["asta", "s2"]
+    assert [n for n, _ in paper_search.tier1_clients(cfg, "all")] == ["pwc", "asta", "s2"]
     assert paper_search.tier1_clients(cfg, "none") == []
     # The default, when nothing overrides it.
-    assert [n for n, _ in paper_search.tier1_clients(cfg)] == ["asta"]
+    assert [n for n, _ in paper_search.tier1_clients(cfg)] == ["pwc"]
 
 
 def test_an_unknown_tier_one_source_lists_the_real_ones(workspace):
@@ -452,4 +485,133 @@ def test_an_unknown_tier_one_source_lists_the_real_ones(workspace):
 
     with pytest.raises(UsageError) as exc:
         paper_search.tier1_clients(config_mod.load(reload=True), "scholar")
-    assert "asta" in (exc.value.fix or "")
+    assert "pwc" in (exc.value.fix or "")
+
+
+# ---------------------------------------------------------------------------
+# the stream that is held open -- why the funnel's first call never returned
+# ---------------------------------------------------------------------------
+def sse(*frames: dict) -> str:
+    return "".join(f"event: message\ndata: {json.dumps(f)}\n\n" for f in frames)
+
+
+def handshake(queue) -> None:
+    queue.append(FakeResponse(payload=rpc({"protocolVersion": "2025-06-18"})))
+    queue.append(FakeResponse(status_code=202, text=""))
+
+
+def test_the_read_stops_at_the_reply_rather_than_at_the_close(workspace, transport):
+    """The bug this closes. Asta answers `tools/call` with an event stream and
+    keeps it open afterwards, pinging every 15s. `httpx`'s timeout is per read,
+    so every ping reset it and a buffered read waited for a close the server
+    never promised -- the call did not fail, it never returned, and tier 1 was
+    simply unreachable with no error to go with it."""
+    _, queue = transport
+    handshake(queue)
+    # id 2: initialize was 1, and the notification between them carries none.
+    answer = FakeResponse(
+        text=sse(
+            {"jsonrpc": "2.0", "method": "notifications/progress", "params": {}},
+            rpc(tool_result({"data": [{"paperId": "p1", "title": "Attention"}]})) | {"id": 2},
+        ),
+        content_type="text/event-stream",
+        hang=True,
+    )
+    queue.append(answer)
+
+    rows = client().snippet_search("attention")
+    assert [r["title"] for r in rows] == ["Attention"]
+    assert answer.lines <= 8, "it kept reading past the answer it already had"
+
+
+def test_a_stream_that_never_answers_is_bounded_by_the_deadline(workspace, transport):
+    """`request_timeout_s` is per socket read and a keepalive resets it, so the
+    only thing that can bound this is a total deadline. A search that hangs is
+    worse than one that fails: nothing points at its own cause."""
+    from core import paths
+
+    config = paths.root() / "config" / "grad.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("[retrieval]\nrequest_deadline_s = -1\n", encoding="utf-8")
+
+    _, queue = transport
+    handshake(queue)
+    queue.append(FakeResponse(text="", content_type="text/event-stream", hang=True))
+
+    with pytest.raises(UpstreamError, match="deadline"):
+        client().snippet_search("attention")
+
+
+def test_the_deadline_message_names_the_key_that_moves_it(workspace, transport):
+    from core import paths
+
+    config = paths.root() / "config" / "grad.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("[retrieval]\nrequest_deadline_s = -1\n", encoding="utf-8")
+
+    _, queue = transport
+    handshake(queue)
+    queue.append(FakeResponse(text="", content_type="text/event-stream", hang=True))
+    with pytest.raises(UpstreamError) as exc:
+        client().snippet_search("attention")
+    assert "request_deadline_s" in (exc.value.fix or "")
+
+
+def test_relevance_search_sends_the_argument_that_tool_actually_takes(workspace, transport):
+    """`snippet_search` takes `query` and this one takes `keyword`, and sending
+    the wrong one is not a soft failure: the server answers in ~1s with a
+    pydantic validation error, so tier 1 lost this endpoint on every search
+    while snippet_search's slowness hid it."""
+    posts, queue = transport
+    handshake(queue)
+    queue.append(FakeResponse(payload=rpc(tool_result({"data": []}))))
+
+    client().paper_search("efficient optimizers", limit=7)
+    arguments = posts[-1]["body"]["params"]["arguments"]
+    assert arguments == {"keyword": "efficient optimizers", "limit": 7}
+
+
+def test_the_envelope_a_live_call_actually_uses_is_read(workspace, transport):
+    """`search_papers_by_relevance` answers `{"result": [...]}` -- singular, and
+    a key this did not know. Every hit was thrown away as an unrecognised
+    envelope, so tier 1 found nothing even once the argument name was right, and
+    the funnel raised rather than returning them.
+
+    Not the JSON-RPC `result`: by the time `_rows` runs, the RPC envelope and the
+    tool's content block are both already unwrapped. They are only spelled the
+    same."""
+    rows = call_with(workspace, transport, {"result": [
+        {"paperId": "sha-1", "title": "Memory Efficient Optimizers with 4-bit States"},
+    ]})
+    assert [r["id"] for r in rows] == ["s2:sha-1"]
+    assert rows[0]["title"].startswith("Memory Efficient")
+
+
+def test_a_still_unrecognised_envelope_names_the_keys_it_knows(workspace, transport):
+    from core import http as http_mod
+
+    assert "result" in http_mod.ROW_KEYS
+    with pytest.raises(UpstreamError, match="no recognisable list"):
+        call_with(workspace, transport, {"payload": {"hits": []}})
+
+
+def test_a_limit_above_what_the_service_accepts_is_clamped(workspace, transport):
+    """*"The limit parameter must be between 1 and 100 inclusive."* The funnel
+    divides its candidate ceiling across the expanded queries, so skipping stage
+    0 asks for six times as many per call -- and `--no-expand` therefore refused
+    every tier-1 call with a validation error. Raising `--candidates` should not
+    be a way to get zero results."""
+    posts, queue = transport
+    handshake(queue)
+    queue.append(FakeResponse(payload=rpc(tool_result({"result": []}))))
+
+    client().paper_search("efficient optimizers", limit=150)
+    assert posts[-1]["body"]["params"]["arguments"]["limit"] == http.MAX_LIMIT
+
+
+def test_a_nonsense_limit_becomes_a_usable_one_rather_than_a_refusal(workspace, transport):
+    posts, queue = transport
+    handshake(queue)
+    queue.append(FakeResponse(payload=rpc(tool_result({"result": []}))))
+    client().snippet_search("attention", limit=0)
+    assert posts[-1]["body"]["params"]["arguments"]["limit"] == 1

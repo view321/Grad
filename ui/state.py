@@ -95,7 +95,11 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
     "preflight": lambda w: models.preflight_model(),
     "funnel": lambda w: models.funnel_model(w.selection.get("funnel.trace")),
     "queue": lambda w: models.queue_model(),
-    "tasks": lambda w: models.tasks_model(),
+    # The agent's own calls are read from the live session rather than from a
+    # file, so they are passed in: `ui/models.py` never reaches for the session,
+    # and the tasks window is the one place that wants both halves of "what is
+    # running on this machine right now".
+    "tasks": lambda w: models.tasks_model(agent=models.agent_calls_model(w.session)),
 }
 
 
@@ -134,6 +138,11 @@ class Workspace:
         self.models: dict[str, Any] = {}
         self.selection: dict[str, Any] = {}
         self.notice: str | None = None
+        #: Whether the agent's reasoning is on screen. Kept here rather than in
+        #: the chat window's closure so it survives the window being redrawn --
+        #: switching session rebuilds that closure, and a display preference that
+        #: silently reset itself would read as the toggle having broken.
+        self.show_reasoning = False
         #: Set by the chat window once it is built. A gate card in the
         #: transcript needs to send the approval back into the same session, and
         #: routing it through here keeps the gate card from having to reach into
@@ -460,12 +469,29 @@ class Workspace:
         could say "AGENT PAUSED" while tokens were still streaming. Interrupting
         is the thing the SDK can actually do, and `Session.interrupt` is already
         the tested path for it -- Escape and the chat window's own button use it.
+
+        What it *says* comes from the session rather than from here, because only
+        the session knows which of the three answers applies: nothing was
+        running, an interrupt is already in flight, or one has just been asked
+        for. The line used to be a fixed "interrupting the turn…" printed
+        whatever happened, which is how a refused interrupt looked like a
+        successful one.
         """
         session = self.session
-        if session is None or not getattr(session, "busy", False):
+        if session is None:
             return
-        session.interrupt()
-        self.say("interrupting the turn…")
+        self.say(session.interrupt())
+
+    def toggle_reasoning(self) -> bool:
+        """Show or hide the agent's reasoning. Returns the new state.
+
+        No redraw: the blocks are always in the DOM and a class on the chat root
+        decides whether they are drawn. Rebuilding the transcript to hide a block
+        would cost its scroll position, which is the same reason the poll never
+        touches this window.
+        """
+        self.show_reasoning = not self.show_reasoning
+        return self.show_reasoning
 
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""
