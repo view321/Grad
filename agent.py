@@ -57,7 +57,16 @@ def system_prompt() -> str:
     return (paths.root() / "prompts" / "system.md").read_text(encoding="utf-8")
 
 
-def build_options(cfg: Any, *, permission_mode: str | None = None) -> Any:
+def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str | None = None) -> Any:
+    """The options one session runs under.
+
+    `resume` is an SDK session id, and passing it is the difference between
+    reopening a transcript and reopening a *conversation*: without it the model
+    starts with no memory of the turns the window is showing above the composer,
+    which is a worse failure than not resuming at all because nothing on screen
+    says so. `ui/sessions.py` records the id and reports when it does not have
+    one.
+    """
     sdk = _sdk()
     mode = permission_mode or str(cfg.get("agent", "permission_mode", "dontAsk"))
     hook_matchers = {
@@ -65,6 +74,7 @@ def build_options(cfg: Any, *, permission_mode: str | None = None) -> Any:
         "Stop": [sdk.HookMatcher(hooks=[hooks.stop])],
     }
     return sdk.ClaudeAgentOptions(
+        resume=resume,
         model=cfg.model_for("research"),
         system_prompt=system_prompt(),
         allowed_tools=BUILTIN_TOOLS,
@@ -194,10 +204,11 @@ async def _turn(client: Any, prompt: str) -> bool:
         return False
 
     await client.query(prompt)
-    stream = TextStream()
+    stream = TurnStream()
     async for message in client.receive_response():
-        # Whatever has not been printed yet -- a token as it arrives, or the
-        # tail of a message that was never streamed. Never both.
+        # Whatever has not been printed yet -- a token as it arrives, the tail
+        # of a message that was never streamed, or a line naming a tool call.
+        # Never both halves of the same text.
         chunk = stream.feed(message)
         if chunk:
             print(chunk, end="", flush=True)
@@ -287,6 +298,250 @@ class TextStream:
             unseen = ""
         self._streamed = ""
         return unseen
+
+
+# ---------------------------------------------------------------------------
+# tool calls
+# ---------------------------------------------------------------------------
+#: What one call contributes to a transcript, at most. A `Read` of a long file
+#: or a training log is tens of thousands of characters, and every one of them
+#: would be held for the life of the session, written to the transcript file on
+#: settle, and drawn again on restore. A card is a record that the call happened
+#: and how it went, not a second copy of its output.
+RESULT_CHARS = 2000
+RESULT_LINES = 40
+
+#: Which input key says what a call was *on*. Anything not listed here falls
+#: back to `SUBJECT_KEYS`, then to the first short string in the input -- an
+#: `Edit` carries its whole replacement text, and a card head that is a wall of
+#: source is worse than one that is empty.
+TOOL_SUBJECT = {
+    "Bash": "command",
+    "Read": "file_path",
+    "Write": "file_path",
+    "Edit": "file_path",
+    "Glob": "pattern",
+    "Grep": "pattern",
+}
+SUBJECT_KEYS = ("command", "file_path", "path", "pattern", "query", "url", "prompt")
+
+#: Per-row limits for the rest of a call's input. Six rows of two lines is a
+#: card you can read at a glance; the whole input is not.
+ROW_CHARS = 200
+ROW_LINES = 2
+MAX_ROWS = 6
+
+
+def clip(text: str, *, chars: int = RESULT_CHARS, lines: int = RESULT_LINES) -> str:
+    """`text`, bounded -- and saying what it dropped rather than trailing off.
+
+    ASCII on purpose: this can reach a Windows console, where a stray `…` is a
+    `UnicodeEncodeError` that would take the turn down.
+    """
+    if not text:
+        return ""
+    split = text.splitlines()
+    dropped_lines = max(0, len(split) - lines)
+    out = "\n".join(split[:lines])
+    dropped_chars = max(0, len(out) - chars)
+    out = out[:chars]
+    if dropped_chars:
+        out += f"\n... +{dropped_chars:,} more characters"
+    if dropped_lines:
+        out += f"\n... +{dropped_lines:,} more lines"
+    return out
+
+
+def _one_line(text: str, limit: int = 120) -> str:
+    """A subject collapsed onto one line, for a card head."""
+    flattened = " ".join(str(text).split())
+    return flattened if len(flattened) <= limit else flattened[: limit - 3] + "..."
+
+
+def describe_tool(name: str, tool_input: dict[str, Any]) -> tuple[str, str]:
+    """`(subject_key, subject)` -- what this call was on, and under which key."""
+    keys = (TOOL_SUBJECT[name],) if name in TOOL_SUBJECT else SUBJECT_KEYS
+    for key in keys:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return key, value
+    for key, value in tool_input.items():
+        if isinstance(value, str) and value.strip() and len(value) <= ROW_CHARS:
+            return key, value
+    return "", ""
+
+
+def _content_blocks(message: Any) -> list[Any]:
+    content = getattr(message, "content", None)
+    return content if isinstance(content, list) else []
+
+
+def _tool_uses(message: Any) -> list[dict[str, Any]]:
+    """Every `ToolUseBlock` in a finished message, as plain data.
+
+    Duck-typed rather than isinstance-checked so `ServerToolUseBlock` -- a tool
+    the API runs on the model's behalf -- draws the same card, and so this file
+    keeps working if the SDK renames a class.
+    """
+    uses: list[dict[str, Any]] = []
+    for block in _content_blocks(message):
+        name = getattr(block, "name", None)
+        tool_input = getattr(block, "input", None)
+        identifier = getattr(block, "id", None)
+        if isinstance(name, str) and isinstance(tool_input, dict) and isinstance(identifier, str):
+            uses.append({"id": identifier, "name": name, "input": tool_input})
+    return uses
+
+
+def _tool_results(message: Any) -> list[dict[str, Any]]:
+    """Every `ToolResultBlock`. These arrive on a `UserMessage`, not on the
+    assistant's -- the tool ran on this side of the wire and is reporting back."""
+    results: list[dict[str, Any]] = []
+    for block in _content_blocks(message):
+        identifier = getattr(block, "tool_use_id", None)
+        if not isinstance(identifier, str):
+            continue
+        results.append(
+            {
+                "id": identifier,
+                "text": _result_text(getattr(block, "content", None)),
+                "is_error": bool(getattr(block, "is_error", False)),
+            }
+        )
+    return results
+
+
+def _result_text(content: Any) -> str:
+    """A result's content, which is a string, a list of blocks, or nothing."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                parts.append(text if isinstance(text, str) else json.dumps(item, default=str))
+            else:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def tool_block(use: dict[str, Any]) -> dict[str, Any]:
+    """One tool card, before its result lands."""
+    tool_input = use["input"]
+    subject_key, subject = describe_tool(use["name"], tool_input)
+    rows = [
+        (key, clip(str(value), chars=ROW_CHARS, lines=ROW_LINES))
+        for key, value in tool_input.items()
+        if key != subject_key
+    ]
+    return {
+        "kind": "tool",
+        "id": use["id"],
+        "name": use["name"],
+        "title": _one_line(subject),
+        "text": clip(subject, chars=600, lines=12),
+        "rows": rows[:MAX_ROWS],
+        "status": "running",
+        "result": "",
+    }
+
+
+class TurnStream:
+    """One turn as an ordered list of blocks: prose, and the tool calls between.
+
+    `TextStream` answers what the agent *said*; this answers what it *did*, and
+    that was the larger half of most turns here -- every capability in this
+    project is reached by a `Bash` into `tools/`, and none of it was visible. A
+    turn that ran six commands and then summarised them arrived as the summary
+    alone, which is exactly the part you cannot check.
+
+    A turn is kept as blocks rather than as one string because **the order is
+    the information**: which command ran before which claim. So a run of prose
+    is cut at each tool call, and `blocks` reads top to bottom as the turn
+    happened. Text assembly is delegated to `TextStream` unchanged, including
+    its rule that a finished message replaces the deltas that built it.
+
+    `feed` returns what a CLI should print next; a UI re-renders from `blocks`.
+    """
+
+    def __init__(self) -> None:
+        self.blocks: list[dict[str, Any]] = []
+        self._text = TextStream()
+        #: The block the current run of prose is accumulating into, if open.
+        self._open: dict[str, Any] | None = None
+        #: Tool blocks by call id, so a result can find the call it answers.
+        self._calls: dict[str, dict[str, Any]] = {}
+
+    @property
+    def text(self) -> str:
+        """The turn's prose, tool cards left out -- what a plain transcript says."""
+        return "".join(b["text"] for b in self.blocks if b["kind"] == "text")
+
+    def feed(self, message: Any) -> str:
+        printed = self._feed_text(message)
+        for use in _tool_uses(message):
+            block = tool_block(use)
+            self.blocks.append(block)
+            self._calls[block["id"]] = block
+            # A tool call ends the run of prose above it: whatever the agent says
+            # next belongs *below* the card, because that is when it said it.
+            self._text = TextStream()
+            self._open = None
+            printed += _tool_line(block)
+        for result in _tool_results(message):
+            block = self._calls.get(result["id"])
+            if block is None:
+                # A result for a call this stream never saw -- a turn resumed
+                # from cache, a subagent's tool. Nothing to attach it to, and
+                # inventing a card for it would claim an order we do not know.
+                continue
+            block["result"] = clip(result["text"])
+            block["status"] = "error" if result["is_error"] else "ok"
+            printed += _result_line(block)
+        return printed
+
+    def note(self, text: str) -> None:
+        """Append text the session itself has to say -- that a turn died, say."""
+        if not text:
+            return
+        self._text = TextStream()
+        self._open = {"kind": "text", "text": text}
+        self.blocks.append(self._open)
+
+    def active(self) -> dict[str, Any] | None:
+        """The call currently in flight, for a status line to name."""
+        for block in reversed(self.blocks):
+            if block["kind"] == "tool" and block["status"] == "running":
+                return block
+        return None
+
+    def _feed_text(self, message: Any) -> str:
+        chunk = self._text.feed(message)
+        # Synced from `TextStream.text`, never `+=`: a finished message may
+        # rewrite the tail its own deltas built, and the block has to follow.
+        if self._text.text:
+            if self._open is None:
+                self._open = {"kind": "text", "text": ""}
+                self.blocks.append(self._open)
+            self._open["text"] = self._text.text
+        return chunk
+
+
+def _tool_line(block: dict[str, Any]) -> str:
+    subject = f" {block['title']}" if block["title"] else ""
+    return f"\n[tool] {block['name']}{subject}\n"
+
+
+def _result_line(block: dict[str, Any]) -> str:
+    if block["status"] == "error":
+        first = next((line for line in block["result"].splitlines() if line.strip()), "failed")
+        return f"[tool] {block['name']} failed: {_one_line(first, 160)}\n"
+    lines = len(block["result"].splitlines())
+    return f"[tool] {block['name']} ok ({lines} line{'' if lines == 1 else 's'})\n"
 
 
 # ---------------------------------------------------------------------------

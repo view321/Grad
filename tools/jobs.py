@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -680,12 +681,19 @@ CREDENTIAL_NAMES = (
     credentials.VOYAGE_KEY,
     credentials.S2_KEY,
     credentials.CONTEXT7_KEY,
+    credentials.CLAUDE_TOKEN,
+    credentials.ASTA_KEY,
 )
 
 
 def _credential_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("action", choices=["status", "set", "delete"])
     p.add_argument("name", nargs="?", help=f"one of: {', '.join(CREDENTIAL_NAMES)}")
+    p.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read the value from stdin rather than prompting (for the workspace UI)",
+    )
 
 
 @cli.command("credential", "inspect or set stored credentials (values are never printed)", setup=_credential_args)
@@ -710,9 +718,23 @@ def cmd_credential(args: argparse.Namespace) -> dict[str, Any]:
     if args.action == "delete":
         credentials.delete(args.name)
         return {"deleted": args.name}
-    import getpass
+    if args.name not in CREDENTIAL_NAMES:
+        raise UsageError(
+            f"unknown credential {args.name!r}",
+            fix=f"one of: {', '.join(CREDENTIAL_NAMES)}",
+        )
 
-    value = getpass.getpass(f"value for {args.name} (not echoed): ")
+    if args.stdin:
+        # A pipe, not an argument. The value is a token, and an argv is visible
+        # to anything that can list processes -- which on a shared machine is
+        # everything. `getpass` is the same guarantee for a human at a terminal;
+        # this is the guarantee for a caller that has no terminal to prompt at,
+        # which is what the workspace's credential panel is.
+        value = sys.stdin.read().strip()
+    else:
+        import getpass
+
+        value = getpass.getpass(f"value for {args.name} (not echoed): ")
     if not value:
         raise UsageError("empty value", fix="run it again and paste the token")
     credentials.set_(args.name, value)

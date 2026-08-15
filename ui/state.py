@@ -22,12 +22,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 from pathlib import Path
 from typing import Any, Callable
 
 from core import jsonl, paths
 from ui import layout as layout_mod, models, registry
+from ui.tasks import envelope_message, run_tool
 
 log = logging.getLogger("grad.ui")
 
@@ -95,6 +95,7 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
     "preflight": lambda w: models.preflight_model(),
     "funnel": lambda w: models.funnel_model(w.selection.get("funnel.trace")),
     "queue": lambda w: models.queue_model(),
+    "tasks": lambda w: models.tasks_model(),
 }
 
 
@@ -327,8 +328,62 @@ class Workspace:
         if payload.get("ok"):
             self.reload()
 
+    async def run_and_reload(self, *argv: str) -> None:
+        """Run a CLI, report it, and re-read everything derived from it.
+
+        For the buttons that change what the *whole workspace* is looking at --
+        a ceiling moved, a project created -- as opposed to one window's data,
+        which `invalidate` covers more cheaply.
+        """
+        payload = await run_tool(*argv)
+        self.say(envelope_message(payload))
+        if payload.get("ok"):
+            self.reload()
+
     def workspaces(self) -> dict[str, Any]:
         return models.workspaces_model()
+
+    def credentials(self) -> dict[str, Any]:
+        return models.credentials_model()
+
+    def sessions(self) -> dict[str, Any]:
+        return models.sessions_model(getattr(self.session, "session_id", None))
+
+    def rebuild_chat(self) -> None:
+        """Redraw the chat window, which the poll deliberately never touches.
+
+        Its state is the live session rather than a file, so a redraw costs the
+        transcript's scroll position -- which is exactly why the poll leaves it
+        alone. Switching session replaces the transcript wholesale, so here that
+        cost is the entire point.
+        """
+        redraw = self._redraw.get("chat")
+        if redraw is not None:
+            _guard(redraw, "chat")
+        for redraw in self._chrome:
+            _guard(redraw, "chrome")
+
+    async def set_credential(self, name: str, value: str) -> None:
+        """Store one credential, down a pipe rather than as an argument.
+
+        The same command the README tells you to run, with `--stdin` instead of
+        the `getpass` prompt -- because the prompt needs a terminal, and needing
+        a terminal for this was the only thing that forced one open beside the
+        app on a fresh machine.
+        """
+        if not value.strip():
+            self.say("nothing to store — paste the token first")
+            return
+        payload = await run_tool(
+            "tools.jobs", "credential", "set", name, "--stdin", "--json", stdin=value
+        )
+        # `envelope_message` and nothing else: the CLI never prints a value, and
+        # neither does this, but the notice is worth being explicit about.
+        self.say(f"{name}: {envelope_message(payload)}")
+
+    async def delete_credential(self, name: str) -> None:
+        payload = await run_tool("tools.jobs", "credential", "delete", name, "--json")
+        self.say(f"{name}: {envelope_message(payload)}")
 
     # -- selections ---------------------------------------------------------
     def select(self, key: str, value: Any, *, window: str | None = None) -> None:
@@ -405,55 +460,7 @@ def _guard(fn: Callable[[], None], what: str) -> None:
         log.exception("redraw of %s failed", what)
 
 
-# ---------------------------------------------------------------------------
-# running the CLIs the buttons are bound to
-# ---------------------------------------------------------------------------
-async def run_tool(*argv: str, timeout: float = 900.0) -> dict[str, Any]:
-    """Run one of Grad's own CLIs and parse its JSON envelope.
-
-    Every button in the UI that *does* something does it by shelling out to the
-    same command the agent would run, with `--json`. That is deliberate: it
-    keeps the UI free of logic (§10), and it means anything the UI can do is
-    reproducible from a terminal and shows up in the same ledgers.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        *argv,
-        cwd=str(paths.root()),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return {"ok": False, "error": {"message": f"timed out after {timeout:.0f}s"}}
-
-    stdout = (out or b"").decode("utf-8", "replace").strip()
-    stderr = (err or b"").decode("utf-8", "replace").strip()
-    for line in reversed(stdout.splitlines()):
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return {
-        "ok": False,
-        "error": {"message": (stderr or stdout or "the command produced no output")[-2000:]},
-    }
-
-
-def envelope_message(payload: dict[str, Any]) -> str:
-    """The one line a status bar should show for a CLI result."""
-    if payload.get("ok"):
-        data = payload.get("data")
-        if isinstance(data, dict) and data.get("message"):
-            return str(data["message"])
-        return "done"
-    error = payload.get("error") or {}
-    message = error.get("message") or "the command failed"
-    fix = error.get("fix")
-    return f"{message}" + (f" — fix: {fix}" if fix else "")
+# `run_tool` and `envelope_message` moved to `ui/tasks.py`, next to `start` --
+# the two are the same decision made twice ("wait for this command" against
+# "watch it"), and having them in one module is what keeps the timeout on the
+# waiting one from being applied to something that should never have had one.

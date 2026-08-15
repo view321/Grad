@@ -19,6 +19,8 @@ without pywebview is a test suite that stops being run.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 pytest.importorskip("nicegui", reason="the ui extra is not installed")
@@ -34,13 +36,24 @@ class FakeSession:
     `Session.start` only runs on the first `ask`, so a render touches nothing."""
 
     busy = False
-    buffer = ""
 
     def __init__(self) -> None:
-        self.settled: list[dict[str, str]] = []
+        self.settled: list[dict[str, Any]] = []
+        self.blocks: list[dict[str, Any]] = []
+        self.session_id = "default"
+        self.title = ""
+        self.sdk_session_id: str | None = None
 
     def interrupt(self) -> None:
         pass
+
+    async def open_session(self, session_id: str) -> str:
+        self.session_id = session_id
+        return f"opened {session_id}"
+
+    async def new_session(self, title: str = "") -> str:
+        self.session_id = "fresh"
+        return "new session"
 
 
 @pytest.fixture
@@ -108,13 +121,77 @@ def test_a_window_whose_render_raises_does_not_take_the_shell_down(rendered, mon
 # ---------------------------------------------------------------------------
 # the chrome reflects the layout
 # ---------------------------------------------------------------------------
-def test_the_opener_marks_open_windows(rendered):
+def _open_window_menu(client: Client, space):
+    """The `⋯` menu, drawn. Its body is built on open rather than at build time,
+    for the same reason the project menu's is: a toggle makes the list it was
+    read from stale."""
+    from nicegui import ui as nicegui_ui
+
+    with client:
+        menu = shell._windows_menu(nicegui_ui, space)  # noqa: SLF001 - no public hook
+        menu.open()
+    return menu
+
+
+def _menu_rows(client: Client) -> list:
+    return [e for e in client.elements.values() if "grad-menu-row" in getattr(e, "classes", [])]
+
+
+def _menu_row(client: Client, window_id: str):
+    """One window's row, found by the hint it carries as a tooltip."""
+    from ui import kit
+
+    wanted = kit.attr(registry.spec(window_id).hint)
+    for element in _menu_rows(client):
+        if element.props.get("title") == wanted:
+            return element
+    raise AssertionError(f"no menu row for {window_id!r}")
+
+
+def test_the_window_menu_marks_what_is_open(rendered):
+    """The `⋯` menu replaced a permanent strip of eleven names and a `⌘K`
+    palette that listed the same eleven. It is the only opener now, so it is the
+    only place the open/closed state appears."""
     client, space = rendered(["chat"])
-    opener_cells = [
-        e for e in client.elements.values() if "grad-opener-cell" in getattr(e, "classes", [])
-    ]
-    assert len(opener_cells) == len(registry.ids())
-    assert len([c for c in opener_cells if "open" in c.classes]) == 1
+    _open_window_menu(client, space)
+
+    rows = _menu_rows(client)
+    assert len(rows) == len(registry.ids()) + len(shell.PRESET_ROWS)
+    assert [r.props.get("title") for r in rows].count(None) == 0
+    assert len([r for r in rows if "open" in r.classes]) == 1
+    assert "open" in _menu_row(client, "chat").classes
+
+
+def test_the_window_menu_toggles_in_place_rather_than_closing(rendered):
+    """Opening three windows is three clicks. A menu that dismissed itself after
+    each one would be three trips back to the same button."""
+    client, space = rendered(["chat"])
+    _open_window_menu(client, space)
+
+    click(_menu_row(client, "ledger"))
+    assert "ledger" in space.layout.windows
+    # Redrawn in place, so the mark beside the row is no longer stale.
+    assert "open" in _menu_row(client, "ledger").classes
+
+    click(_menu_row(client, "ledger"))
+    assert "ledger" not in space.layout.windows
+    assert "open" not in _menu_row(client, "ledger").classes
+
+
+def test_a_quote_in_a_tooltip_cannot_truncate_the_props_string(rendered):
+    """`props('title="…")` is parsed by NiceGUI, so a `"` in the value ends it
+    early and silently drops whatever came after. Ledger text reaches these --
+    a preflight remedy, a candidate id -- so it goes through `kit.attr`."""
+    from ui import kit
+
+    client, _ = rendered(["chat"])
+    with client:
+        element = kit.button("FIX", title='run --note "see below"\nand retry')
+
+    # One line, and no double quote left to close the attribute early.
+    assert '"' not in element.props["title"]
+    assert "\n" not in element.props["title"]
+    assert "see below" in element.props["title"]
 
 
 def test_a_handle_sits_between_every_pair_of_columns(rendered):
@@ -177,8 +254,14 @@ def test_a_verify_flips_the_notebook_chip_without_a_retile(rendered):
 
 
 def click(element) -> None:
-    """Invoke an element's click handlers, the way the browser would."""
-    for listener in element._event_listeners.values():  # noqa: SLF001 - no public hook
+    """Invoke an element's click handlers, the way the browser would.
+
+    Snapshotted first: a handler may rebuild the subtree it was clicked in --
+    the `⋯` menu redraws itself after a toggle -- and deleting the element
+    mutates the dict this is walking. The browser has the same freedom because
+    it dispatches by id rather than by iterating.
+    """
+    for listener in list(element._event_listeners.values()):  # noqa: SLF001 - no public hook
         if listener.type == "click" and listener.handler is not None:
             listener.handler()
 
@@ -222,6 +305,136 @@ def test_answering_a_gate_sends_the_decision_into_the_session(rendered):
     click(find_button(client, "DENY"))
     assert space.agent_state == "running"
     assert sent and "denied" in sent[0]
+
+
+# ---------------------------------------------------------------------------
+# the calls the agent made
+# ---------------------------------------------------------------------------
+def test_a_settled_turn_draws_a_card_for_every_call_it_made(rendered):
+    """What the transcript is for: a command the agent ran and a command it
+    only claimed to run must not look alike."""
+    client, space = rendered(["chat"])
+    with client:
+        from ui.windows.chat import _message
+
+        _message(
+            {
+                "role": "assistant",
+                "text": "Checking.",
+                "blocks": [
+                    {"kind": "text", "text": "Checking."},
+                    {"kind": "tool", "name": "Bash", "title": "python -m tools.ledger show",
+                     "text": "python -m tools.ledger show", "rows": [],
+                     "status": "ok", "result": "3 expectations"},
+                    {"kind": "tool", "name": "Bash", "title": "ssh probe-host", "text": "ssh probe-host",
+                     "rows": [], "status": "error", "result": "denied by the gate"},
+                ],
+            },
+            space,
+        )
+
+    markup = html_of(client)
+    assert markup.count("grad-card tool") == 2
+    assert "python -m tools.ledger show" in markup
+    assert "3 expectations" in markup
+    assert "OK" in markup and "ERROR" in markup
+
+
+def test_the_turn_in_flight_scrolls_with_the_transcript(rendered):
+    """The tail has to be *inside* the scrolling region. As a sibling below it
+    the tail grows without bound, so a turn with three tool cards scrolls
+    `.grad-body` instead and paints over the composer."""
+    client, _ = rendered(["chat"])
+    scroller = _by_id(client, "grad-transcript")
+    tail = _by_id(client, "grad-tail")
+    assert scroller in _ancestors(tail)
+    assert scroller._style.get("overflow-y") == "auto"  # noqa: SLF001 - no public accessor
+
+
+def _by_id(client: Client, element_id: str):
+    for element in client.elements.values():
+        if element.props.get("id") == element_id:
+            return element
+    raise AssertionError(f"no element with id {element_id!r}")
+
+
+def _ancestors(element) -> list:
+    """Every element between this one and the page root."""
+    out = []
+    slot = element.parent_slot
+    while slot is not None:
+        out.append(slot.parent)
+        slot = slot.parent.parent_slot
+    return out
+
+
+def test_a_turn_with_no_blocks_still_draws_as_prose(rendered):
+    """Transcripts written before the calls were captured have no `blocks`, and
+    a user's own message never will."""
+    client, space = rendered(["chat"])
+    with client:
+        from ui.windows.chat import _message
+
+        _message({"role": "assistant", "text": "GATE — YOUR CALL\ncost: $18.40\n"}, space)
+
+    assert "GATE" in html_of(client)
+
+
+def test_the_tail_appends_a_card_rather_than_redrawing_the_turn(rendered):
+    """The split-tail rule, extended: prose already in the tail must not be
+    rebuilt 15 times a second just because a call landed under it."""
+    client, space = rendered(["chat"])
+    with client:
+        from ui.windows import chat as chat_window
+
+        tail = chat_window._Tail(chat_window.kit.column("", gap=0))
+        tail.sync([{"kind": "text", "text": "Checking."}])
+        prose = tail._drawn[0]["body"].id
+        tail.sync([
+            {"kind": "text", "text": "Checking."},
+            {"kind": "tool", "name": "Bash", "title": "ls", "text": "ls", "rows": [],
+             "status": "running", "result": ""},
+        ])
+        assert tail._drawn[0]["body"].id == prose      # the prose element is the same one
+        assert "RUNNING" in html_of(client)
+
+        # ... and the same card is repainted in place when the result lands.
+        card = tail._drawn[1]["state"].id
+        tail.sync([
+            {"kind": "text", "text": "Checking."},
+            {"kind": "tool", "name": "Bash", "title": "ls", "text": "ls", "rows": [],
+             "status": "ok", "result": "budget.py"},
+        ])
+        assert tail._drawn[1]["state"].id == card
+        markup = html_of(client)
+        assert "RUNNING" not in markup
+        assert "budget.py" in markup
+
+
+def test_a_new_turn_clears_the_tail_rather_than_stacking_onto_it(rendered):
+    client, space = rendered(["chat"])
+    with client:
+        from ui.windows import chat as chat_window
+
+        tail = chat_window._Tail(chat_window.kit.column("", gap=0))
+        tail.sync([{"kind": "text", "text": "the first turn"}])
+        tail.sync([])                                   # settled: the tail was promoted
+        assert tail._drawn == []
+        tail.sync([{"kind": "text", "text": "the second turn"}])
+        assert len(tail._drawn) == 1
+        assert "the first turn" not in html_of(client)
+
+
+def test_the_status_line_names_the_call_in_flight(rendered):
+    """A spinner says something is happening; naming the command says a
+    40-minute job is running and which one."""
+    from ui.windows.chat import _activity
+
+    assert _activity([]) == "running …"
+    assert _activity([
+        {"kind": "tool", "name": "Bash", "title": "python -m tools.jobs run", "status": "running"},
+    ]) == "running Bash python -m tools.jobs run"
+    assert _activity([{"kind": "tool", "name": "Bash", "title": "ls", "status": "ok"}]) == "running …"
 
 
 def test_the_focused_window_is_marked(rendered):
@@ -341,7 +554,7 @@ def test_the_project_menu_lists_the_folder_and_its_projects(rendered):
     # read from stale, so it is rebuilt each time.
     with client:
         shell_mod._draw_project_menu(  # noqa: SLF001 - no public hook
-            __import__("nicegui").ui, space, menu[0], _NullDialog()
+            __import__("nicegui").ui, space, menu[0], _NullMenu()
         )
     markup = html_of(client)
     assert "proj-a" in markup
@@ -349,9 +562,67 @@ def test_the_project_menu_lists_the_folder_and_its_projects(rendered):
     assert "WORKSPACE" in markup
 
 
-class _NullDialog:
+class _NullMenu:
     def close(self) -> None:
         pass
+
+    def redraw(self) -> None:
+        pass
+
+
+def test_the_workspace_menu_can_store_a_credential_without_a_terminal(rendered, monkeypatch):
+    """The one thing the workspace could not do. `credential set` prompts with
+    `getpass`, which needs a terminal -- so a fresh machine needed a shell open
+    beside the app before the app was usable."""
+    from core import budget as budget_mod
+    from ui import shell as shell_mod, tasks as tasks_mod
+
+    calls: list[dict] = []
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        calls.append({"argv": argv, "stdin": stdin})
+        return {"ok": True, "data": {"message": "stored"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+
+    budget_mod.create("proj-a", title="A", budget={})
+    budget_mod.set_current("proj-a")
+    client, space = rendered(["chat"])
+    card = [e for e in client.elements.values() if "grad-card" in getattr(e, "classes", [])][0]
+    with client:
+        shell_mod._draw_project_menu(  # noqa: SLF001 - no public hook
+            __import__("nicegui").ui, space, card, _NullMenu()
+        )
+
+    assert "CREDENTIALS" in html_of(client)
+    import asyncio
+
+    asyncio.run(space.set_credential("hf_token", "hf_the-actual-token"))
+
+    assert calls, "no command was run"
+    argv, stdin = calls[0]["argv"], calls[0]["stdin"]
+    # Down a pipe, never in an argument: an argv is visible to anything that can
+    # list processes.
+    assert stdin == "hf_the-actual-token"
+    assert "--stdin" in argv
+    assert not any("hf_the-actual-token" in part for part in argv)
+
+
+def test_an_empty_credential_is_refused_before_a_command_runs(rendered, monkeypatch):
+    from ui import tasks as tasks_mod
+
+    async def explode(*argv, **kwargs):
+        raise AssertionError("a command ran for an empty value")
+
+    monkeypatch.setattr("ui.state.run_tool", explode)
+    monkeypatch.setattr(tasks_mod, "run_tool", explode)
+
+    _, space = rendered(["chat"])
+    import asyncio
+
+    asyncio.run(space.set_credential("hf_token", "   "))
+    assert "nothing to store" in (space.notice or "")
 
 
 def test_the_folder_picker_argument_survives_a_process_boundary():

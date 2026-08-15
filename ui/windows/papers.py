@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
+from ui.tasks import start, task_message
 
 FILTERS = (("cited", "CITED IN PAPER"), ("read", "READ"), ("queued", "QUEUED"))
 
@@ -28,9 +29,51 @@ def subtitle(workspace: Any) -> str:
     return f"{counts.get('cited', 0)} cited · {counts.get('read', 0)} read · {counts.get('queued', 0)} queued"
 
 
+def _ingest(workspace: Any) -> None:
+    """Pull an arXiv paper's LaTeX source into the local index.
+
+    Tier 2 is the half of retrieval that answers "where did I see that lemma",
+    and it only holds what has been ingested -- so this is the control that
+    makes the local index grow. A background task: it fetches a source tarball,
+    chunks it section by section and embeds the chunks.
+    """
+    from nicegui import ui
+
+    def settled(task: Any) -> None:
+        workspace.say(task_message(task))
+        workspace.invalidate("papers")
+        workspace.tick()
+
+    def run() -> None:
+        arxiv_id = (entry.value or "").strip()
+        if not arxiv_id:
+            return
+        entry.value = ""
+        start(
+            f"ingest {arxiv_id}",
+            "tools.paper_ingest", "arxiv", arxiv_id, "--json",
+            on_done=settled,
+        )
+        workspace.say(f"ingesting {arxiv_id} — see the tasks window")
+        workspace.invalidate("tasks")
+        workspace.tick()
+
+    with kit.row("grad-pad", gap=6).style("border-bottom: var(--grad-border)"):
+        entry = (
+            ui.input(placeholder="arXiv id, e.g. 2001.08361")
+            .props("borderless dense")
+            .classes("field")
+            .style("flex: 0 0 240px; padding: 0 8px")
+        )
+        entry.on("keydown.enter.prevent", run)
+        kit.button("INGEST ⏎", tone="primary", on_click=run)
+        kit.spacer()
+
+
 def render(workspace: Any) -> None:
     model = workspace.model("papers") or {}
     kit.error_strip(model.get("error"))
+    _ingest(workspace)
     if not model.get("all"):
         kit.empty("No papers ingested yet.", model.get("empty_fix"))
         return

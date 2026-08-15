@@ -31,6 +31,26 @@ S2_KEY = "s2_api_key"
 # optional and says so when it is missing.
 CONTEXT7_KEY = "context7_key"
 
+# The sixth. The funnel's Haiku stages (`core/haiku.py`) are Agent SDK clients
+# in their own right, and they are reached the way every capability here is
+# reached: the agent runs the CLI over Bash. That hop strips
+# CLAUDE_CODE_OAUTH_TOKEN from the child environment -- deliberately, and only
+# that variable; everything else in the environment survives it. So a token that
+# lives in the environment authenticates the funnel from a terminal and leaves
+# it unauthenticated under the agent, which is the only way it actually runs.
+# The answer is the one §9 already gives for every other credential: keep it in
+# the credential store and fetch it at the moment of use.
+CLAUDE_TOKEN = "claude_oauth_token"
+
+# The seventh, and the one that exists because the fourth cannot be obtained.
+# Semantic Scholar stopped issuing API keys to free-domain email addresses, so
+# `S2_KEY` is unreachable from a personal account and the anonymous pool is
+# shared with everyone else in that position. Ai2 serve the same corpus over MCP
+# at `asta-tools.allen.ai`, where a key is optional and raises rate limits
+# rather than unlocking anything -- so this is treated like `CONTEXT7_KEY`: its
+# absence is a note, not an error.
+ASTA_KEY = "asta_api_key"
+
 
 def _keyring() -> Any:
     try:
@@ -99,7 +119,9 @@ def status() -> dict[str, bool]:
     """Which credentials exist. Values are never returned."""
     return {
         n: present(n)
-        for n in (HF_TOKEN, OPENROUTER_KEY, VOYAGE_KEY, S2_KEY, CONTEXT7_KEY)
+        for n in (
+            HF_TOKEN, OPENROUTER_KEY, VOYAGE_KEY, S2_KEY, CONTEXT7_KEY, CLAUDE_TOKEN, ASTA_KEY,
+        )
     }
 
 

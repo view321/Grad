@@ -347,6 +347,25 @@
 
   window.gradReflow = reflowFrames;
 
+  /* ------------------------------------------------------- sticky transcript */
+  /* A turn appends to the bottom of the transcript for as long as it runs, and
+   * a reader watching it should not have to chase it with the scrollbar. But
+   * scrolling up to re-read a tool's output has to survive the next token, so
+   * this pins only while the reader is already at the bottom. Server-side this
+   * would be a `run_javascript` per flush, fifteen times a second. */
+  window.gradStickBottom = (id) => {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.gradStuck) return;
+    el.dataset.gradStuck = '1';
+    const SLACK_PX = 80;
+    const atBottom = () => el.scrollHeight - el.scrollTop - el.clientHeight <= SLACK_PX;
+    let pinned = true;
+    el.addEventListener('scroll', () => { pinned = atBottom(); }, {passive: true});
+    const stick = () => { if (pinned) el.scrollTop = el.scrollHeight; };
+    new MutationObserver(stick).observe(el, {childList: true, subtree: true, characterData: true});
+    stick();
+  };
+
   window.addEventListener('resize', reflowFrames);
   window.addEventListener('scroll', reflowFrames, true);
   // The pane tree is rebuilt by the server on every retile, so the anchor is a

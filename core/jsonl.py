@@ -206,12 +206,18 @@ def damaged_lines(path: Path | str) -> list[int]:
 def write_json(path: Path | str, obj: Any) -> None:
     """Atomic whole-file JSON write, for the preflight records in §6.
 
-    These are single-writer and replaced wholesale, so a temp file plus
-    os.replace is the right tool rather than the append lock.
+    These are replaced wholesale, so a temp file plus `os.replace` is the right
+    tool rather than the append lock.
+
+    The temp name carries the *thread* as well as the process. The UI persists a
+    layout through here, one `Workspace` per connected client in one process --
+    so two windows open on the same project are two threads writing the same
+    path, and a pid-only name would give them the same temp file to interleave
+    into. `os.replace` would then publish whichever half won.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}.{threading.get_ident():x}")
     tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     os.replace(tmp, path)
 

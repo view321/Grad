@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
-from ui.state import envelope_message, run_tool
+from ui.tasks import start, task_message
 
 
 def subtitle(workspace: Any) -> str:
@@ -43,11 +43,18 @@ def render(workspace: Any) -> None:
     model = workspace.model("wiki") or {}
     kit.error_strip(model.get("error"))
 
-    async def rebuild() -> None:
-        workspace.say("regenerating the wiki …")
-        payload = await run_tool("tools.wiki", "map", "--json", timeout=900)
-        workspace.say(envelope_message(payload))
+    def settled(task: Any) -> None:
+        workspace.say(task_message(task))
         workspace.invalidate("wiki")
+        workspace.tick()
+
+    def rebuild() -> None:
+        """RepoWiki walks `core/` and `tools/` and calls a model per scope, so
+        this is minutes rather than seconds -- and nothing else in the workspace
+        needs to wait for it."""
+        start("wiki map", "tools.wiki", "map", "--json", on_done=settled)
+        workspace.say("regenerating the wiki — see the tasks window")
+        workspace.invalidate("tasks")
         workspace.tick()
 
     if not model.get("built"):

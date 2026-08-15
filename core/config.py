@@ -57,6 +57,16 @@ DEFAULTS: dict[str, Any] = {
         "cache_ttl_s": 604800,
         "request_timeout_s": 60,
         "min_request_interval_s": 1.1,  # unauthenticated S2 is ~1 req/s
+        # Which tier-1 client does discovery: "asta", "s2", or "both".
+        #
+        # Asta by default because it is the one that *works*. Both reach the
+        # same Semantic Scholar corpus and both expose snippet search, but S2's
+        # own API stopped issuing keys to free-domain email addresses, leaving a
+        # personal account on the shared anonymous pool -- which is rate limited
+        # often enough that "no results" and "no key" are hard to tell apart.
+        # Asta's key is optional. "both" is for comparing them, and it doubles
+        # the request count for candidates that mostly fuse back together.
+        "tier1": "asta",
     },
     # HANDOFF-2 §18 listed the REST paths as unverified (§23 item 2). They are
     # now verified against the live API: `/api/v2/libs/search` returns

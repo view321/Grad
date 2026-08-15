@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
-from ui.state import envelope_message, run_tool
+from ui.tasks import envelope_message, run_tool
 
 
 def subtitle(workspace: Any) -> str:
@@ -118,7 +118,11 @@ def _lineage(campaign: dict[str, Any]) -> None:
             for bar in bars:
                 element = kit.el("div", f"bar {bar['tone'] if bar['tone'] != 'ordinary' else ''}".strip())
                 element.style(f"height: {bar.get('height', 0.5) * 100:.1f}%")
-                element.props(f'title="gen {bar.get("generation")} · {bar["score"]:.6g} · {bar.get("id")}"')
+                # Through `kit.attr`, unlike most titles, because this one is
+                # assembled here rather than passed to `kit.button` -- and the
+                # candidate id in it comes off the campaign ledger.
+                hint = f'gen {bar.get("generation")} · {bar["score"]:.6g} · {bar.get("id")}'
+                element.props(f'title="{kit.attr(hint)}"')
         with kit.row("", gap=9):
             kit.caption(f"gen {bars[0].get('generation')}")
             kit.spacer()

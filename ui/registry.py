@@ -1,9 +1,9 @@
 """The window registry: the one list the whole shell is derived from.
 
-The opener strip, the layout presets, the `⌘K` palette, the persisted layout's
-validation and the status bar's count all read this tuple. Adding a twelfth
-window is adding one `WindowSpec` and one module -- if it is ever more than
-that, something has grown a second list and the two will drift.
+The `⋯` menu, the persisted layout's validation and the status bar's count all
+read this tuple. Adding a thirteenth window is adding one `WindowSpec` and one
+module -- if it is ever more than that, something has grown a second list and
+the two will drift.
 
 `module` is resolved with `importlib` at first render rather than imported here,
 for the reason the rest of the app imports lazily: `ui.registry` has to stay
@@ -25,6 +25,8 @@ class WindowSpec:
     id: str
     name: str
     module: str
+    #: One line saying what the window is for. It is the menu row's caption and
+    #: its tooltip, and the title bar's subtitle when the window defines none.
     hint: str
     #: In the arrangement a fresh workspace opens with. The mock's opening
     #: state: chat and notebook side by side, ledger over quota on the right.
@@ -46,6 +48,7 @@ WINDOWS: tuple[WindowSpec, ...] = (
     WindowSpec("preflight", "preflight", "ui.windows.preflight", "the checklist that blocks a submission"),
     WindowSpec("funnel", "funnel", "ui.windows.funnel", "retrieval, stage by stage"),
     WindowSpec("queue", "queue", "ui.windows.queue", "runs and GPU jobs"),
+    WindowSpec("tasks", "tasks", "ui.windows.tasks", "commands running on this machine"),
 )
 
 BY_ID: dict[str, WindowSpec] = {w.id: w for w in WINDOWS}

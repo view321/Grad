@@ -16,6 +16,51 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
+from ui.tasks import start, task_message
+
+
+def _search(ui: Any, workspace: Any) -> None:
+    """Run the funnel from the window that exists to debug it.
+
+    It was read-only, which is a strange shape for a debugging surface: the
+    thing you do after reading a trace is run the search again with one stage
+    changed, and that meant a terminal.
+
+    A background task rather than an awaited call, because the funnel is minutes
+    at its own rate limits -- and because stage 0 and stage 3 spend quota and
+    stage 2 spends credits, so watching it is worth something.
+    """
+
+    def settled(task: Any) -> None:
+        workspace.say(task_message(task))
+        workspace.invalidate("funnel")
+        workspace.tick()
+
+    def run() -> None:
+        question = (entry.value or "").strip()
+        if not question:
+            return
+        entry.value = ""
+        argv = ["tools.paper_search", "search", question, "--json"]
+        if skip_rerank.value:
+            # The one stage that spends credits rather than quota.
+            argv.append("--no-rerank")
+        start(f"search {question[:40]}", *argv, on_done=settled)
+        workspace.say(f"searching — {question[:60]}")
+        workspace.invalidate("tasks")
+        workspace.tick()
+
+    with kit.row("grad-pad", gap=6).style("border-bottom: var(--grad-border)"):
+        entry = (
+            ui.input(placeholder="a research question, in words")
+            .props("borderless dense")
+            .classes("field")
+            .style("flex: 1 1 auto; padding: 0 8px")
+        )
+        entry.on("keydown.enter.prevent", run)
+        skip_rerank = ui.checkbox("no rerank").props("dense")
+        skip_rerank.props('title="stage 2 costs credits; the rest of the funnel does not"')
+        kit.button("SEARCH ⏎", tone="primary", on_click=run)
 
 
 def subtitle(workspace: Any) -> str:
@@ -32,6 +77,8 @@ def render(workspace: Any) -> None:
     model = workspace.model("funnel") or {}
     kit.error_strip(model.get("error"))
     trace = model.get("trace")
+
+    _search(ui, workspace)
     if not trace:
         kit.empty("No searches yet.", model.get("empty_fix"))
         return

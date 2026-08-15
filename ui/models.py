@@ -28,7 +28,7 @@ import datetime as _dt
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from core import paths
 
@@ -257,6 +257,8 @@ def status_model() -> dict[str, Any]:
     """
     from core import ledger_store as ls
 
+    from ui import tasks as tasks_mod
+
     kernel, _ = _safe(_kernel_state, "no kernel")
     runs, runs_error = _safe(ls.runs, [])
     uncollected = [r for r in (runs or []) if not r.collected]
@@ -265,6 +267,10 @@ def status_model() -> dict[str, Any]:
         "kernel": kernel,
         "queued": len(uncollected),
         "gpu": len([r for r in uncollected if not r.is_smoke]),
+        # Local subprocesses, counted apart from the remote runs beside them.
+        # A wiki rebuild and a GPU job are both "running" and are not remotely
+        # the same fact -- one is this machine's CPU, the other is money.
+        "tasks": len(tasks_mod.running()),
         "error": runs_error,
     }
 
@@ -276,6 +282,163 @@ def _kernel_state() -> str:
     if state.get("running"):
         return f"lab :{state['port']}"
     return "lab stopped"
+
+
+# ---------------------------------------------------------------------------
+# 0. chat sessions
+# ---------------------------------------------------------------------------
+def sessions_model(current: str | None = None) -> dict[str, Any]:
+    """The stored conversations, and which one is open.
+
+    Read here rather than in the window for the reason every other window reads
+    a model: a file read belongs on this side of the line, and it makes the
+    picker testable without a browser. `chat` has no entry in `MODEL_BUILDERS`
+    -- its state is the live session, not a file, and the poll must not redraw
+    it -- so this is called directly, the way `workspaces_model` is.
+    """
+    from ui import sessions as sessions_mod
+
+    listed, error = _safe(sessions_mod.listing, [])
+    rows = list(listed or [])
+    return {
+        "rows": rows,
+        "current": current,
+        "count": len(rows),
+        # Reopening a session whose SDK id was never recorded shows the
+        # transcript without continuing the conversation. Counted so the window
+        # can say so rather than let it be discovered.
+        "transcript_only": len([r for r in rows if not r["resumable"]]),
+        "error": error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 0a. credentials
+# ---------------------------------------------------------------------------
+#: What each credential unlocks, and whether the system works without it. The
+#: text matters as much as the flag: "missing" is not the same fact for a token
+#: that gates GPU submission as for one that raises a rate limit.
+CREDENTIAL_NOTES: dict[str, tuple[str, bool]] = {
+    "hf_token": ("Hugging Face Jobs — submitting and collecting runs", True),
+    "openrouter_key": ("the reranker, funnel stage 2 (costs credits)", False),
+    "voyage_key": ("embeddings for the local index (costs credits)", False),
+    "asta_api_key": ("raises Asta's rate limits; discovery works without it", False),
+    "s2_api_key": ("Semantic Scholar direct — only issued to institutional addresses", False),
+    "context7_key": ("raises Context7's rate limits; lookups work without it", False),
+    "claude_oauth_token": ("the funnel's Haiku stages, when the agent runs them", True),
+}
+
+
+def credentials_model() -> dict[str, Any]:
+    """Which credentials are stored. Values are never read, let alone returned.
+
+    The point of the panel this feeds is that storing a credential was the one
+    thing the workspace could not do: `jobs.py credential set` prompts with
+    `getpass`, which needs a terminal, so the four commands in the README's
+    install section were the reason to keep a shell open beside the app.
+    """
+    from core import credentials as credentials_mod
+
+    present, error = _safe(credentials_mod.status, {})
+    rows = []
+    for name, stored in (present or {}).items():
+        purpose, required = CREDENTIAL_NOTES.get(name, ("", False))
+        rows.append(
+            {
+                "name": name,
+                "stored": bool(stored),
+                "purpose": purpose,
+                "required": required,
+                "tone": "ok" if stored else ("broken" if required else "neutral"),
+                "state": "STORED" if stored else ("MISSING" if required else "not set"),
+            }
+        )
+    return {
+        "rows": rows,
+        "missing_required": [r["name"] for r in rows if r["required"] and not r["stored"]],
+        "error": error,
+        # The store itself, so "nothing is stored" and "nothing can be stored"
+        # are distinguishable on screen.
+        "service": getattr(credentials_mod, "SERVICE", "grad"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 0b. background tasks
+# ---------------------------------------------------------------------------
+def tasks_model() -> dict[str, Any]:
+    """Local commands the workspace started, newest first.
+
+    Deliberately not merged into `queue_model`. Both lists hold things that are
+    "running", and that is where the resemblance stops: a wiki rebuild is this
+    machine's CPU for two minutes, a GPU job is money against a ceiling that a
+    gate refuses at. The queue window's own docstring makes the same argument in
+    the other direction about campaign candidates, and one table showing both
+    would make each one harder to read for no gain.
+
+    The output tail is included whole. It is bounded at the source
+    (`tasks.TAIL_LINES`), and the poll's fingerprint is what turns "a line
+    arrived" into a redraw -- so a task that is quiet costs one comparison.
+    """
+    from ui import tasks as tasks_mod
+
+    rows = []
+    for task in tasks_mod.all_tasks():
+        rows.append(
+            {
+                "id": task.id,
+                "label": task.label,
+                "command": "python -m " + " ".join(task.argv),
+                "state": task.state,
+                "tone": tasks_mod.STATE_TONE.get(task.state, "neutral"),
+                "running": task.running,
+                "elapsed": _duration(task.elapsed),
+                "exit_code": task.exit_code,
+                "stoppable": task.running,
+                # Named so the button can say what stopping will actually do:
+                # asking the tool, or signalling it. See `tasks.cancel`.
+                "halt": ("python -m " + " ".join(task.halt)) if task.halt else None,
+                "message": tasks_mod.task_message(task),
+                "tail": _tail_runs(task.tail),
+                "dropped": task.dropped,
+            }
+        )
+    return {
+        "rows": rows,
+        "running": len([r for r in rows if r["running"]]),
+        "finished": len([r for r in rows if not r["running"]]),
+        "empty_fix": (
+            "nothing has been started from the workspace yet — VERIFY, RE-CHECK, "
+            "REBUILD and BUILD PDF all run here"
+        ),
+    }
+
+
+def _tail_runs(tail: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Consecutive lines of the same kind, joined into one block.
+
+    A tail is up to `tasks.TAIL_LINES` long, and a `<pre>` per line would be 400
+    elements per task rebuilt on every poll that moved one of them. Runs collapse
+    that to two or three in practice, while keeping stderr distinguishable and --
+    the part a naive "all stdout, then all stderr" split would lose -- keeping
+    every line in the order the command emitted it.
+    """
+    runs: list[tuple[str, list[str]]] = []
+    for tag, line in tail:
+        if runs and runs[-1][0] == tag:
+            runs[-1][1].append(line)
+        else:
+            runs.append((tag, [line]))
+    return [(tag, "\n".join(lines)) for tag, lines in runs]
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+    return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60):02d}m"
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-"""Assembling a turn's text from partial and finished messages (`agent.TextStream`).
+"""Assembling a turn from partial and finished messages (`agent.TextStream`,
+`agent.TurnStream`).
 
 `include_partial_messages` makes the SDK emit the same text twice over: once as
 a run of `text_delta` events, and again as the finished `AssistantMessage`. The
@@ -6,6 +7,11 @@ whole job of `TextStream` is to show it once, and the failure it exists to
 prevent -- every answer appearing twice -- is invisible until someone actually
 runs the agent. So it is tested here, against fakes shaped like the SDK's own
 messages, with no SDK and no network.
+
+`TurnStream` is the other half: the tool calls, which `TextStream` filters out
+by construction. Its own rule is that **the order is the information** -- which
+command ran before which claim -- so most of what is tested below is where a
+block lands, not just that it exists.
 """
 
 from __future__ import annotations
@@ -182,6 +188,254 @@ def test_a_malformed_stream_event_is_not_a_crash():
                   {"type": "content_block_delta", "delta": {"type": "text_delta", "text": 7}}):
         assert stream.feed(FakeStreamEvent(event)) == ""
     assert stream.text == ""
+
+
+# ---------------------------------------------------------------------------
+# the tool calls (`TurnStream`)
+# ---------------------------------------------------------------------------
+@dataclass
+class ToolUse:
+    """A `ToolUseBlock`."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """A `ToolResultBlock`. These arrive on a `UserMessage`, not the assistant's."""
+
+    tool_use_id: str
+    content: Any = None
+    is_error: bool | None = None
+
+
+def kinds(stream: agent.TurnStream) -> list[str]:
+    return [b["kind"] for b in stream.blocks]
+
+
+def test_a_call_becomes_a_block_of_its_own():
+    """The gap this closes: every capability in this project is reached by a
+    Bash into `tools/`, and none of it used to reach the transcript."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([
+        FakeBlock("Checking the ledger."),
+        ToolUse("tu_1", "Bash", {"command": "python -m tools.ledger show"}),
+    ]))
+    assert kinds(stream) == ["text", "tool"]
+    call = stream.blocks[1]
+    assert call["name"] == "Bash"
+    assert call["title"] == "python -m tools.ledger show"
+    assert call["status"] == "running"
+
+
+def test_prose_after_a_call_lands_below_it():
+    """The order is the whole point: a claim made *after* a command ran reads
+    differently from one made before it."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([
+        FakeBlock("Checking."),
+        ToolUse("tu_1", "Bash", {"command": "ls"}),
+    ]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "one\ntwo")]))
+    stream.feed(delta(" Two entries."))
+    stream.feed(FakeMessage([FakeBlock(" Two entries.")]))
+    assert kinds(stream) == ["text", "tool", "text"]
+    assert [b["text"] for b in stream.blocks if b["kind"] == "text"] == ["Checking.", " Two entries."]
+
+
+def test_a_result_attaches_to_the_call_it_answers():
+    """Two calls in flight and the results back in the other order is the case
+    that matching by position would get exactly backwards."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([
+        ToolUse("tu_1", "Read", {"file_path": "core/budget.py"}),
+        ToolUse("tu_2", "Grep", {"pattern": "def status"}),
+    ]))
+    stream.feed(FakeMessage([ToolResult("tu_2", "core/budget.py:41"), ToolResult("tu_1", "…source…")]))
+    first, second = stream.blocks
+    assert (first["title"], first["result"]) == ("core/budget.py", "…source…")
+    assert (second["title"], second["result"]) == ("def status", "core/budget.py:41")
+    assert [b["status"] for b in stream.blocks] == ["ok", "ok"]
+
+
+def test_a_refused_call_is_drawn_as_failed_not_as_output():
+    """A `PreToolUse` denial comes back as an error result. Showing it as
+    ordinary output would make a blocked spend look like a successful one."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "ssh probe-host echo hello"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "denied by the gate", is_error=True)]))
+    assert stream.blocks[0]["status"] == "error"
+    assert stream.blocks[0]["result"] == "denied by the gate"
+
+
+def test_a_result_for_a_call_this_stream_never_saw_is_dropped():
+    """A turn resumed from cache can carry a result whose call was never
+    streamed. Inventing a card for it would claim an order we do not know."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolResult("tu_missing", "output")]))
+    assert stream.blocks == []
+
+
+def test_result_content_that_arrives_as_blocks_is_flattened():
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "ls"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", [{"type": "text", "text": "one"}, {"type": "text", "text": "two"}])]))
+    assert stream.blocks[0]["result"] == "one\ntwo"
+
+
+def test_a_long_result_is_clipped_and_says_so():
+    """A `Read` of a long file is held for the session, written to the
+    transcript file and drawn again on restore. The card is a record that the
+    call happened, not a second copy of its output."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Read", {"file_path": "notes/long.md"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "\n".join(f"line {i}" for i in range(500)))]))
+    result = stream.blocks[0]["result"]
+    assert len(result.splitlines()) <= agent.RESULT_LINES + 2
+    assert "more lines" in result
+
+
+def test_the_turns_text_is_the_prose_alone():
+    """`text` is what a transcript with no cards should say. Tool output is not
+    something the agent said, and folding it in would put a command's stdout in
+    the agent's own voice."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([FakeBlock("Running it."), ToolUse("tu_1", "Bash", {"command": "ls"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "budget.py")]))
+    assert stream.text == "Running it."
+
+
+def test_a_card_is_titled_by_what_the_call_was_on():
+    """Not by the whole input: an `Edit` carries its entire replacement text,
+    and a head that is a wall of source is worse than one that is empty."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Edit", {
+        "file_path": "core/budget.py",
+        "old_string": "x" * 5000,
+        "new_string": "y" * 5000,
+    })]))
+    call = stream.blocks[0]
+    assert call["title"] == "core/budget.py"
+    assert dict(call["rows"]).keys() == {"old_string", "new_string"}
+    assert all(len(value) < 400 for value in dict(call["rows"]).values())
+
+
+def test_a_multiline_command_is_one_line_in_the_head_and_whole_in_the_body():
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "cd tools \\\n&& python -m evolve"})]))
+    call = stream.blocks[0]
+    assert "\n" not in call["title"]
+    assert "python -m evolve" in call["text"]
+
+
+def test_the_call_in_flight_is_the_one_still_running():
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "first"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "done")]))
+    stream.feed(FakeMessage([ToolUse("tu_2", "Bash", {"command": "second"})]))
+    assert stream.active()["title"] == "second"
+    stream.feed(FakeMessage([ToolResult("tu_2", "done")]))
+    assert stream.active() is None
+
+
+def test_a_cli_gets_a_line_naming_each_call_and_its_outcome():
+    """`feed` returns what a terminal should print next -- the same stream the
+    UI draws as cards, in one line each."""
+    stream = agent.TurnStream()
+    printed = drain(stream, [
+        delta("Checking."), FakeMessage([FakeBlock("Checking."), ToolUse("tu_1", "Bash", {"command": "ls"})]),
+        FakeMessage([ToolResult("tu_1", "one\ntwo")]),
+    ])
+    assert "Checking." in printed
+    assert "[tool] Bash ls" in printed
+    assert "[tool] Bash ok (2 lines)" in printed
+
+
+def test_a_failed_call_says_why_on_the_command_line():
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "ssh probe-host"})]))
+    printed = stream.feed(FakeMessage([ToolResult("tu_1", "denied: ssh is gated", is_error=True)]))
+    assert "[tool] Bash failed: denied: ssh is gated" in printed
+
+
+def test_a_printed_line_is_ascii_so_a_windows_console_survives_it():
+    """`print` to a cp1252 console raises on a stray glyph, and that would take
+    the whole turn down at the moment it was most worth watching."""
+    stream = agent.TurnStream()
+    printed = stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "ls"})]))
+    printed += stream.feed(FakeMessage([ToolResult("tu_1", "x" * 6000, is_error=True)]))
+    printed.encode("ascii")  # raises if anything above is not
+
+
+def test_the_no_duplication_rule_still_holds_around_a_call():
+    """`TurnStream` delegates text to `TextStream`, so the bug that class exists
+    to prevent must not come back through the wrapper."""
+    stream = agent.TurnStream()
+    printed = drain(stream, [
+        delta("Checking"), delta(" the ledger."),
+        FakeMessage([FakeBlock("Checking the ledger."), ToolUse("tu_1", "Bash", {"command": "ls"})]),
+        FakeMessage([ToolResult("tu_1", "one")]),
+        delta(" Done."), FakeMessage([FakeBlock(" Done.")]),
+    ])
+    assert stream.text == "Checking the ledger. Done."
+    assert printed.count("Checking the ledger.") == 1
+
+
+def test_a_note_is_the_sessions_own_voice_at_the_end_of_the_turn():
+    """How a turn that died says so: the prose that streamed before it is kept,
+    and the card of the call it died on is left mid-flight."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([FakeBlock("Starting."), ToolUse("tu_1", "Bash", {"command": "ls"})]))
+    stream.note("\n\n**the session failed:** `ConnectionError`")
+    assert kinds(stream) == ["text", "tool", "text"]
+    assert stream.blocks[1]["status"] == "running"
+    assert stream.text.endswith("`ConnectionError`")
+
+
+# ---------------------------------------------------------------------------
+# what survives to the transcript file
+# ---------------------------------------------------------------------------
+def test_the_calls_survive_a_restart_and_a_transcript_without_them_still_opens():
+    """`blocks` is optional on the way back in: transcripts written before tool
+    calls were captured have none, and those still have to open."""
+    app = pytest.importorskip("ui.app", reason="the ui extra is not installed")
+
+    session = app.Session("test")
+    session.settled = [
+        {"role": "user", "text": "check the ledger"},
+        {"role": "assistant", "text": "Checking.", "blocks": [
+            {"kind": "text", "text": "Checking."},
+            {"kind": "tool", "name": "Bash", "title": "ls", "status": "ok", "result": "one"},
+        ]},
+    ]
+    session._persist()  # noqa: SLF001 - the round trip is the test
+
+    reopened = app.Session("test")
+    reopened.restore()
+    assert reopened.settled[0] == {"role": "user", "text": "check the ledger"}
+    assert reopened.settled[1]["blocks"][1]["name"] == "Bash"
+
+
+def test_a_transcript_line_whose_blocks_are_junk_still_opens_the_window():
+    """The file outlives the version that wrote it, so `blocks` is untrusted
+    input. A block with no `kind` would reach the renderer's dispatch and take
+    the page down at build time."""
+    app = pytest.importorskip("ui.app", reason="the ui extra is not installed")
+
+    session = app.Session("junk")
+    session.path().parent.mkdir(parents=True, exist_ok=True)
+    session.path().write_text(
+        "\n".join([
+            '{"role": "assistant", "text": "fine", "blocks": "not a list"}',
+            '{"role": "assistant", "text": "fine", "blocks": [{"no": "kind"}, 7, {"kind": "tool"}]}',
+        ]),
+        encoding="utf-8",
+    )
+    session.restore()
+    assert "blocks" not in session.settled[0]
+    assert session.settled[1]["blocks"] == [{"kind": "tool"}]
 
 
 def test_the_options_actually_ask_for_partial_messages(monkeypatch):

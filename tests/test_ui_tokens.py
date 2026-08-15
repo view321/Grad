@@ -143,7 +143,7 @@ def test_the_stylesheet_covers_every_component_class_the_kit_emits():
     the failure mode hardest to notice in review."""
     sheet = tokens.stylesheet()
     for name in (
-        "grad-shell", "grad-appbar", "grad-opener", "grad-statusbar", "grad-tiles",
+        "grad-shell", "grad-appbar", "grad-dots", "grad-menu-row", "grad-statusbar", "grad-tiles",
         "grad-column", "grad-slot", "grad-handle", "grad-window", "grad-titlebar",
         "grad-body", "grad-btn", "grad-chip", "grad-kv", "grad-bar", "grad-progress",
         "grad-status-square", "grad-band", "grad-stage", "grad-lineage", "grad-diff",

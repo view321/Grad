@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any, Callable
 
-from core import paths, quota_log
+from core import credentials, paths, quota_log
 from core.errors import ConfigError, UpstreamError
 from core.ledger_store import now_iso
 
@@ -77,6 +78,37 @@ only connection is shared vocabulary.
 provenance recorded in the research ledger, so "relevant to the query" is a
 useless answer.
 """
+
+
+NOT_AUTHENTICATED = (
+    "the funnel's Haiku stages have no subscription credentials, so the model was "
+    "never reached. The agent runs this CLI over Bash, and that hop strips "
+    "CLAUDE_CODE_OAUTH_TOKEN from the environment -- so the token has to come from "
+    "the credential store, not from the environment."
+)
+AUTH_FIX = (
+    "claude setup-token   # mint a token, then store it where the hop cannot strip it:\n"
+    "python -m tools.jobs credential set claude_oauth_token"
+)
+
+
+def _credentials_env() -> dict[str, str]:
+    """Subscription credentials for the CLI this stage spawns.
+
+    The ambient variable comes first, so running a funnel stage by hand in a
+    terminal keeps working with no setup at all. The credential store is the
+    fallback that makes the same command work when the *agent* is the one
+    running it -- see `credentials.CLAUDE_TOKEN` for why the two differ.
+
+    `ClaudeAgentOptions.env` merges over the inherited environment rather than
+    replacing it, so this adds one variable and takes nothing away.
+    """
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if not token:
+        token = credentials.get(credentials.CLAUDE_TOKEN, required=False)
+    if not token:
+        raise ConfigError(NOT_AUTHENTICATED, fix=AUTH_FIX)
+    return {"CLAUDE_CODE_OAUTH_TOKEN": token}
 
 
 def _validate_expansion(args: dict[str, Any]) -> str | None:
@@ -139,15 +171,32 @@ async def _call(
         mcp_servers={"funnel": sdk.create_sdk_mcp_server("funnel", tools=[_submit])},
         allowed_tools=[f"mcp__funnel__{tool_name}"],
         disallowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
+        env=_credentials_env(),
     )
 
     transcript: list[str] = []
     usage: Any = None
-    async for message in sdk.query(prompt=user_prompt, options=options):
-        text = _text_of(message)
-        if text:
-            transcript.append(text)
-        usage = getattr(message, "usage", None) or usage
+    unauthenticated = False
+    try:
+        async for message in sdk.query(prompt=user_prompt, options=options):
+            # An unauthenticated CLI answers with a synthetic "Not logged in"
+            # turn and then exits non-zero. The SDK reports the exit as
+            # "Claude Code returned an error result: success" -- the CLI sends no
+            # `errors` array, so the SDK falls back to printing the result
+            # *subtype*, which is `success`. That message is worse than useless
+            # here, so the reason is taken from the message that carries it.
+            if getattr(message, "error", None) == "authentication_failed":
+                unauthenticated = True
+            text = _text_of(message)
+            if text:
+                transcript.append(text)
+            usage = getattr(message, "usage", None) or usage
+    except Exception as exc:  # noqa: BLE001 - re-raised unless we know better
+        if unauthenticated:
+            raise ConfigError(NOT_AUTHENTICATED, fix=AUTH_FIX) from exc
+        raise
+    if unauthenticated:
+        raise ConfigError(NOT_AUTHENTICATED, fix=AUTH_FIX)
 
     quota_log.from_sdk_usage(
         stage, usage, model=model, role=role,
