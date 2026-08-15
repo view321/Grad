@@ -1,5 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+# 77 rather than 68 is the floor for PEP 639 (`license` as an SPDX expression
+# plus `license-files`). The older `license = { text = "MIT" }` form is
+# deprecated, and it was also the form that let this project claim a licence for
+# two months with no LICENSE file in the tree -- metadata that says MIT and a
+# repository that grants nothing is worse than saying nothing at all.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +13,8 @@ version = "0.1.0"
 description = "Grad - a personal research agent for mathematics and machine learning"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 
 # The core (ledger, preflight, submitters) runs on the standard library plus a
 # file lock. Everything heavier is optional and imported lazily at the point of
@@ -65,15 +71,23 @@ grad = "agent:main"
 
 [tool.setuptools]
 packages = ["core", "tools", "ui", "ui.windows"]
+# Top-level modules, not packages. Without these the installed `grad` command
+# cannot import `agent:main`, and `hooks` would be missing under it.
+#
+# This key belongs to `[tool.setuptools]` and spent its first months one table
+# lower, under `package-data`, where setuptools reads keys as *package names* --
+# so it declared package data for a package called `py-modules` and declared no
+# top-level modules at all. The editable install hid it completely, because an
+# editable install puts the source tree on the path and `import agent` resolves
+# whether or not the wheel would have contained it. Only a real wheel would have
+# found this, and `grad --update` never builds one.
+py-modules = ["agent", "hooks"]
 
 # The stylesheet is generated from `ui/tokens.py`, but `tiling.js` and any
 # vendored fonts are real files and have to travel with the wheel -- without
 # them an installed Grad has no pane dragging and no typefaces.
 [tool.setuptools.package-data]
 ui = ["static/*.js", "static/fonts/*", "assets/katex/**/*"]
-# Top-level modules, not packages. Without these the installed `grad` command
-# cannot import `agent:main`, and `hooks` would be missing under it.
-py-modules = ["agent", "hooks"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

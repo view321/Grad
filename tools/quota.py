@@ -80,12 +80,18 @@ def cmd_funnel(args: argparse.Namespace) -> dict[str, Any]:
         quota_log.STAGE_RERANK,
         quota_log.STAGE_TRIAGE,
     ]
-    rows = {s: summary["by_stage"].get(s, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "credits_usd": 0.0}) for s in stages}
+    empty = {"calls": 0, "billable_tokens": 0, "credits_usd": 0.0}
+    empty.update({field: 0 for field, _ in quota_log.KINDS})
+    rows = {s: summary["by_stage"].get(s, dict(empty)) for s in stages}
     return {
         "window_days": args.days,
         "stages": rows,
+        # Weighted, like every other ceiling-facing total. The funnel's two
+        # subagent stages send a short prompt and read a long one, so counting
+        # only input + output flattered them by exactly the component that makes
+        # them worth questioning.
         "quota_tokens_stage0_and_3": sum(
-            rows[s]["input_tokens"] + rows[s]["output_tokens"]
+            rows[s]["billable_tokens"]
             for s in (quota_log.STAGE_EXPAND, quota_log.STAGE_TRIAGE)
         ),
         "credits_usd_stage2": rows[quota_log.STAGE_RERANK]["credits_usd"],
@@ -118,6 +124,11 @@ def _record_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model")
     p.add_argument("--input-tokens", type=int, default=0)
     p.add_argument("--output-tokens", type=int, default=0)
+    # The ledger has always stored these two; until now nothing but the SDK
+    # translation could write them, so a hand-written record could only ever
+    # describe the tenth of a turn that is not cache traffic.
+    p.add_argument("--cache-read-tokens", type=int, default=0)
+    p.add_argument("--cache-write-tokens", type=int, default=0)
     p.add_argument("--credits-usd", type=float, default=0.0)
     p.add_argument("--unit", choices=["quota", "credits"], default="quota")
     p.add_argument("--role", help="the §16 model role this call filled")
@@ -130,7 +141,11 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
     # This is the measurement instrument for every later cost decision, so a
     # negative count (which would reduce reported usage) or a NaN (which is not
     # valid JSON and would poison every later sum) is refused rather than stored.
-    if args.input_tokens < 0 or args.output_tokens < 0 or args.credits_usd < 0:
+    counts = (
+        args.input_tokens, args.output_tokens,
+        args.cache_read_tokens, args.cache_write_tokens,
+    )
+    if any(n < 0 for n in counts) or args.credits_usd < 0:
         raise UsageError("usage values must be non-negative", fix="check the arguments")
     if not math.isfinite(args.credits_usd):
         raise UsageError("--credits-usd must be a finite number", fix="pass a real dollar amount")
@@ -140,6 +155,8 @@ def cmd_record(args: argparse.Namespace) -> dict[str, Any]:
             model=args.model,
             input_tokens=args.input_tokens,
             output_tokens=args.output_tokens,
+            cache_read_tokens=args.cache_read_tokens,
+            cache_write_tokens=args.cache_write_tokens,
             credits_usd=args.credits_usd,
             unit=args.unit,
             role=args.role,

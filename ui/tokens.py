@@ -618,12 +618,38 @@ def _chat() -> str:
 .grad-statusline .activity { opacity: 0.62; min-width: 0; overflow: hidden;
                              white-space: nowrap; text-overflow: ellipsis; }
 .grad-statusline .clock { opacity: 0.62; flex: 0 0 auto; }
+/* How much of the context window is in use, and how close compaction is.
+   Dimmed like the clock until it matters, because for most of a session the
+   honest answer is "not yet" and a meter that shouts throughout is one nobody
+   reads by the time it should be shouting. `warn` is an outline and
+   `attention` is a fill: the first says the end is in sight, the second says
+   the next turn may be the one that triggers a compaction. */
+.grad-statusline .context { opacity: 0.62; flex: 0 0 auto; padding: 1px 5px; }
+.grad-statusline .context.warn {
+    opacity: 1; border: 1.5px solid var(--grad-ink); }
+.grad-statusline .context.attention {
+    opacity: 1; background: var(--grad-attention); color: var(--grad-ink); }
 /* The one part of the bar that is a control rather than a report, so it is the
    one part drawn as one. */
 .grad-statusline .reasoning { flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
                               padding: 1px 7px; letter-spacing: 0.08em; }
 .grad-chat.reasoning-on .grad-statusline .reasoning {
     background: var(--grad-ink); color: var(--grad-paper); }
+
+/* The compaction marker: a rule across the transcript, not a message. Nothing
+   was said at this point -- what happened is that everything above it stopped
+   being something the agent remembers first-hand. Drawn as a rule so it reads
+   as a boundary rather than as a turn, and dashed for the same reason the rest
+   of the design uses a dashed border: what is above the line is no longer
+   solid. */
+.grad-compaction { margin: 14px 14px; border-top: 1.5px dashed var(--grad-rule-mid);
+                   padding-top: 10px; font-size: 12px; }
+.grad-compaction > .head { align-items: flex-start; }
+.grad-compaction .mark { font-family: var(--grad-font-mono); opacity: 0.55;
+                         flex: 0 0 auto; line-height: 1.5; }
+.grad-compaction .head .q-markdown, .grad-compaction .head p { margin: 0; opacity: 0.75; }
+.grad-compaction .note { margin-top: 6px; font-size: 11px;
+                         background: var(--grad-paper-sunk); border: var(--grad-secondary); }
 
 /* Reasoning is drawn either way and painted only when it is switched on: a
    toggle that rebuilt the transcript would take its scroll position with it,

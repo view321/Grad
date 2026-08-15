@@ -4,6 +4,12 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+# Build outputs. Nothing here builds a wheel in the normal course of things --
+# the install is editable and `grad --update` moves the checkout rather than
+# reinstalling from an artifact -- but the packaging metadata is only really
+# checked by building one, and the leftovers should not land in a commit.
+build/
+dist/
 
 # Derived index - rebuildable from the JSONL at any time (HANDOFF §7).
 ledger/ledger.sqlite

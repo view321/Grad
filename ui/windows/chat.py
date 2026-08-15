@@ -49,6 +49,27 @@ from ui.state import FLUSH_HZ
 #: "pending": an outcome that has not happened yet is not a green one.
 STATUS_TONE = {"running": "dashed", "ok": "ok", "error": "broken"}
 
+#: Seconds between context readings. Four is slow enough that the call is
+#: invisible next to a turn and fast enough that the chip is never far behind
+#: what is actually in the window.
+CONTEXT_POLL_S = 4.0
+
+
+def compact_threshold() -> int:
+    """Where Grad will compact, for the meter to measure against.
+
+    Here rather than read from `core.compaction` at the call site so the import
+    stays lazy: `ui/windows/chat.py` is imported by the registry on a machine
+    that may have no config yet, and `config.load()` is cached, so the cost of
+    asking on every poll is a dict lookup.
+    """
+    from core import compaction  # noqa: PLC0415
+
+    try:
+        return compaction.threshold()
+    except Exception:  # noqa: BLE001 - a meter must not be able to take the window down
+        return 0
+
 
 def subtitle(workspace: Any) -> str:
     session = getattr(workspace, "session", None)
@@ -216,6 +237,24 @@ def render(workspace: Any) -> None:
         statusline.sync(blocks)
 
     ui.timer(1 / FLUSH_HZ, flush)
+
+    async def poll_context() -> None:
+        """Ask the CLI how big the context is, and redraw the chip.
+
+        On its own timer, several hundred times slower than the flush. The call
+        costs no tokens -- it is a control request answered from state the CLI
+        already holds -- but it is still a round-trip over the transport a turn
+        is streaming on, and there is nothing to learn from asking sixty times a
+        second about a number that moves once a turn.
+
+        The interval is chosen for the case that matters: a turn that runs for
+        forty minutes, where the point of the meter is watching the context
+        climb while there is still time to do something about it.
+        """
+        await session.read_context()
+        statusline.sync_context()
+
+    ui.timer(CONTEXT_POLL_S, poll_context)
     # Once, at build: keep the transcript pinned to the bottom while a turn
     # streams. Doing it from here instead would be a `run_javascript` per flush.
     kit.run_js("window.gradStickBottom && window.gradStickBottom('grad-transcript')")
@@ -267,10 +306,17 @@ class _Statusline:
             self.state = kit.text("IDLE", "state", tag="span")
             self.activity = kit.text("waiting for you", "activity", tag="span")
             kit.spacer()
+            # Before the clock rather than after it: the clock and the reasoning
+            # switch are about the turn in flight, and this is about the session
+            # as a whole -- it is the one thing on this strip that is still true
+            # when nothing is running.
+            self.context = kit.text("", "context", tag="span")
             self.clock = kit.text("", "clock", tag="span")
             self.reasoning = kit.text("", "reasoning", tag="span")
         self.bar = bar
+        self._context_mark: tuple[Any, ...] | None = None
         self._paint_reasoning()
+        self.sync_context()
 
     def toggle(self) -> None:
         showing = self.workspace.toggle_reasoning()
@@ -295,6 +341,32 @@ class _Statusline:
     def _paint_reasoning(self) -> None:
         showing = self.workspace.show_reasoning
         kit.set_text(self.reasoning, f"reasoning {'■ on' if showing else '□ off'}")
+
+    def sync_context(self) -> None:
+        """Redraw the context chip from the session's last reading.
+
+        Called on its own timer rather than on the 15 Hz flush: the underlying
+        number changes once per control request, and repainting it a hundred
+        times between two readings is a hundred DOM writes that say the same
+        thing. Like `sync`, it touches nothing unless the line changed.
+        """
+        session = self.workspace.session
+        model = models.context_model(
+            getattr(session, "context", None),
+            compact_at=compact_threshold(),
+        )
+        mark = (model["label"], model["tone"], model["detail"])
+        if mark == self._context_mark:
+            return
+        self._context_mark = mark
+        kit.set_text(self.context, model["label"])
+        # Both removed before either is added: a chip that crossed from warn to
+        # attention would otherwise carry the old class as well as the new one,
+        # and the pair have different accents by design.
+        self.context.classes(remove="warn attention")
+        if model["tone"]:
+            self.context.classes(add=model["tone"])
+        self.context.props(f'title="{kit.attr(model["detail"])}"')
 
     def sync(self, blocks: list[dict[str, Any]]) -> None:
         """Called at the flush rate, so nothing here touches the DOM unless the
@@ -466,6 +538,31 @@ def _has_gate(record: dict[str, Any]) -> bool:
     return False
 
 
+def _compaction(ui: Any, record: dict[str, Any]) -> None:
+    """The line across the transcript where the agent's memory was replaced.
+
+    Drawn as a rule rather than as a message because that is what it is: nothing
+    was said here, and everything above it is now something the agent knows only
+    second-hand. Without a mark the transcript reads as one continuous
+    conversation, and the first time the model fails to remember a detail that
+    is plainly visible three turns up, the reasonable conclusion is that the
+    agent is broken.
+
+    The note is behind a disclosure. It is long by design -- `HANDOFF_PROMPT`
+    asks for paths, commands and ledger state, not for brevity -- and it is
+    exactly what someone will want to read when the answer after a compaction is
+    worse than the answers before it.
+    """
+    with kit.el("div", "grad-compaction"):
+        with kit.row("head", gap=8):
+            kit.text("⊟", "mark", tag="span")
+            ui.markdown(record.get("text") or "compacted")
+        note = record.get("note")
+        if isinstance(note, str) and note.strip():
+            with ui.expansion("the handover note the previous session left").classes("note"):
+                ui.markdown(note)
+
+
 def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline: Any) -> None:
     session = workspace.session
 
@@ -506,6 +603,23 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
         # system does not have. Whether to plan first is something you say in
         # words, and the gates are what actually stop a spend.
         await session.ask(prompt, settle)
+        # After the turn has settled, never during it: compacting drops the
+        # client, and dropping it underneath a live `receive_response` is the
+        # failure `_stop_turn` exists to clean up after. Here rather than inside
+        # `ask` because the record has to be *drawn*, and the transcript is the
+        # window's to write to.
+        outcome = await session.maybe_compact()
+        if outcome is None:
+            return
+        if outcome.get("record"):
+            with transcript:
+                _message(outcome["record"], workspace)
+        else:
+            # A compaction that could not happen is worth saying out loud. The
+            # session carries on oversized, which is survivable, but silence
+            # here would leave a meter pinned at the threshold with nothing
+            # explaining why nothing is being done about it.
+            workspace.say(outcome.get("message") or "could not compact this session")
 
     with kit.el("div", "grad-composer"):
         # Right-aligned by the row rather than by a leading spacer: with the mode
@@ -557,6 +671,9 @@ def _message(record: dict[str, Any], workspace: Any) -> None:
     from nicegui import ui
 
     text = record.get("text") or ""
+    if record.get("role") == "system":
+        _compaction(ui, record)
+        return
     if record.get("role") == "user":
         with kit.el("div", "grad-msg user"):
             kit.text("you", "role")

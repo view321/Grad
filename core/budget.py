@@ -308,13 +308,29 @@ def spend(project_id: str) -> dict[str, Any]:
         if not (r.collected and r.get("cost_usd_actual") is not None):
             in_flight_usd += amount
 
-    quota_tokens = 0
+    # The four kinds, weighted into one number by `quota_log.billable`.
+    #
+    # This line used to be `input + output`, which sounds like the whole of what
+    # a turn spends and is not close to it: a long context is re-read from cache
+    # on every tool round-trip, so cache reads dominate everything else by two
+    # orders of magnitude. Measured over the first fortnight of use, this sum saw
+    # 149k tokens while 12.5M had actually moved. The ceiling was real, the
+    # arithmetic under it was not.
+    #
+    # The raw counts are kept beside the weighted total rather than replaced by
+    # it. A ceiling needs one number; a person asking why they hit it needs four.
+    weight = quota_log.weights()
+    quota_billable = 0.0
+    quota_counts = {field: 0 for field, _ in quota_log.KINDS}
     credits_usd = 0.0
     for entry in quota_log.entries():
         if project_of(entry) != project_id:
             continue
-        quota_tokens += int(entry.get("input_tokens", 0) or 0) + int(entry.get("output_tokens", 0) or 0)
+        for field, value in quota_log.counts(entry).items():
+            quota_counts[field] += value
+        quota_billable += quota_log.billable(entry, weight)
         credits_usd += float(entry.get("credits_usd", 0.0) or 0.0)
+    quota_tokens = round(quota_billable)
 
     # Campaign candidates consume real resources and live outside runs.jsonl by
     # design (§23 item 4). Leaving them out here would make a campaign invisible
@@ -343,6 +359,11 @@ def spend(project_id: str) -> dict[str, Any]:
         "gpu_in_flight_usd": round(in_flight_usd, 4),
         "gpu_candidate_usd": round(candidate_usd, 4),
         "quota_tokens": quota_tokens,
+        # What the weighted figure above is made of, and the weights that made
+        # it. Reported so `budget status` can answer "why is this number twelve
+        # times what I expected" without anyone having to read this file.
+        "quota_token_counts": dict(quota_counts),
+        "quota_weights": dict(weight),
         "credits_usd": round(credits_usd, 6),
         "runs": runs,
         "candidates": candidates,
@@ -390,6 +411,13 @@ def status(project_id: str) -> dict[str, Any]:
         "gpu_in_flight_usd": used["gpu_in_flight_usd"],
         "run_count": len(used["runs"]),
         "over_budget": [r for r, d in resources.items() if d["over"]],
+        # What the `quota_tokens` figure is made of. Carried up from `spend`
+        # because this is the payload every surface reads -- `budget status`,
+        # the quota window, and the refusal message the agent is handed -- and a
+        # ceiling that is mostly cache traffic is unarguable with the four
+        # numbers beside it and baffling without them.
+        "quota_token_counts": used.get("quota_token_counts", {}),
+        "quota_weights": used.get("quota_weights", {}),
         # The meter must not imply a fuel gauge. Anthropic exposes no remaining
         # balance and the real limits are rolling windows, so a token ceiling is
         # a proxy the user controls.

@@ -272,6 +272,11 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
 
     now = _dt.datetime.now(_dt.timezone.utc)
     cutoff = now - _dt.timedelta(hours=hours)
+    # Weighted, like the ceiling. This meter is meant to answer "how much of the
+    # rolling window have I used", and cache reads are most of what draws on it
+    # -- counting only input + output drew a bar that barely moved through a
+    # session that was in fact consuming the window steadily.
+    weight = quota_log.weights()
     chat = tool = 0.0
     chat_tokens = tool_tokens = 0
     tokens = 0
@@ -282,7 +287,11 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
             continue
         oldest = at if oldest is None or at < oldest else oldest
         credits = float(entry.get("credits_usd", 0.0) or 0.0)
-        entry_tokens = int(entry.get("input_tokens", 0) or 0) + int(entry.get("output_tokens", 0) or 0)
+        # Kept fractional and rounded once, at the bottom. Rounding each entry
+        # first costs up to half a token per row, and this window folds every
+        # record in five hours -- an error that grows with how busy the window
+        # was is exactly the wrong shape for a meter about how busy it was.
+        entry_tokens = quota_log.billable(entry, weight)
         tokens += entry_tokens
         if str(entry.get("stage") or "") == quota_log.STAGE_MAIN:
             chat += credits
@@ -316,13 +325,134 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
         "credits_usd": total,
         "chat_usd": chat,
         "tool_usd": tool,
-        "chat_tokens": chat_tokens,
-        "tool_tokens": tool_tokens,
+        # Rounded once, on the way out. The fractions above are computed from the
+        # unrounded figures, so the split does not shift with the rounding.
+        "chat_tokens": round(chat_tokens),
+        "tool_tokens": round(tool_tokens),
         "chat_fraction": chat_fraction,
         "tool_fraction": tool_fraction,
         "split_basis": "credits" if total else ("tokens" if token_total else "empty"),
-        "tokens": tokens,
+        "tokens": round(tokens),
         "resets_in": resets_in,
+    }
+
+
+# ---------------------------------------------------------------------------
+# the context meter
+# ---------------------------------------------------------------------------
+#: Fractions of the way to compaction at which the chip changes tone. Below the
+#: first it is ordinary; past the second, compaction is the next thing that will
+#: happen and the strip should say so before it does rather than after.
+CONTEXT_WARN = 0.75
+CONTEXT_NEAR = 0.92
+
+
+def _reading(source: Any, key: str) -> int | None:
+    """A non-negative integer out of a `get_context_usage` payload, or None.
+
+    None and 0 are kept distinct all the way through this file, which is the
+    whole discipline of the context meter: "I could not read it" and "there is
+    nothing in it" are opposite facts and only one of them means there is room.
+    Every caller here decides for itself which way to fail.
+    """
+    if not isinstance(source, dict):
+        return None
+    value = source.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def context_model(usage: Any, *, compact_at: int = 0) -> dict[str, Any]:
+    """What the statusline's context chip shows, from one `get_context_usage`.
+
+    Pure, and separate from the call that produces `usage`, because the
+    interesting part is not the request -- it is which limit the fraction is
+    measured against. There are two, and they mean different things:
+
+    * `maxTokens` is where the *CLI* will compact, which a live session reports
+      as 967,000 of a 1,000,000 window. By the time that matters, every tool
+      round-trip has been re-reading most of a million cached tokens for a long
+      while, and the meter has been reading "ok" throughout.
+    * `compact_at` is where *Grad* will compact, from `[agent]
+      compact_at_tokens`. When it is set it is always the lower of the two, and
+      it is the one worth drawing, because it is the one that is going to fire.
+
+    So the fraction is against whichever limit will actually be reached first,
+    and `limit_source` says which one that was -- a meter reading 40% means two
+    quite different things at a 300k threshold and at a 967k one.
+
+    `usage` may be None (no client yet, or the call failed). That is a real and
+    ordinary state -- the meter is drawn as "—" rather than as zero, because a
+    context of zero and an unknown context look identical at a glance and only
+    one of them is worth acting on.
+    """
+    tokens = _reading(usage, "totalTokens") if isinstance(usage, dict) else None
+    if tokens is None:
+        # Not only "no dict yet". A reading whose `totalTokens` is missing or is
+        # not a number is *also* unknown, and it used to land here as a confident
+        # zero -- which is the one reading this function's docstring says must
+        # never happen, drawn by this function. A meter reporting "ctx 0 · 0%"
+        # for a session it cannot measure is worse than one reporting nothing,
+        # because it invites exactly the conclusion that there is plenty of room.
+        return {
+            "known": False, "tokens": 0, "limit": 0, "fraction": 0.0,
+            "label": "ctx —", "tone": "", "limit_source": "unknown",
+            "detail": "no context reading yet — it arrives once a session is connected",
+            "categories": [],
+        }
+
+    ceiling = _reading(usage, "maxTokens") or _reading(usage, "rawMaxTokens") or 0
+    source = "cli"
+    if compact_at and (not ceiling or compact_at < ceiling):
+        ceiling, source = compact_at, "grad"
+    fraction = min(1.0, tokens / ceiling) if ceiling else 0.0
+
+    tone = ""
+    if fraction >= CONTEXT_NEAR:
+        tone = "attention"
+    elif fraction >= CONTEXT_WARN:
+        tone = "warn"
+
+    # Built with a loop rather than a comprehension because a bare
+    # `int(c.get("tokens"))` raises on a non-numeric value, and this is drawn
+    # from a timer -- one odd category in one reading would not produce one bad
+    # tooltip, it would raise several times a second for as long as the session
+    # lasted. A category that cannot be read is skipped.
+    categories: list[dict[str, Any]] = []
+    for entry in usage.get("categories") or []:
+        if not isinstance(entry, dict):
+            continue
+        size = _reading(entry, "tokens")
+        if not size:
+            continue
+        name = str(entry.get("name") or "?").strip()
+        # `Free space` is a category in the CLI's own breakdown and is the
+        # complement of everything else, so listing it in a tooltip about what
+        # is *using* the context is worse than noise -- it is always the largest
+        # entry and it is not a consumer.
+        if name.lower() == "free space":
+            continue
+        categories.append({"name": name or "?", "tokens": size})
+    categories.sort(key=lambda c: -c["tokens"])
+
+    where = "Grad compacts" if source == "grad" else "the CLI compacts"
+    detail = f"{tokens:,} of {ceiling:,} tokens ({where} here)" if ceiling else f"{tokens:,} tokens"
+    if categories:
+        detail += " — " + ", ".join(f"{c['name']} {_tokens(c['tokens'])}" for c in categories[:4])
+    return {
+        "known": True,
+        "tokens": tokens,
+        "limit": ceiling,
+        "fraction": fraction,
+        "label": f"ctx {_tokens(tokens)}" + (f" · {fraction * 100:.0f}%" if ceiling else ""),
+        "tone": tone,
+        "limit_source": source,
+        "detail": detail,
+        "categories": categories,
     }
 
 
@@ -1082,6 +1212,12 @@ def quota_model(*, days: int = 1) -> dict[str, Any]:
         "roles": roles,
         "stages": summary.get("by_stage") or {},
         "total_tokens": summary.get("total_tokens", 0),
+        # The four kinds beside the one number, because they are the answer to
+        # the first question the one number provokes. `billable_tokens` is what
+        # a ceiling is charged; `totals` is what it is charged *for*.
+        "token_counts": summary.get("totals") or {},
+        "billable_tokens": summary.get("billable_tokens", 0),
+        "token_weights": summary.get("weights") or {},
         "total_credits_usd": summary.get("total_credits_usd", 0.0),
         "gpu": {
             "total_usd": rolling.get("total_usd", 0.0),

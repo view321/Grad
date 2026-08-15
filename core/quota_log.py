@@ -18,6 +18,11 @@ from core.ledger_store import now_iso
 # Funnel stages plus the main loop. Free-form strings are allowed; these are the
 # ones the UI knows how to group.
 STAGE_MAIN = "main"
+#: The summary a compaction writes. Its own stage rather than folded into
+#: `main`, because "what did compacting cost me" is the question that decides
+#: whether the threshold is set right, and it is unanswerable if the compaction
+#: turn is filed under the conversation it was compacting.
+STAGE_COMPACT = "compaction"
 STAGE_EXPAND = "funnel.expand"        # stage 0
 STAGE_RETRIEVE = "funnel.retrieve"    # stage 1 (free, logged for latency)
 STAGE_RERANK = "funnel.rerank"        # stage 2 (credits, not quota)
@@ -117,6 +122,92 @@ def entries() -> list[dict[str, Any]]:
     return jsonl.read(paths.quota_path())
 
 
+# ---------------------------------------------------------------------------
+# what a token counts as
+# ---------------------------------------------------------------------------
+#: The four kinds, and the config key that weights each. Ordered as they are
+#: displayed, which is also cheapest-to-dearest for everything except the first.
+KINDS: tuple[tuple[str, str], ...] = (
+    ("input_tokens", "weight_input"),
+    ("output_tokens", "weight_output"),
+    ("cache_read_tokens", "weight_cache_read"),
+    ("cache_write_tokens", "weight_cache_write"),
+)
+
+#: Used when the config cannot be read at all. Same numbers as `config.DEFAULTS`
+#: -- duplicated rather than imported, because `core.budget` calls into here on
+#: the gate path and accounting must not be what takes a session down.
+FALLBACK_WEIGHTS: dict[str, float] = {
+    "weight_input": 1.0,
+    "weight_output": 1.0,
+    "weight_cache_read": 0.1,
+    "weight_cache_write": 1.25,
+}
+
+
+def weights(cfg: Any = None) -> dict[str, float]:
+    """The `[quota]` weights, as floats, with every key present.
+
+    A weight that is missing, non-numeric or negative falls back rather than
+    raising: this is read on the path that decides whether a turn may be issued,
+    and a typo in `grad.toml` should not be able to strand a session. A negative
+    weight is refused specifically because it would make spending *lower* the
+    measured total, which is the one error here that a ceiling cannot survive.
+    """
+    if cfg is None:
+        try:
+            from core import config as config_mod  # noqa: PLC0415
+
+            cfg = config_mod.load()
+        except Exception:  # noqa: BLE001 - see the docstring
+            return dict(FALLBACK_WEIGHTS)
+    out: dict[str, float] = {}
+    for _, key in KINDS:
+        try:
+            value = float(cfg.get("quota", key, FALLBACK_WEIGHTS[key]))
+        except (TypeError, ValueError):
+            value = FALLBACK_WEIGHTS[key]
+        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+            value = FALLBACK_WEIGHTS[key]
+        out[key] = value
+    return out
+
+
+def counts(row: Any) -> dict[str, int]:
+    """The four raw token counts of one record, defaulting to zero.
+
+    **Clamped at zero**, for the same reason `weights` refuses a negative weight:
+    a negative count would *reduce* the measured total, which is the one error a
+    ceiling cannot survive -- one malformed row and a project has spending power
+    it was never allocated. `tools/quota.py record` already refuses a negative
+    at the CLI, but that is not the only door: `from_sdk_usage` records whatever
+    the SDK reports, and the ledger is a file on disk that can be edited. The
+    guard belongs at the read, where every path passes.
+    """
+    get = row.get if isinstance(row, dict) else (lambda k, d=0: getattr(row, k, d))
+    out: dict[str, int] = {}
+    for field, _ in KINDS:
+        try:
+            out[field] = max(0, int(get(field, 0) or 0))
+        except (TypeError, ValueError):
+            out[field] = 0
+    return out
+
+
+def billable(row: Any, weight: dict[str, float] | None = None) -> float:
+    """One record's tokens as a single weighted number.
+
+    **This is the only place the four kinds become one.** `core/budget.py`
+    charges a ceiling with it, `summarise` totals it, and the UI meters it, so a
+    change to what a cache read is worth lands everywhere at once. The four raw
+    counts stay in the record and stay in every summary -- the weighting is how
+    they are *compared*, never a substitute for having them.
+    """
+    weight = weights() if weight is None else weight
+    n = counts(row)
+    return sum(n[field] * weight.get(key, FALLBACK_WEIGHTS[key]) for field, key in KINDS)
+
+
 def summarise(days: int | None = None, *, project: str | None = None) -> dict[str, Any]:
     """Totals by stage, by role, and by project.
 
@@ -143,21 +234,45 @@ def summarise(days: int | None = None, *, project: str | None = None) -> dict[st
                 kept.append(r)
         rows = kept
 
+    weight = weights()
+
     def _fold(key: str, fallback: str) -> dict[str, dict[str, Any]]:
         out: dict[str, dict[str, Any]] = {}
         for r in rows:
             node = out.setdefault(
                 str(r.get(key) or fallback),
                 {"calls": 0, "input_tokens": 0, "output_tokens": 0,
-                 "cache_read_tokens": 0, "cache_write_tokens": 0, "credits_usd": 0.0},
+                 "cache_read_tokens": 0, "cache_write_tokens": 0,
+                 "billable_tokens": 0.0, "credits_usd": 0.0},
             )
             node["calls"] += 1
-            for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
-                node[k] += int(r.get(k, 0) or 0)
+            # Through `counts`, not straight off the record, so the raw figures
+            # and the weighted total are clamped by one rule. Read separately,
+            # a negative row would be excluded from `billable` and included in
+            # the counts printed beside it -- two numbers describing the same
+            # row and disagreeing, which is worse than either being wrong.
+            for k, value in counts(r).items():
+                node[k] += value
+            node["billable_tokens"] += billable(r, weight)
             node["credits_usd"] += float(r.get("credits_usd", 0.0) or 0.0)
-        return {k: {**v, "credits_usd": round(v["credits_usd"], 4)} for k, v in sorted(out.items())}
+        # Rounded here and *not* re-rounded into the grand total below: rounding
+        # each group and then summing accumulates up to half a token of error per
+        # group, which is small but is also entirely avoidable.
+        return {
+            k: {**v,
+                "billable_tokens": round(v["billable_tokens"]),
+                "credits_usd": round(v["credits_usd"], 4)}
+            for k, v in sorted(out.items())
+        }
 
     by_stage = _fold("stage", "unknown")
+    # `total_tokens` stays input + output, because that is what it has always
+    # meant and something reads every field in here. The number that a ceiling
+    # is charged against is `billable_tokens`, and the four raw counts are
+    # reported beside both so the difference between them is visible rather than
+    # buried in a weight -- on the first fortnight of use the two differ by a
+    # factor of twelve, and a reader who cannot see why would be right not to
+    # trust either.
     total_tokens = sum(n["input_tokens"] + n["output_tokens"] for n in by_stage.values())
     return {
         "window_days": days,
@@ -168,6 +283,14 @@ def summarise(days: int | None = None, *, project: str | None = None) -> dict[st
         "by_role": _fold("role", "untagged"),
         "by_project": _fold("project", "unassigned"),
         "total_tokens": total_tokens,
+        "totals": {
+            field: sum(n[field] for n in by_stage.values()) for field, _ in KINDS
+        },
+        # From the rows, not from the rounded per-stage figures above. Summing
+        # values that have each already been rounded carries every group's
+        # rounding error into the one number a ceiling is compared against.
+        "billable_tokens": round(sum(billable(r, weight) for r in rows)),
+        "weights": weight,
         "total_credits_usd": round(sum(n["credits_usd"] for n in by_stage.values()), 4),
         # Anthropic exposes no remaining-quota API and the Max 5x window is
         # opaque, so this is self-measured usage against an assumed budget --

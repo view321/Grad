@@ -61,6 +61,35 @@ def render(workspace: Any) -> None:
 
         kit.hr()
 
+        # The four kinds, spelled out. The ceiling is charged one weighted
+        # number, and the first question that number provokes is "why is it
+        # twelve times what I expected" -- which is unanswerable without this
+        # row and obvious with it. Cache reads are nearly always the largest
+        # entry, and that is the point rather than a defect.
+        kit.label(f"tokens · {model.get('days', 1)}d")
+        counts = model.get("token_counts") or {}
+        weights = model.get("token_weights") or {}
+        if not counts:
+            kit.text("nothing recorded in this window", "grad-caption")
+        else:
+            kit.kv([
+                (label, f"{counts.get(field, 0):,}  × {weights.get(key, 1.0):g}")
+                for field, key, label in (
+                    ("input_tokens", "weight_input", "input"),
+                    ("output_tokens", "weight_output", "output"),
+                    ("cache_read_tokens", "weight_cache_read", "cache read"),
+                    ("cache_write_tokens", "weight_cache_write", "cache write"),
+                )
+            ])
+            with kit.row("", gap=14).style("margin-top: 6px"):
+                kit.text(
+                    f"{model.get('billable_tokens', 0):,} charged to the ceiling",
+                    "grad-mono",
+                    tag="span",
+                )
+
+        kit.hr()
+
         kit.label(f"spend today · {model.get('days', 1)}d")
         roles = model.get("roles") or []
         if not roles:

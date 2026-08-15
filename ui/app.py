@@ -45,7 +45,12 @@ from typing import Any
 
 from core import appdata, config as config_mod, instance, migrate, paths
 from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
-ROLES = ("user", "assistant")
+#: Roles the chat window knows how to draw, and therefore the ones `restore`
+#: keeps. `system` is the compaction marker: not something anyone said, but the
+#: record of the moment the agent's memory of this transcript was replaced --
+#: which is the one event a reader needs in order to interpret everything above
+#: it correctly.
+ROLES = ("user", "assistant", "system")
 STATIC_URL = "/grad-static"
 
 #: The port `run()` bound, so the rest of the app can name its own origin. The
@@ -121,6 +126,19 @@ class Session:
         #: for it: a fire-and-forget interrupt can outlive the turn it was aimed
         #: at and land on the one after it.
         self._stopping: asyncio.Task[None] | None = None
+        #: The last reading from `get_context_usage`, or None before the first
+        #: one. The statusline draws it; `ui/models.py:context_model` decides
+        #: what it means. None is a state the meter renders, not an error.
+        self.context: dict[str, Any] | None = None
+        #: One reading at a time. The call is a control request over the same
+        #: transport a turn is streaming on, and a slow one must not be able to
+        #: queue a second behind it every time the poll timer fires.
+        self._reading_context = False
+        #: The handover note a compaction left, waiting for somewhere to go. It
+        #: rides in front of the next prompt rather than being sent as a turn of
+        #: its own, which would spend a round-trip to produce an answer nobody
+        #: asked for. Cleared once it has been sent.
+        self.pending_seed: str | None = None
 
     async def start(self) -> None:
         if self.client is not None:
@@ -245,6 +263,13 @@ class Session:
         the app, and leaks a whole set on any later reconnect.
         """
         client, self.client = self.client, None
+        # The reading belongs to the client that answered it. Keeping it across a
+        # close would leave the meter reporting the context of a conversation
+        # that no longer exists -- and every path that drops a client (a session
+        # switch, a workspace rebind, an interrupt) is one where the next context
+        # is a different size, usually much smaller. A stale high reading there
+        # is exactly the reading that would trigger a needless compaction.
+        self.context = None
         if client is not None:
             try:
                 await client.__aexit__(None, None, None)
@@ -298,6 +323,12 @@ class Session:
             self._idle.set()
             raise
 
+        # The transcript records what the *user* said; the seed is machinery and
+        # goes only to the model. Putting it in `settled` would show the handover
+        # note as though the user had typed it, which is both wrong and, given
+        # its length, the thing you would then have to scroll past forever.
+        seed, self.pending_seed = self.pending_seed, None
+        sent = f"{seed}\n\n---\n\n{prompt}" if seed else prompt
         self.settled.append({"role": "user", "text": prompt})
         # The turn lands in the stream's blocks as it arrives; the chat window's
         # ~15 Hz timer is what turns that into something on screen. The same list
@@ -312,7 +343,7 @@ class Session:
             # whether the budget applies.
             result = await agent.drive_turn(
                 self.client,
-                prompt,
+                sent,
                 stream,
                 # Recorded as it arrives rather than read off the return value,
                 # which an interrupted turn never reaches. That id is what lets
@@ -327,6 +358,7 @@ class Session:
             # Not an error in the transcript's sense: the system did what it
             # says it does. It still has to be visible, because otherwise the
             # composer just goes quiet.
+            self.pending_seed = self.pending_seed or seed
             stream.note(
                 f"\n\n**{exc.refusal['message']}**\n\n`{exc.refusal['fix']}`"
             )
@@ -337,6 +369,13 @@ class Session:
             # message can carry a URL with a token in it, a header, or a path,
             # and both of those destinations are readable long after the fact.
             log.exception("session turn failed")
+            # Put the handover note back. It was consumed by a turn that did not
+            # complete, and it is the only remaining record of everything the
+            # compaction discarded -- dropping it here would mean one failed
+            # turn, immediately after a compaction, silently costs the session
+            # its entire memory. Re-sending it on the next turn is at worst
+            # redundant context; the model may not have read it at all.
+            self.pending_seed = self.pending_seed or seed
             # Whatever streamed before the failure is kept: a turn that died
             # half-way is more legible with its half than without it -- and a
             # tool card left mid-flight says which call it died on.
@@ -474,6 +513,124 @@ class Session:
     def _remember_sdk_session(self, sdk_session_id: str) -> None:
         self.sdk_session_id = sdk_session_id
 
+    async def read_context(self) -> dict[str, Any] | None:
+        """Refresh the context reading. Never raises, never blocks a turn.
+
+        `get_context_usage` is a control request, not a model call: it costs no
+        tokens and it is answered by the CLI from state it already has. That is
+        what makes polling it reasonable at all, and it is why this is a poll
+        rather than something folded into `drive_turn` -- the number worth
+        watching is the one that climbs *during* a long turn, and a turn that
+        runs for forty minutes would otherwise report its context once, at the
+        end, when nothing can be done about it.
+
+        Every failure is swallowed to None. An SDK without the method, a client
+        mid-restart, a control request that races a shutdown: none of them are
+        worth a line in the transcript, and all of them are indistinguishable to
+        a reader from "no session yet", which the meter already draws.
+        """
+        client = self.client
+        if client is None or self._reading_context:
+            return self.context
+        reader = getattr(client, "get_context_usage", None)
+        if reader is None:
+            return self.context
+        self._reading_context = True
+        try:
+            usage = await reader()
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            log.debug("context usage unavailable", exc_info=exc)
+            return self.context
+        finally:
+            self._reading_context = False
+        if isinstance(usage, dict):
+            self.context = usage
+        return self.context
+
+    async def maybe_compact(self) -> dict[str, Any] | None:
+        """Compact if the context has passed the configured threshold.
+
+        Called after a turn settles, which is the only safe moment: this drops
+        the client and builds another, and doing that underneath a running
+        `receive_response` is the failure `_stop_turn` exists to clean up after.
+
+        The order matters and is the whole method. The note is written *first*,
+        while the outgoing session still remembers everything and its cache is
+        warm; only then is the client dropped. Reversed, there would be nothing
+        left to summarise.
+
+        `pending_seed` rather than an immediate turn: sending the note now would
+        cost a whole round-trip to produce an answer nobody asked for. Held, it
+        rides along with whatever the user says next and costs nothing.
+        """
+        from core import compaction  # noqa: PLC0415
+
+        cfg = config_mod.load()
+        usage = await self.read_context()
+        if not compaction.should_compact(usage, cfg):
+            return None
+        before = compaction.context_tokens(usage)
+        return await self.compact(reason=f"context reached {before:,} tokens")
+
+    async def compact(self, *, reason: str = "") -> dict[str, Any]:
+        """Summarise this conversation and start a fresh one holding the summary.
+
+        Separated from `maybe_compact` so it can be asked for directly -- the
+        threshold is a default, not the only reason to want this, and a session
+        that has wandered is worth compacting at any size.
+        """
+        import agent  # noqa: PLC0415
+        from core import compaction  # noqa: PLC0415
+
+        if self.busy:
+            return {"ok": False, "message": "a turn is still running — interrupt it first"}
+        if self.client is None:
+            return {"ok": False, "message": "nothing to compact — no session is connected"}
+
+        before = compaction.context_tokens(self.context)
+        self.busy = True
+        self._idle.clear()
+        try:
+            handoff = await compaction.write_handoff(
+                self.client, agent.drive_turn, session=self.session_id
+            )
+        except agent.BudgetRefused as exc:
+            # No carve-out. A compaction is a model call and the allocation
+            # applies to it like any other -- exempting it would make "compact"
+            # the way to keep spending after the ceiling, and the ceiling is the
+            # feature. The conversation is left intact and oversized, which is
+            # recoverable; the alternative is not.
+            return {"ok": False, "message": exc.refusal["message"], "fix": exc.refusal["fix"]}
+        except Exception as exc:  # noqa: BLE001 - a failed compaction keeps the session
+            log.exception("could not write the handoff note")
+            return {
+                "ok": False,
+                "message": f"could not summarise the session ({type(exc).__name__}) — nothing was discarded",
+            }
+        finally:
+            self.busy = False
+            self._idle.set()
+
+        # The fresh conversation is a *new* SDK session, so the resume id has to
+        # go. Leaving it would have `start()` resume the very conversation this
+        # is discarding, quietly restoring the context that was just summarised
+        # and making the whole operation a cost with no effect.
+        await self.close()
+        self.sdk_session_id = None
+        self.pending_seed = compaction.seed_message(handoff["note"], tokens_before=before)
+
+        entry = compaction.record(
+            tokens_before=before,
+            tokens_after=0,
+            note=handoff["note"],
+            cost=handoff.get("quota"),
+        )
+        if reason:
+            entry["reason"] = reason
+        self.settled.append(entry)
+        self._persist()
+        return {"ok": True, "message": f"compacted at {before:,} tokens", "record": entry}
+
     def say(self, message: str) -> None:
         """A line for the status bar, when there is one to put it in."""
         log.info("%s", message)
@@ -547,6 +704,15 @@ class Session:
                 blocks = _drawable_blocks(record.get("blocks"))
                 if blocks:
                     kept["blocks"] = blocks
+                # Carried through the filter rather than dropped by it, so a
+                # compaction marker still reads as one after a reload instead of
+                # degrading into an anonymous message from nobody. Both are
+                # copied defensively: this file outlives the version that wrote
+                # it, and the renderer subscripts them.
+                if isinstance(record.get("kind"), str):
+                    kept["kind"] = record["kind"]
+                if isinstance(record.get("note"), str):
+                    kept["note"] = record["note"]
                 self.settled.append(kept)
 
 
