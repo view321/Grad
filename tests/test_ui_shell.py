@@ -91,9 +91,18 @@ def html_of(client: Client) -> str:
 @pytest.mark.parametrize("window", registry.ids())
 def test_every_window_renders_on_an_empty_workspace(rendered, window):
     """The empty state is the state a new user sees, so it is the one most
-    worth proving renders at all."""
+    worth proving renders at all.
+
+    The element count is not enough on its own and never was: `shell._render`
+    turns a window that raises into a card saying so, deliberately, so that ten
+    working windows and one broken one is still a usable workspace -- and that
+    card is elements too. A `_Statusline` method that got dedented out of its
+    class took the whole chat window down, and this test watched it happen and
+    passed, because a failure card is bigger than ten elements.
+    """
     client, _ = rendered([window])
     assert len(client.elements) > 10
+    assert "failed to render" not in html_of(client)
 
 
 def test_all_eleven_render_together(rendered):
@@ -103,6 +112,7 @@ def test_all_eleven_render_together(rendered):
     assert "grad-shell" in markup
     assert "grad-tiles" in markup
     assert "grad-statusbar" in markup
+    assert "failed to render" not in markup
 
 
 def test_a_window_whose_render_raises_does_not_take_the_shell_down(rendered, monkeypatch):
@@ -427,14 +437,103 @@ def test_a_new_turn_clears_the_tail_rather_than_stacking_onto_it(rendered):
 
 def test_the_status_line_names_the_call_in_flight(rendered):
     """A spinner says something is happening; naming the command says a
-    40-minute job is running and which one."""
+    40-minute job is running and which one.
+
+    The fallbacks changed with the statusline: `running …` was the only thing it
+    could say when no call was in flight, which covered "reasoning", "writing"
+    and "nothing has come back yet" with one word. Each is now named, because
+    each is a different answer to "why is nothing on screen".
+    """
     from ui.windows.chat import _activity
 
-    assert _activity([]) == "running …"
+    assert _activity([]) == "waiting for the model"
     assert _activity([
         {"kind": "tool", "name": "Bash", "title": "python -m tools.jobs run", "status": "running"},
     ]) == "running Bash python -m tools.jobs run"
-    assert _activity([{"kind": "tool", "name": "Bash", "title": "ls", "status": "ok"}]) == "running …"
+    # A finished call is not an activity; what is happening is whatever came
+    # after it, and the reasoning is as specific as that gets.
+    assert _activity([
+        {"kind": "tool", "name": "Bash", "title": "ls", "status": "ok"},
+        {"kind": "thinking", "text": "one entry, so the claim holds"},
+    ]) == "thinking"
+    assert _activity([
+        {"kind": "thinking", "text": "working it out"},
+        {"kind": "text", "text": "The answer is"},
+    ]) == "writing"
+
+
+def test_the_statusline_switches_the_reasoning_without_redrawing_the_transcript(rendered):
+    """A toggle that rebuilt the transcript would take its scroll position with
+    it, which is the same reason the poll never touches this window. So the
+    blocks are always in the DOM and a class decides whether they are painted.
+
+    Clicked rather than called: the first version of this test drove
+    `Workspace.toggle_reasoning` and wrote the class by hand, which exercised
+    everything except the handler on the bar -- and the handler was the half
+    that was broken.
+    """
+    client, space = rendered(["chat"])
+    with client:
+        assert space.show_reasoning is False
+        roots = [
+            e for e in client.elements.values() if "grad-chat" in getattr(e, "classes", [])
+        ]
+        assert roots, "the chat root carries the class the switch writes"
+        assert "reasoning-on" not in roots[0].classes
+
+        bars = [
+            e for e in client.elements.values()
+            if "grad-statusline" in getattr(e, "classes", [])
+        ]
+        assert len(bars) == 1
+
+        click(bars[0])
+        assert space.show_reasoning is True
+        assert "reasoning-on" in roots[0].classes
+        # Said once, at the click: switching on something that reveals nothing
+        # is indistinguishable from a switch that does not work.
+        assert "no reasoning in this session yet" in (space.notice or "")
+
+        click(bars[0])
+        assert space.show_reasoning is False
+        assert "reasoning-on" not in roots[0].classes
+
+
+def test_the_statusline_reports_the_call_in_flight_as_the_turn_moves(rendered):
+    """`sync` is the method the flush timer drives at 15 Hz, and it was the
+    other half dedented out of the class."""
+    client, space = rendered(["chat"])
+    with client:
+        bar = next(
+            e for e in client.elements.values()
+            if "grad-statusline" in getattr(e, "classes", [])
+        )
+        line = chat_statusline(space, bar)
+        space.session.busy = True
+        line.sync([{"kind": "tool", "name": "Bash", "title": "pytest -q", "status": "running"}])
+        assert "RUNNING" in html_of(client)
+        assert "running Bash pytest -q" in html_of(client)
+
+
+def chat_statusline(space, bar):
+    """The `_Statusline` behind a rendered bar, via the handler bound to it."""
+    for listener in bar._event_listeners.values():  # noqa: SLF001 - no public hook
+        if listener.type == "click" and listener.handler is not None:
+            return listener.handler.__self__
+    raise AssertionError("the statusline has no click handler")
+
+
+def test_the_session_picker_is_the_workspaces_own_menu(rendered):
+    """The last Quasar control in the workspace. A `select` has one string per
+    option, so "another window has this open" arrived as a ` · ` fragment glued
+    onto the title and looked exactly like the rows that can be opened."""
+    client, space = rendered(["chat"])
+    with client:
+        selects = [
+            e for e in client.elements.values() if type(e).__name__ == "Select"
+        ]
+        assert selects == []
+        assert "grad-session-btn" in html_of(client)
 
 
 def test_the_focused_window_is_marked(rendered):

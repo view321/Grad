@@ -27,6 +27,9 @@ only, by `tools/lab.py`.
 """
 
 import os
+import pathlib
+import re
+import sys
 
 # The Grad UI's origin. `tools/lab.py` sets this when it launches the server, so
 # the two cannot drift apart; the default matches ui/app.py's default port.
@@ -58,12 +61,45 @@ c.ServerApp.tornado_settings = {
         "X-Frame-Options": "",
     },
 }
-c.ServerApp.allow_origin = _APP_ORIGIN
+# The same pair of hosts as the CSP above, and for the same reason. `allow_origin`
+# takes exactly one origin, so setting it to `127.0.0.1:<port>` rejects the
+# websocket when the app is opened on `localhost:<port>` -- and *that* failure is
+# the confusing half: the page renders, the frame loads, and only the kernel
+# connection dies. `allow_origin_pat` is the regex form, which is how both can be
+# named without widening this to `*`.
+_ORIGINS = [_APP_ORIGIN] + ([_LOCALHOST_ALIAS.strip()] if _LOCALHOST_ALIAS else [])
+c.ServerApp.allow_origin_pat = "|".join(re.escape(origin) for origin in _ORIGINS)
 c.ServerApp.allow_credentials = True
 
 # The websocket the kernel connection rides on.
 c.ServerApp.allow_remote_access = False
 c.ServerApp.disable_check_xsrf = False
+
+# Where jupyter-lsp looks for language servers, stated rather than discovered.
+#
+# `LanguageServerManager.node_roots` is a traitlet with a `@default` generator,
+# and that generator ends by running `npm prefix -g` to find a custom global
+# prefix (jupyter_lsp/types.py, `_default_node_roots`). It is a `subprocess.run`
+# with no `creationflags`, and on Windows `npm` is `npm.cmd` -- a batch file, so
+# Windows runs it through `cmd.exe`. That is the black window titled *npm
+# prefix* that appears a second or two after the Lab tab starts.
+#
+# Setting the trait here means the `@default` generator never runs, so the probe
+# never happens. The list below is what the generator would have produced minus
+# that last step: the server's own root, JupyterLab's staging directory, and the
+# environment prefix (conda puts `node_modules` in `$PREFIX/lib` on POSIX and
+# directly in `%PREFIX%` on Windows). `extra_node_roots` is searched first and is
+# left alone, so a user who installs a language server somewhere unusual still
+# has the documented way to say so.
+_NODE_ROOTS = [str(pathlib.Path.cwd())]
+try:
+    from jupyterlab import commands as _lab_commands
+
+    _NODE_ROOTS.append(str(pathlib.Path(_lab_commands.get_app_dir()) / "staging"))
+except Exception:  # noqa: BLE001 - a missing staging dir is not a reason to fail startup
+    pass
+_NODE_ROOTS += [str(pathlib.Path(sys.prefix) / "lib"), str(pathlib.Path(sys.prefix))]
+c.LanguageServerManager.node_roots = _NODE_ROOTS
 
 # Kernel ownership discipline (§19): Lab has its own kernel manager and
 # `tools/nb.py` spawns its own detached kernels. Two owners over one notebook

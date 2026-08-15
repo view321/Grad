@@ -27,8 +27,11 @@ Notebooks tab is worth more than the embed, and it is why that was built first.
    deliberately unsandboxed. Lab stays on its own port and never shares the UI's
    storage secret.
 3. *Pin everything.* The JupyterLab 3->4 break is what killed the Tabnine
-   extension. `pyproject.toml`'s `lab` extra pins JupyterLab itself and every
-   extension, so an unrelated `pip install -U` cannot take the app down.
+   extension. `pyproject.toml` pins JupyterLab in the `lab` extra and every
+   extension in `lab-extensions`, exactly rather than as a floor, so an
+   unrelated `pip install -U` cannot take the app down. The `ui` extra depends
+   on `lab`, because the notebook window's interior *is* Lab and an app that
+   ships that window without a server to put in it ships a button that fails.
 
 "Connect an arbitrary extension" therefore means: add a pin, reinstall, restart.
 """
@@ -45,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from core import jsonl, paths
+from core import appdata, jsonl, paths, spawn
 from core.cli import Cli, main
 from core.errors import ConfigError, GradError
 
@@ -68,11 +71,14 @@ DEFAULT_PORT = 8889
 
 
 def _state_path() -> Path:
-    return paths.data_dir() / "lab" / "lab.json"
+    """Under the app directory, not the workspace: this file carries the Lab
+    server's token, and a freshly minted secret does not belong in a folder
+    somebody will eventually commit."""
+    return appdata.state_dir() / "lab" / "lab.json"
 
 
 def _log_path() -> Path:
-    return paths.data_dir() / "lab" / "lab.log"
+    return appdata.logs_dir() / "lab.log"
 
 
 def _jupyter_config_dir() -> Path:
@@ -90,7 +96,10 @@ def _executable() -> str:
         return found
     raise ConfigError(
         "jupyter is not installed, so there is no Lab server to start",
-        fix="pip install -e '.[lab]'   # pins jupyterlab and every extension",
+        fix=(
+            "pip install -e '.[ui]'   # the desktop app ships the Lab server it embeds; "
+            "add ,lab-extensions for the pinned extension set"
+        ),
     )
 
 
@@ -121,7 +130,11 @@ def _alive(pid: int | None) -> bool:
     if not pid:
         return False
     if os.name == "nt":
-        out = subprocess.run(
+        # Through `spawn.run`: this is called on every `lab start` and `lab
+        # status`, and `tasklist` is a console program. Under the desktop app
+        # there is no console to inherit, so each check opened one -- a black
+        # window over the workspace for as long as it took to list one process.
+        out = spawn.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
             capture_output=True, text=True, check=False,
         )
@@ -153,9 +166,21 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     worse trade than re-reading the file after a restart.
     """
     state = _read_state()
-    if not args.force and state.get("port") and _listening(int(state["port"])) and _alive(state.get("pid")):
+    running = bool(
+        state.get("port") and _listening(int(state["port"])) and _alive(state.get("pid"))
+    )
+    # A server already up on the *right* origin is the one thing worth not
+    # restarting. On the wrong one it is worse than nothing: the framing headers
+    # are fixed at launch, so the iframe is blocked and the browser reports it as
+    # "127.0.0.1 refused to connect" -- which reads as a dead port and sends you
+    # looking for a server that is running perfectly well. Restarting is the only
+    # way to change a header that was decided at start time.
+    stale_origin = running and state.get("ui_origin") != args.ui_origin
+    if running and not args.force and not stale_origin:
         return {**state, "already_running": True,
                 "next": "python -m tools.lab status --json"}
+    if stale_origin:
+        cmd_stop(argparse.Namespace())
 
     executable = _executable()
     port = _free_port(args.port)
@@ -190,28 +215,21 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         f"--ServerApp.config_file={_jupyter_config_dir() / 'jupyter_server_config.py'}",
     ]
 
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-    else:
-        start_new_session = True
-
     with open(log, "ab") as fh:
-        proc = subprocess.Popen(
+        # Detached, which on Windows also means *no console at all* -- a
+        # stronger promise than `CREATE_NO_WINDOW`, and not combinable with it.
+        # See `core/spawn.py`.
+        server = subprocess.Popen(
             argv, cwd=str(paths.root()), stdout=fh, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL, env=env,
-            creationflags=creationflags, start_new_session=start_new_session,
+            stdin=subprocess.DEVNULL, env=env, **spawn.detached(),
         )
 
     deadline = time.time() + 30
     while time.time() < deadline and not _listening(port):
-        if proc.poll() is not None:
+        if server.poll() is not None:
             raise GradError(
                 "lab_died",
-                f"the Lab server exited immediately (code {proc.returncode})",
+                f"the Lab server exited immediately (code {server.returncode})",
                 exit_code=8,
                 fix=f"read {log}",
                 detail={"log": str(log)},
@@ -221,7 +239,7 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     record = {
         "port": port,
         "token": token,
-        "pid": proc.pid,
+        "pid": server.pid,
         "url": f"http://127.0.0.1:{port}/lab",
         "root_dir": str(paths.root()),
         "ui_origin": args.ui_origin,
@@ -294,7 +312,7 @@ def cmd_extensions(_: argparse.Namespace) -> dict[str, Any]:
 
     def _run(argv: list[str]) -> dict[str, Any]:
         try:
-            out = subprocess.run(
+            out = spawn.run(
                 argv, capture_output=True, text=True, timeout=120, env=env, check=False
             )
         except subprocess.TimeoutExpired:
@@ -325,7 +343,7 @@ def cmd_stop(_: argparse.Namespace) -> dict[str, Any]:
         jsonl.write_json(_state_path(), {})
         return {"stopped": False, "note": "no Lab server was running"}
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+        spawn.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
     else:
         import signal  # noqa: PLC0415
 

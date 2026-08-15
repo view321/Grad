@@ -60,7 +60,45 @@
     const totalPx = panes.reduce((sum, p) => sum + size(p), 0);
 
     handle.classList.add('dragging');
+    // The same class the *retile* drag sets, and for the reason recorded beside
+    // its rule in `ui/tokens.py`: a cross-origin iframe hit-tests the pointer
+    // before this document does. Only the title-bar drag was setting it, and
+    // this is the drag that starts *adjacent* to a pane.
+    //
+    // The inline cursor below outranks the class's `grabbing`, so the resize
+    // cursor is still the one shown.
+    document.body.classList.add('grad-dragging');
     document.body.style.cursor = vertical ? 'row-resize' : 'col-resize';
+
+    /* Pointer capture, and listeners on the *handle* rather than the document.
+     *
+     * A drag has exactly one way to end correctly and several ways to end
+     * badly, and the bad ones all used to leave the same wreckage: the move
+     * listener still attached, `grad-dragging` still on the body, the resize
+     * cursor still showing, and the next stray movement going on resizing with
+     * no button held. Listening on the document catches none of them, because
+     * the events stop arriving at the document:
+     *
+     *   - the pointer crosses into the embedded Lab, which hit-tests first;
+     *   - it leaves the window entirely and the button comes up outside;
+     *   - the window loses focus mid-drag, or the OS cancels the gesture.
+     *
+     * `setPointerCapture` retargets every subsequent pointer event for this
+     * pointer to the handle until it is released, which covers the first two by
+     * construction -- capture outranks hit-testing, and events keep arriving
+     * past the window edge. `pointercancel` and `lostpointercapture` cover the
+     * third: whatever takes the gesture away, one of them fires, and both run
+     * the same teardown. `finish` is idempotent because releasing capture
+     * inside it raises `lostpointercapture` re-entrantly.
+     */
+    let done = false;
+    try {
+      handle.setPointerCapture(event.pointerId);
+    } catch (err) {
+      // No capture available (a synthetic event, an ancient engine). The
+      // listeners below still work; only the iframe and out-of-window cases
+      // degrade to the old behaviour, which `finish` then cleans up on blur.
+    }
 
     const onMove = (moveEvent) => {
       const delta = (vertical ? moveEvent.clientY : moveEvent.clientX) - startPos;
@@ -72,10 +110,23 @@
       reflowFrames();
     };
 
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+    const finish = (endEvent) => {
+      if (done) return;
+      done = true;
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', finish);
+      handle.removeEventListener('lostpointercapture', finish);
+      window.removeEventListener('blur', finish);
+      try {
+        if (handle.hasPointerCapture?.(event.pointerId)) {
+          handle.releasePointerCapture(event.pointerId);
+        }
+      } catch (err) {
+        /* already released with the element, or never captured */
+      }
       handle.classList.remove('dragging');
+      document.body.classList.remove('grad-dragging');
       document.body.style.cursor = '';
       emit('grad_resize', {
         axis: vertical ? 'slots' : 'columns',
@@ -85,12 +136,18 @@
       });
     };
 
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
+    handle.addEventListener('lostpointercapture', finish);
+    window.addEventListener('blur', finish);
     event.preventDefault();
   };
 
-  document.addEventListener('mousedown', (event) => {
+  document.addEventListener('pointerdown', (event) => {
+    // Primary button only: a right-click on a divider is a context menu, not a
+    // resize that never ends because no `pointerup` for button 2 is coming.
+    if (event.button !== 0) return;
     const handle = event.target.closest?.('.grad-handle');
     if (handle) startDrag(handle, event);
   });
@@ -299,22 +356,47 @@
    * living inside it, so the pane tree can be torn down and rebuilt around it
    * without the browser reloading the document. */
   const frames = new Map();
+  //: Assigned at the bottom of this block, where the loop it starts is defined.
+  //: Only ever called from `gradRegisterFrame`, which runs long after.
+  let startLoop = () => {};
+
+  /* Placing an overlay costs a layout, and writing the four position properties
+   * dirties layout again for the next reader. On the overwhelming majority of
+   * passes the numbers are identical -- a pane that has not moved -- so the box
+   * is remembered and the writes are skipped. This matters far more than it
+   * looks: with a whole JupyterLab document in the frame, the layout each
+   * needless write forces is not a small one. */
+  const place = (frame, next) => {
+    if (frame.__gradBox === next) return;
+    frame.__gradBox = next;
+    if (next === null) {
+      frame.style.display = 'none';
+      return;
+    }
+    frame.style.display = 'block';
+    frame.style.left = `${next[0]}px`;
+    frame.style.top = `${next[1]}px`;
+    frame.style.width = `${next[2]}px`;
+    frame.style.height = `${next[3]}px`;
+  };
 
   const reflowFrames = () => {
     frames.forEach((frame, anchorId) => {
       const anchor = document.getElementById(anchorId);
       if (!anchor) {
-        frame.style.display = 'none';
+        place(frame, null);
         return;
       }
       const box = anchor.getBoundingClientRect();
       const visible = box.width > 1 && box.height > 1 && box.bottom > 0 && box.top < window.innerHeight;
-      frame.style.display = visible ? 'block' : 'none';
-      if (!visible) return;
-      frame.style.left = `${Math.round(box.left)}px`;
-      frame.style.top = `${Math.round(box.top)}px`;
-      frame.style.width = `${Math.round(box.width)}px`;
-      frame.style.height = `${Math.round(box.height)}px`;
+      if (!visible) {
+        place(frame, null);
+        return;
+      }
+      const next = [Math.round(box.left), Math.round(box.top), Math.round(box.width), Math.round(box.height)];
+      const held = frame.__gradBox;
+      if (held && held[0] === next[0] && held[1] === next[1] && held[2] === next[2] && held[3] === next[3]) return;
+      place(frame, next);
     });
   };
 
@@ -322,6 +404,7 @@
     let frame = frames.get(anchorId);
     if (frame && frame.dataset.src === src) {
       reflowFrames();
+      startLoop();
       return;
     }
     if (frame) frame.remove();
@@ -337,6 +420,7 @@
     document.body.appendChild(frame);
     frames.set(anchorId, frame);
     reflowFrames();
+    startLoop();
   };
 
   window.gradDropFrame = (anchorId) => {
@@ -368,13 +452,43 @@
 
   window.addEventListener('resize', reflowFrames);
   window.addEventListener('scroll', reflowFrames, true);
-  // The pane tree is rebuilt by the server on every retile, so the anchor is a
-  // different element each time; polling one frame per animation frame is both
-  // cheaper and more reliable than trying to observe a node that keeps being
-  // replaced.
-  const tick = () => {
-    reflowFrames();
+
+  /* The pane tree is rebuilt by the server on every retile, so the anchor is a
+   * different element each time; polling is more reliable than trying to
+   * observe a node that keeps being replaced. What it does not have to be is
+   * *per frame*. Everything a person does directly -- dragging a divider,
+   * scrolling, resizing the window -- already reflows on its own event, so this
+   * loop only has to catch changes the server made, and 15 Hz is well under the
+   * rate anyone notices a frame settling into a new pane.
+   *
+   * The difference is not academic. The old loop measured and repositioned
+   * sixty times a second for the lifetime of the page, whether or not anything
+   * had moved and whether or not a frame existed at all -- and every one of
+   * those passes reached into a layout containing an embedded JupyterLab. It
+   * ran hardest in exactly the state it was most expensive in. */
+  const POLL_MS = 66;
+  let looping = false;
+  let lastPoll = 0;
+
+  const tick = (now) => {
+    if (!frames.size) {
+      // Nothing to place: stop entirely rather than idle. `gradRegisterFrame`
+      // starts it again, so the workspace pays nothing for this until a window
+      // that embeds something is actually open.
+      looping = false;
+      return;
+    }
+    if (now - lastPoll >= POLL_MS) {
+      lastPoll = now;
+      reflowFrames();
+    }
     window.requestAnimationFrame(tick);
   };
-  window.requestAnimationFrame(tick);
+
+  startLoop = () => {
+    if (looping) return;
+    looping = true;
+    lastPoll = 0;
+    window.requestAnimationFrame(tick);
+  };
 })();

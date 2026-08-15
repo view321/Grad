@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import re
+import time as _time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -397,7 +398,7 @@ def credentials_model() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 0b. background tasks
 # ---------------------------------------------------------------------------
-def tasks_model() -> dict[str, Any]:
+def tasks_model(agent: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Local commands the workspace started, newest first.
 
     Deliberately not merged into `queue_model`. Both lists hold things that are
@@ -416,6 +417,11 @@ def tasks_model() -> dict[str, Any]:
     task redrew the whole window forever -- the opposite of what the paragraph
     above claims. Seconds resolution below a minute is finer than anyone reads
     a background task at, and it makes the docstring true.
+
+    `agent` is the other half of the same question -- the calls the agent itself
+    has in flight, from `agent_calls_model`. Passed in rather than read here
+    because it comes from the live session rather than from a file, which is the
+    one thing this module never reaches for.
     """
     from ui import tasks as tasks_mod
 
@@ -443,15 +449,101 @@ def tasks_model() -> dict[str, Any]:
                 "dropped": task.dropped,
             }
         )
+    calls = list(agent or [])
     return {
         "rows": rows,
         "running": len([r for r in rows if r["running"]]),
         "finished": len([r for r in rows if not r["running"]]),
+        "agent": calls,
+        "agent_running": len([c for c in calls if c["running"]]),
         "empty_fix": (
             "nothing has been started from the workspace yet — VERIFY, RE-CHECK, "
-            "REBUILD and BUILD PDF all run here"
+            "REBUILD and BUILD PDF all run here, and the agent's own calls appear "
+            "here while they run"
         ),
     }
+
+
+#: How many of the agent's own calls the window keeps. Enough to cover the turn
+#: in flight and the ones just before it; not so many that this becomes a second
+#: transcript, which is what the chat window already is.
+AGENT_CALLS = 20
+#: Lines of a finished call's output kept on the row. The whole thing is already
+#: bounded by `agent.clip`; this is the glance version.
+AGENT_TAIL_LINES = 8
+
+#: A call's recorded status -> how the tasks window reports it. `running` is
+#: absent because it depends on *where* the call is: still running in the turn in
+#: flight, or left running by a turn that ended, which is a different fact.
+CALL_STATE_TONE = {"ok": ("ok", "ok"), "error": ("failed", "broken")}
+
+
+def agent_calls_model(session: Any) -> list[dict[str, Any]]:
+    """The agent's own tool calls: the turn in flight first, then the ones before.
+
+    Every capability in this project is reached by a Bash into `tools/`, so the
+    agent's calls are the other half of "what is running on this machine right
+    now" -- and until this they were visible only in the transcript, which is the
+    wrong place to look for it once the conversation has scrolled on.
+
+    They are listed *apart* from the workspace's own tasks rather than merged,
+    for the reason `tasks_model` gives about the queue: a task is a process this
+    app started and can stop, a call is one the agent made and only the agent can
+    stop. One table showing both would imply a STOP button that does not exist.
+
+    A call that is still `running` in a turn that has already settled is reported
+    as `unfinished`, not as running. The turn died or was interrupted mid-call,
+    and the process behind it is not this app's to know about -- saying "running"
+    of something nothing is waiting for would be the same lie as a task that
+    silently forgets its tail.
+    """
+    live = list(getattr(session, "blocks", None) or [])
+    rows = [_call_row(b, live=True) for b in reversed(live) if b.get("kind") == "tool"]
+    for record in reversed(list(getattr(session, "settled", None) or [])):
+        if len(rows) >= AGENT_CALLS:
+            break
+        for block in reversed(record.get("blocks") or []):
+            if block.get("kind") == "tool":
+                rows.append(_call_row(block, live=False))
+    return rows[:AGENT_CALLS]
+
+
+def _call_row(block: dict[str, Any], *, live: bool) -> dict[str, Any]:
+    status = str(block.get("status") or "ok")
+    running = live and status == "running"
+    if running:
+        state, tone = "running", "dashed"
+    elif status == "running":
+        state, tone = "unfinished", "attention"
+    else:
+        state, tone = CALL_STATE_TONE.get(status, ("done", "neutral"))
+    result = str(block.get("result") or "")
+    return {
+        "id": str(block.get("id") or ""),
+        "name": str(block.get("name") or "tool"),
+        "subject": str(block.get("title") or ""),
+        "state": state,
+        "tone": tone,
+        "running": running,
+        # Only for a call actually in flight. `started` is wall clock so it
+        # survives the session file, but a *finished* call's duration is not
+        # something the block records, and inventing one would be worse than the
+        # dash. Bucketed for the same reason a task's is: the poll fingerprints
+        # the whole model, and a second-by-second clock would redraw the window
+        # forever on a call that is doing nothing visible.
+        "elapsed": _call_elapsed(block) if running else "",
+        "tail": "\n".join(result.splitlines()[-AGENT_TAIL_LINES:]),
+        "lines": len(result.splitlines()),
+    }
+
+
+def _call_elapsed(block: dict[str, Any]) -> str:
+    started = block.get("started")
+    if not isinstance(started, (int, float)) or isinstance(started, bool):
+        # A transcript written before calls were stamped. The row is still worth
+        # showing; the clock is the part that is not known.
+        return ""
+    return _duration(max(0.0, _time.time() - float(started)), coarse=True)
 
 
 def _tail_runs(tail: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -624,24 +716,99 @@ def notebook_model() -> dict[str, Any]:
     lab, lab_error = _safe(lab_tool.lab_state, {})
     lab = lab or {}
     return {
-        "notebooks": [{"name": n, "verify": verify_state(n, store=store)} for n in names],
+        # `mtime` is in the model rather than read at draw time because it is
+        # what the read-only render's URL is keyed on: the iframe rebuilds only
+        # when its `src` changes, so without it an edit made in Lab would leave
+        # a stale document on screen. It is also what moves the fingerprint, so
+        # the pane redraws at all.
+        "notebooks": [
+            {"name": n, "verify": verify_state(n, store=store), "mtime": _mtime(directory / n)}
+            for n in names
+        ],
         "lab_running": bool(lab.get("running")),
         "lab_port": lab.get("port"),
         "lab_token": lab.get("token"),
+        "lab_origin": lab.get("ui_origin"),
+        "origin_mismatch": origin_mismatch(lab),
         "ruler": 88,
         "error": lab_error,
     }
 
 
-def lab_url(state: dict[str, Any], notebook: str | None = None) -> str:
-    """The iframe src, or `about:blank` when there is nothing to embed."""
+def _mtime(path: Path) -> int:
+    """Whole seconds, so a fingerprint does not churn on filesystems that report
+    sub-second precision differently between reads. A file that vanished between
+    the glob and here is zero rather than an exception."""
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
+
+
+def app_port() -> int:
+    """The port `ui/app.py` bound. Imported lazily to avoid a cycle: `app`
+    imports the shell, which imports this module."""
+    from ui import app as app_mod  # noqa: PLC0415
+
+    return int(getattr(app_mod, "PORT", 8080))
+
+
+def origin_mismatch(lab: dict[str, Any]) -> bool:
+    """Whether the running Lab was scoped to a different origin than this app.
+
+    Lab fixes `frame-ancestors` at launch from the origin it was given, so an
+    app that has since moved ports cannot embed it -- and the browser reports
+    that as *"127.0.0.1 refused to connect"*, which reads as a dead server and
+    sends you hunting for a process that is running perfectly well. Detecting it
+    is what lets the window say the true thing instead.
+
+    Only the port is compared. `config/jupyter/jupyter_server_config.py`
+    deliberately allows both `127.0.0.1:<port>` and `localhost:<port>`, because
+    a browser treats them as different origins and which one the window opened
+    on is not Lab's business -- so a host difference is not a mismatch, and
+    flagging one would put a banner on a perfectly good server.
+    """
+    if not lab.get("running"):
+        return False
+    recorded = str(lab.get("ui_origin") or "").rstrip("/")
+    if not recorded:
+        return False
+    # A portless origin -- `http://127.0.0.1`, or anything this cannot parse --
+    # makes `rsplit` hand back the *host*, which never equals a port number, so
+    # every healthy server would be flagged. That is precisely the false banner
+    # this function exists to avoid, so an origin whose shape cannot be read is
+    # treated as agreeing rather than as disagreeing.
+    authority = recorded.split("//", 1)[-1]
+    if ":" not in authority:
+        return False
+    return authority.rsplit(":", 1)[-1] != str(app_port())
+
+
+#: The Lab workspace the app's own window uses. JupyterLab keeps one layout per
+#: named workspace *on the server*, and two clients on the same one do not
+#: cooperate -- Lab detects the collision, and what the second client sees is a
+#: reload that drops its kernel connections mid-cell. Giving the app's window a
+#: name of its own means opening Lab in a browser at the same time is two
+#: independent sessions rather than a fight, which is the whole failure.
+APP_LAB_WORKSPACE = "grad-app"
+
+
+def lab_url(
+    state: dict[str, Any], notebook: str | None = None, *, lab_workspace: str | None = None
+) -> str:
+    """A URL into the running Lab, or `about:blank` when there is nothing to open.
+
+    `lab_workspace` names a JupyterLab workspace; omit it for the default one a
+    browser would use. See `APP_LAB_WORKSPACE`.
+    """
     if not state.get("lab_running"):
         return "about:blank"
     base = f"http://127.0.0.1:{state['lab_port']}"
     token = state.get("lab_token") or ""
+    root = f"/lab/workspaces/{lab_workspace}" if lab_workspace else "/lab"
     if notebook:
-        return f"{base}/lab/tree/notebooks/{notebook}?token={token}"
-    return f"{base}/lab?token={token}"
+        return f"{base}{root}/tree/notebooks/{notebook}?token={token}"
+    return f"{base}{root}?token={token}"
 
 
 # ---------------------------------------------------------------------------

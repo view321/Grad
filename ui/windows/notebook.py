@@ -26,8 +26,9 @@ from __future__ import annotations
 from typing import Any
 
 from pathlib import Path
+from urllib.parse import quote
 
-from ui import kit, models
+from ui import desktop, kit, models
 from ui.tasks import CANCELLED, envelope_message, run_tool, start, task_message
 
 ANCHOR_ID = "grad-anchor-notebook"
@@ -63,7 +64,12 @@ def _current(workspace: Any) -> str | None:
 def subtitle(workspace: Any) -> str:
     model = workspace.model("notebook") or {}
     name = _current(workspace)
-    where = f":{model.get('lab_port')}" if model.get("lab_running") else " stopped"
+    if model.get("origin_mismatch"):
+        where = " wrong origin"
+    elif model.get("lab_running"):
+        where = f":{model.get('lab_port')}"
+    else:
+        where = " stopped"
     return f"{name or 'no notebook'} · lab{where}"
 
 
@@ -151,6 +157,20 @@ def _toolbar(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, An
                 value=name,
                 on_change=lambda e: workspace.select("notebook.name", e.value, window="notebook"),
             ).props("dense borderless").style("min-width: 180px")
+        view = _view(workspace)
+        with kit.el("div", "grad-group"):
+            kit.button(
+                "▤ READ",
+                tone="active" if view == "render" else "neutral",
+                on_click=lambda: workspace.select("notebook.view", "render", window="notebook"),
+                title="the notebook as a document — no kernel, nothing to break",
+            )
+            kit.button(
+                "⌨ LAB",
+                tone="active" if view == "lab" else "neutral",
+                on_click=lambda: workspace.select("notebook.view", "lab", window="notebook"),
+                title="JupyterLab, which is the only thing here that can edit",
+            )
         kit.text(f"ruler {model.get('ruler', 88)}", "grad-chip dashed")
         kit.button(
             "↗ OPEN IN LAB",
@@ -201,7 +221,50 @@ def _failure(verify: dict[str, Any]) -> None:
                         kit.pre(verify["fix"])
 
 
+#: What the Lab server is told to allow when the page cannot be asked. The port
+#: is `ui/app.py`'s, recorded when it ran, so this is right for a default launch
+#: and is only a guess when the browser has gone away mid-click.
+def _fallback_origin() -> str:
+    from ui import app as app_mod  # noqa: PLC0415 - avoids a cycle at import time
+
+    return f"http://127.0.0.1:{getattr(app_mod, 'PORT', 8080)}"
+
+
+async def _origin(ui: Any) -> str:
+    """The origin this page is actually on, asked of the page itself.
+
+    Lab's framing headers are scoped to one origin and fixed at launch, and
+    getting it wrong does not fail loudly: the browser reports a blocked frame
+    as *"127.0.0.1 refused to connect"*, which reads as a dead port and sends
+    you looking for a server that is running perfectly well.
+
+    There are two ways to be wrong that guessing cannot cover, and the page
+    knows the answer to both. `--port` moves the app and `agent.py --ui`'s own
+    help already warned that Lab would need telling; and `http://localhost:8080`
+    and `http://127.0.0.1:8080` are *different origins* to a browser, so which
+    one the window happens to be opened on decides whether the frame loads.
+    """
+    try:
+        origin = await ui.run_javascript("window.location.origin", timeout=3.0)
+    except Exception:  # noqa: BLE001 - a page that cannot answer is not an error
+        origin = ""
+    return str(origin or "").strip() or _fallback_origin()
+
+
+def _view(workspace: Any) -> str:
+    """Which surface the pane is showing. Reading is the default.
+
+    The pane is where you *look* at a notebook and Lab is where you change one,
+    so the cheap, always-available, no-kernel-required view is the one that
+    opens. Lab is a click away and is still the only thing that can edit.
+    """
+    return "lab" if workspace.selection.get("notebook.view") == "lab" else "render"
+
+
 def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) -> None:
+    if _view(workspace) == "render":
+        _rendered(ui, workspace, entry)
+        return
     if not model.get("lab_running"):
         kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
 
@@ -210,7 +273,9 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
         # is nothing useful to do while this runs.
         async def start_lab() -> None:
             workspace.say("starting JupyterLab …")
-            payload = await run_tool("tools.lab", "start", "--json", timeout=90)
+            payload = await run_tool(
+                "tools.lab", "start", "--ui-origin", await _origin(ui), "--json", timeout=90
+            )
             workspace.say(envelope_message(payload))
             workspace.invalidate("notebook")
             workspace.tick()
@@ -225,6 +290,21 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
             )
         return
 
+    # Only when Lab would actually be *framed*. A Lab opened in a window of its
+    # own is a top-level document at its own origin, so `frame-ancestors` never
+    # applies to it and a mismatch is not a problem it has -- showing the banner
+    # there would be reporting a fault that cannot affect what the user is about
+    # to do.
+    if model.get("origin_mismatch") and not desktop.native_available():
+        kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
+        _origin_mismatch(ui, workspace, model)
+        return
+
+    if desktop.native_available():
+        kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
+        _own_window(ui, workspace, model, entry)
+        return
+
     anchor = kit.el("div", "grad-iframe-anchor")
     anchor.props(f'id="{ANCHOR_ID}"')
     url = models.lab_url(model, entry["name"])
@@ -232,6 +312,97 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
     # iframe: Lab is a server we started ourselves, on its own port, behind a
     # token we minted, and it cannot function sandboxed.
     kit.run_js(f"window.gradRegisterFrame && window.gradRegisterFrame('{ANCHOR_ID}', {url!r}, false)")
+
+
+def _rendered(ui: Any, workspace: Any, entry: dict[str, Any]) -> None:
+    """The notebook as a document: code, markdown and stored output, no kernel.
+
+    Served by this app rather than by Lab, so it works with Lab stopped and can
+    be sandboxed -- stored output is arbitrary HTML from a file that may have
+    been cloned rather than written here. `ui/render.py` carries the reasoning.
+
+    The URL is same-origin and carries the notebook's mtime, which is what makes
+    an edit in Lab show up here: the iframe is only rebuilt when its `src`
+    changes, so a constant URL would leave a stale render on screen until the
+    pane happened to be retiled.
+    """
+    name = entry["name"]
+    stamp = entry.get("mtime") or 0
+    url = f"/__grad/notebook/{quote(name)}?v={stamp}"
+    anchor = kit.el("div", "grad-iframe-anchor")
+    anchor.props(f'id="{ANCHOR_ID}"')
+    kit.run_js(f"window.gradRegisterFrame && window.gradRegisterFrame('{ANCHOR_ID}', {url!r}, true)")
+
+
+async def _restart_lab(ui: Any, workspace: Any) -> None:
+    """Restart Lab bound to the origin this page is actually on.
+
+    `--force` because the whole point is to replace a server that is already
+    running: framing headers are decided at launch, so there is no way to change
+    the allowed origin of a live one.
+    """
+    workspace.say("restarting JupyterLab for this window …")
+    payload = await run_tool(
+        "tools.lab", "start", "--ui-origin", await _origin(ui), "--force", "--json", timeout=90
+    )
+    workspace.say(envelope_message(payload))
+    workspace.invalidate("notebook")
+    workspace.tick()
+
+
+def _origin_mismatch(ui: Any, workspace: Any, model: dict[str, Any]) -> None:
+    """The banner for a Lab that is running, healthy, and cannot be embedded.
+
+    Worth a window of its own rather than a line in the log, because the failure
+    it replaces is genuinely misleading: the browser renders a blocked frame as
+    "refused to connect", so the visible evidence says the server is down while
+    the server is fine. Naming both origins is the whole fix -- one glance and
+    the cause is obvious.
+    """
+    with kit.pad():
+        kit.text("JupyterLab is running, but it was started for a different window.", "grad-empty")
+        with kit.el("div").style(
+            "border: var(--grad-border); background: var(--grad-attention); padding: 9px; margin: 9px 0"
+        ):
+            kit.text("LAB ALLOWS", "grad-label")
+            kit.pre(str(model.get("lab_origin") or "unknown"))
+            kit.text("THIS WINDOW IS", "grad-label")
+            kit.pre(desktop.origin(models.app_port()))
+        kit.button("↻ RESTART LAB FOR THIS WINDOW", tone="primary",
+                   on_click=lambda: _restart_lab(ui, workspace))
+        kit.note(
+            "Lab fixes the origins it will be framed by when it starts, so this cannot be "
+            "changed on a running server. Restarting keeps your files; unsaved cells in the "
+            "old session are lost, so save in Lab first if it is still open elsewhere."
+        )
+
+
+def _own_window(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Lab as a second desktop window instead of an iframe in this one.
+
+    See `ui/desktop.py:open_lab_window` for why: a separate webview is a
+    separate renderer process, so Lab's rendering and the workspace's stop
+    competing for one main thread. The verify banner and the toolbar stay here,
+    which is what matters -- they are what decides whether a notebook is
+    citable, and that must not be inside the window Lab owns.
+    """
+    url = models.lab_url(model, entry["name"], lab_workspace=models.APP_LAB_WORKSPACE)
+
+    def open_lab() -> None:
+        if desktop.open_lab_window(url):
+            workspace.say(f"{entry['name']} — opened in the Lab window")
+        else:
+            workspace.say("could not open a Lab window; opening in a browser tab instead")
+            ui.navigate.to(url, new_tab=True)
+
+    with kit.pad():
+        kit.text("JupyterLab runs in its own window.", "grad-empty")
+        kit.button("⧉ OPEN LAB WINDOW", tone="primary", on_click=open_lab)
+        kit.note(
+            "A separate window is a separate renderer, so a busy notebook cannot slow the "
+            "workspace down. Everything that decides whether this notebook is citable — the "
+            "verify banner above, and VERIFY — stays here."
+        )
 
 
 def _footer(model: dict[str, Any], entry: dict[str, Any]) -> None:

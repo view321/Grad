@@ -29,7 +29,7 @@ remote = ["keyring>=25.0", "huggingface-hub>=0.24"]
 # to reparent a window between panes without rebuilding it, and `shared=True` on
 # `add_head_html`/`add_body_html`, which 3.0 requires when global-scope markup
 # coexists with a `@ui.page` route. On 2.x the shell raises at page build.
-ui = ["nicegui>=3.0", "pywebview>=5.0", "nbformat>=5.10", "nbconvert>=7.16"]
+ui = ["nicegui>=3.0", "pywebview>=5.0", "nbformat>=5.10", "nbconvert>=7.16", "grad[lab]"]
 math = ["sympy>=1.13", "mpmath>=1.3"]
 # HANDOFF-2 §19: the extension set is *declared*, not accumulated, and every pin
 # is exact rather than a floor. The JupyterLab 3->4 break is what killed the
@@ -37,8 +37,15 @@ math = ["sympy>=1.13", "mpmath>=1.3"]
 # the Lab tab down. "Connect an arbitrary extension" means: add a pin here,
 # reinstall, restart. Read any *server* extension before adding it -- it runs in
 # the Lab process with your filesystem rights and can reach the credential store.
-lab = [
-    "jupyterlab==4.4.7",
+#
+# Split in two, because these answer different questions. The notebook window is
+# one of the twelve and its interior *is* Lab, so shipping the app without a Lab
+# server ships a window whose only content is a button that fails -- `ui` now
+# depends on this extra for that reason. The extensions are a preference and stay
+# opt-in: `python-lsp-server[all]` alone is heavier than everything else in this
+# file put together.
+lab = ["jupyterlab==4.4.7"]
+lab-extensions = [
     "jupyterlab-lsp==5.1.1",
     "python-lsp-server[all]==1.12.2",
     "jupyterlab-git==0.51.1",

@@ -313,6 +313,93 @@ def blink_caret() -> Any:
     return el("span", "grad-caret")
 
 
+class Menu:
+    """A dialog whose body is rebuilt each time it opens.
+
+    `ui.dialog` builds its contents once. These menus list projects, folders,
+    open windows and stored sessions, and all four change *because of* what the
+    dialog does -- create a project and the list it was read from is already
+    stale, open a window and the mark beside its name is wrong. Redrawing on open
+    is cheaper than binding every row to the poll, and it cannot go stale between
+    the click and the dialog appearing.
+
+    `draw` is handed the menu so a control *inside* it can call `redraw` after
+    changing what the menu is listing -- which is what lets the window menu stay
+    open across several toggles instead of closing after each one.
+
+    It lives here rather than in `ui/shell.py`, where it was written, because the
+    chat window's session picker is the fourth of these: a Quasar `select` was
+    the one control in the workspace still carrying NiceGUI's own look, and it
+    could not say the two things a session row has to say -- that reopening one
+    only redisplays it, and that another window already has it.
+    """
+
+    def __init__(self, dialog: Any, draw: Any) -> None:
+        self._dialog = dialog
+        self._draw = draw
+
+    def open(self) -> None:
+        self.redraw()
+        self._dialog.open()
+
+    def redraw(self) -> None:
+        self._draw(self)
+
+    def close(self) -> None:
+        self._dialog.close()
+
+
+def menu(draw: Callable[[Any, Any], None], *, width: int = 460) -> Menu:
+    """A `Menu` over a card in the app's own paper, ready to be filled.
+
+    `draw` is called with `(body, menu)` each time it opens; it is expected to
+    clear the body itself, because a redraw from inside the menu is the same
+    call.
+    """
+    ui = _ui()
+    with ui.dialog() as dialog, el("div", "grad-app"):
+        body = el("div", "grad-card", style=f"background: var(--grad-paper); min-width: {width}px")
+    return Menu(dialog, lambda m: draw(body, m))
+
+
+def menu_row(
+    mark: str,
+    name: str,
+    hint: str,
+    *,
+    open: bool = False,
+    title: str = "",
+    wide: bool = False,
+    disabled: bool = False,
+) -> Any:
+    """One row of a menu: a mark, a name, and what the row is for.
+
+    A `<button>` so the keyboard reaches it, which is why the stylesheet resets
+    four properties on it.
+
+    `wide` gives the name the row instead of a fixed column -- a window is called
+    `LEDGER` and a session is called whatever was first asked in it, and the same
+    96px column cannot serve both.
+    """
+    classes = "grad-menu-row"
+    if open:
+        classes += " open"
+    if wide:
+        classes += " wide"
+    if disabled:
+        classes += " disabled"
+    row = el("button", classes)
+    if title:
+        row.props(f'title="{attr(title)}"')
+    if disabled:
+        row.props("disabled")
+    with row:
+        text(mark, "mark", tag="span")
+        text(name, "name", tag="span")
+        text(hint, "hint", tag="span")
+    return row
+
+
 def run_js(code: str) -> None:
     """Send JavaScript to the browser once, after the client is connected.
 

@@ -23,12 +23,22 @@ is the same window either way, which is the point: a command the agent ran and a
 command it claimed to run should not look alike, and before this only the second
 one could ever appear.
 
+**The statusline is the fourth thing, and it is a control as well as a report.**
+It sits above the composer and is always there: what the agent is doing, which
+call is in flight, how long the turn has been going. The strip it replaced
+appeared only while a turn ran and said "running …", so the state worth reading
+at a glance was the one that came and went. Clicking it shows or hides the
+agent's reasoning, which is a fifth kind of block and is drawn whether or not it
+is switched on -- a class on the chat root decides whether it is painted, so the
+toggle costs no re-render and takes no scroll position with it.
+
 This window is never redrawn by the poll. Its state is the live session, not a
 file, and a redraw would take the transcript's scroll position with it.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from ui import katex, kit, models
@@ -67,58 +77,106 @@ def _sessions(ui: Any, workspace: Any) -> None:
     that only redisplays shows the transcript above a composer whose next turn
     the agent has no memory of, and a picker that presented both the same way
     would be lying about the more important half.
+
+    This was a Quasar `select` -- the one control left in the workspace still
+    wearing NiceGUI's own look, in an app whose stylesheet bypasses Quasar
+    rather than overriding it (see the note at the top of `ui/tokens.py`). It was
+    not only out of place: a `select` has one string per option, so the two
+    things a session row has to say arrived as ` · ` fragments glued onto the
+    title, and the row that *cannot* be opened looked exactly like the rows that
+    can. It is now the same menu the windows and the workspace use.
     """
     session = workspace.session
-
-    async def switch(session_id: str) -> None:
-        workspace.say(await session.open_session(session_id))
-        workspace.rebuild_chat()
-
-    async def fresh() -> None:
-        workspace.say(await session.new_session())
-        workspace.rebuild_chat()
-
-    model = workspace.sessions()
-    listed = model["rows"]
-    current = model["current"]
+    menu = kit.menu(lambda body, m: _draw_session_menu(workspace, body, m), width=520)
 
     with kit.row("grad-pad", gap=6).style("border-bottom: var(--grad-border); flex: 0 0 auto"):
         kit.button(
             "+ NEW",
             tone="primary",
             title="start a clean conversation, keeping this one",
-            on_click=lambda: workspace.spawn(fresh(), "new session"),
+            on_click=lambda: workspace.spawn(_fresh(workspace), "new session"),
         )
-        options = {
-            row["id"]: f"{row['title']}  ·  {row['messages']} msg"
-            + ("" if row["resumable"] else "  ·  transcript only")
-            + ("" if not row["held_elsewhere"] else "  ·  open in another window")
-            for row in listed
-        }
-        # A brand-new session has no file on disk until something is said in it,
-        # so the picker would otherwise open with nothing selected.
-        if current is not None:
-            options.setdefault(current, getattr(session, "title", "") or "new session")
-        picker = (
-            ui.select(
-                options,
-                value=current,
-                on_change=lambda e: (
-                    workspace.spawn(switch(e.value), "session switch")
-                    if e.value != current
-                    else None
-                ),
-            )
-            .props("dense borderless")
-            .style("flex: 1 1 auto; min-width: 0")
+        model = workspace.sessions()
+        title = getattr(session, "title", "") or "new session"
+        kit.button(
+            f"{title}  ▾",
+            tone="ghost",
+            classes="grad-session-btn",
+            title="sessions in this workspace, most recent first",
+            on_click=menu.open,
         )
-        picker.props(
-            'title="sessions in this workspace, most recent first"'
-        )
+        kit.spacer()
+        kit.text(f"{model['count']} stored", "grad-caption", tag="span")
         if not getattr(session, "sdk_session_id", None) and getattr(session, "settled", []):
             # Said once, where the decision is made, rather than left to be
             # discovered when the agent answers as though nothing was discussed.
             kit.chip("TRANSCRIPT ONLY", "attention")
+
+
+async def _fresh(workspace: Any) -> None:
+    workspace.say(await workspace.session.new_session())
+    workspace.rebuild_chat()
+
+
+async def _switch(workspace: Any, session_id: str) -> None:
+    workspace.say(await workspace.session.open_session(session_id))
+    workspace.rebuild_chat()
+
+
+def _draw_session_menu(workspace: Any, body: Any, menu: Any) -> None:
+    """Every stored conversation, and what opening it would actually do."""
+    model = workspace.sessions()
+    current = model["current"]
+    body.clear()
+
+    with body:
+        with kit.row("head ink", gap=9):
+            kit.text("SESSIONS", "", tag="span")
+            kit.spacer()
+            kit.text(f"{model['count']} in this workspace", "", tag="span")
+
+        with kit.el("div", "body"):
+            kit.error_strip(model.get("error"))
+            for row in model["rows"]:
+                is_current = row["id"] == current
+                held = row["held_elsewhere"]
+                hint = f"{row['messages']} msg"
+                if held:
+                    hint += " · open in another window"
+                elif not row["resumable"]:
+                    # The more important half of the promise, and the half a
+                    # one-string picker could not distinguish from decoration.
+                    hint += " · transcript only"
+                menu_row = kit.menu_row(
+                    "■" if is_current else "□",
+                    row["title"],
+                    hint,
+                    open=is_current,
+                    wide=True,
+                    disabled=held or is_current,
+                    title=(
+                        "another window has this one open"
+                        if held
+                        else "the conversation continues where it left off"
+                        if row["resumable"]
+                        else "the transcript opens; the agent has no memory of it"
+                    ),
+                )
+                if not (held or is_current):
+                    menu_row.on(
+                        "click",
+                        lambda _=None, sid=row["id"]: (
+                            menu.close(),
+                            workspace.spawn(_switch(workspace, sid), "session switch"),
+                        ),
+                    )
+
+            if model["transcript_only"]:
+                kit.text(
+                    f"{model['transcript_only']} of these predate the id `resume` takes — "
+                    "they open as a transcript, and the next turn starts fresh",
+                    "grad-caption",
+                ).style("margin-top: 12px")
 
 
 def render(workspace: Any) -> None:
@@ -126,7 +184,7 @@ def render(workspace: Any) -> None:
 
     session = workspace.session
 
-    with kit.column("", gap=0).classes("h-full"):
+    with kit.column(_chat_classes(workspace), gap=0).classes("h-full") as root:
         _sessions(ui, workspace)
         # One scrolling region, not two. The tail used to be a sibling *below*
         # the scroller, which was survivable when it held a single markdown
@@ -147,24 +205,15 @@ def render(workspace: Any) -> None:
             for message in session.settled:
                 _message(message, workspace)
 
-        streaming = kit.el("div", "grad-streaming")
-        streaming.style("display: none")
-        with streaming:
-            kit.el("span", "block")
-            activity = kit.text("running …", "", tag="span")
-            kit.spacer()
-            kit.text("esc to interrupt", "", tag="span")
-
-        _composer(ui, workspace, transcript, tail, streaming)
+        statusline = _Statusline(workspace, root)
+        _composer(ui, workspace, transcript, tail, statusline)
 
     def flush() -> None:
         # ~15 Hz, not per token: only the tail re-renders, and inside it only
         # the block that actually moved.
-        busy = bool(session.busy)
-        streaming.style(f"display: {'flex' if busy else 'none'}")
         blocks = getattr(session, "blocks", None) or []
         tail.sync(blocks)
-        kit.set_text(activity, _activity(blocks))
+        statusline.sync(blocks)
 
     ui.timer(1 / FLUSH_HZ, flush)
     # Once, at build: keep the transcript pinned to the bottom while a turn
@@ -172,13 +221,152 @@ def render(workspace: Any) -> None:
     kit.run_js("window.gradStickBottom && window.gradStickBottom('grad-transcript')")
 
 
+def _chat_classes(workspace: Any) -> str:
+    return "grad-chat" + (" reasoning-on" if workspace.show_reasoning else "")
+
+
+#: What the statusline says the agent is doing, per workspace state. `running`
+#: is absent on purpose: while a turn is in flight the activity is read off the
+#: blocks, which is more specific than any fixed word.
+STATE_CAPTION = {
+    "idle": ("IDLE", "waiting for you"),
+    "awaiting_gate": ("YOUR CALL", "the turn ended by asking for a decision"),
+    "paused": ("PAUSED", ""),
+}
+
+
+class _Statusline:
+    """The agent's own status line, and the switch for its reasoning.
+
+    Two jobs in one strip, and they belong together. The strip that was here
+    before appeared only while a turn ran, said "running …" and vanished --
+    so an idle session had nothing saying so, and the one piece of state worth
+    reading at a glance (what is it doing *right now*) was the one that came and
+    went. This is always on screen, and it names the call in flight rather than
+    spinning, which is the difference between a spinner and knowing a
+    forty-minute job is still going.
+
+    Clicking it shows or hides the reasoning. A toggle rather than a second
+    control because the reasoning is *about* what this line reports, and because
+    the line is already the widest click target in the window. Nothing is
+    redrawn: the blocks are in the DOM either way and a class on the chat root
+    decides whether they are painted -- see `Workspace.toggle_reasoning`.
+    """
+
+    def __init__(self, workspace: Any, root: Any) -> None:
+        self.workspace = workspace
+        self.root = root
+        self._started: float | None = None
+        self._last: tuple[Any, ...] | None = None
+
+        bar = kit.el("button", "grad-statusline")
+        bar.props('title="what the agent is doing — click to show or hide its reasoning"')
+        bar.on("click", self.toggle)
+        with bar:
+            self.block = kit.el("span", "block")
+            self.state = kit.text("IDLE", "state", tag="span")
+            self.activity = kit.text("waiting for you", "activity", tag="span")
+            kit.spacer()
+            self.clock = kit.text("", "clock", tag="span")
+            self.reasoning = kit.text("", "reasoning", tag="span")
+        self.bar = bar
+        self._paint_reasoning()
+
+    def toggle(self) -> None:
+        showing = self.workspace.toggle_reasoning()
+        if showing:
+            self.root.classes(add="reasoning-on")
+        else:
+            self.root.classes(remove="reasoning-on")
+        self._paint_reasoning()
+        if showing and not _has_reasoning(self.workspace.session):
+            # Switching on something that reveals nothing is indistinguishable
+            # from a switch that does not work, and there are two ordinary
+            # reasons for it: a transcript written before reasoning was captured
+            # at all, and a model that was never asked for the text. Both are
+            # worth saying once, at the click, rather than leaving to be
+            # guessed at.
+            self.workspace.say(
+                "no reasoning in this session yet — it is captured from the next turn on, "
+                'and needs [agent] reasoning = "summarized" in config/grad.toml'
+            )
+
+
+    def _paint_reasoning(self) -> None:
+        showing = self.workspace.show_reasoning
+        kit.set_text(self.reasoning, f"reasoning {'■ on' if showing else '□ off'}")
+
+    def sync(self, blocks: list[dict[str, Any]]) -> None:
+        """Called at the flush rate, so nothing here touches the DOM unless the
+        line it draws actually changed."""
+        busy = bool(getattr(self.workspace.session, "busy", False))
+        if not busy:
+            self._started = None
+        elif self._started is None:
+            self._started = time.monotonic()
+
+        state = self.workspace.agent_state
+        if busy:
+            caption, activity = "RUNNING", _activity(blocks)
+        else:
+            caption, activity = STATE_CAPTION.get(state, ("IDLE", "waiting for you"))
+        clock = _elapsed(self._started)
+
+        mark = (busy, caption, activity, clock)
+        if mark == self._last:
+            return
+        self._last = mark
+        if busy:
+            self.bar.classes(add="running")
+        else:
+            self.bar.classes(remove="running")
+        kit.set_text(self.state, caption)
+        kit.set_text(self.activity, activity)
+        kit.set_text(self.clock, clock)
+
+
+def _has_reasoning(session: Any) -> bool:
+    """Is there any reasoning in this session to show?
+
+    Scanned at the click rather than on the flush, because this is the one
+    moment the answer changes what the user is looking at -- and a scan of every
+    settled turn fifteen times a second to decide the wording of one chip is the
+    kind of thing `ui/state.py` exists to avoid.
+    """
+    live = getattr(session, "blocks", None) or []
+    if any(b.get("kind") == "thinking" for b in live):
+        return True
+    for record in getattr(session, "settled", None) or []:
+        if any(b.get("kind") == "thinking" for b in record.get("blocks") or []):
+            return True
+    return False
+
+
+def _elapsed(started: float | None) -> str:
+    if started is None:
+        return ""
+    seconds = max(0.0, time.monotonic() - started)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
+
+
 def _activity(blocks: list[dict[str, Any]]) -> str:
-    """What the status line under the tail says. Naming the call in flight is
-    the difference between a spinner and knowing a 40-minute job is running."""
+    """What the statusline says while a turn runs.
+
+    Read backwards off the blocks, because the last thing that moved is what is
+    happening: a call still running is the answer whenever there is one, and
+    when there is not, whether the agent is reasoning or writing is the next
+    most specific thing that can honestly be said.
+    """
     for block in reversed(blocks):
         if block.get("kind") == "tool" and block.get("status") == "running":
             return f"running {block.get('name') or 'tool'} {block.get('title') or ''}".strip()[:90]
-    return "running …"
+    for block in reversed(blocks):
+        if not (block.get("text") or "").strip():
+            continue
+        return "thinking" if block.get("kind") == "thinking" else "writing"
+    return "waiting for the model"
 
 
 class _Tail:
@@ -218,12 +406,21 @@ class _Tail:
     def _draw(self, block: dict[str, Any]) -> dict[str, Any]:
         from nicegui import ui
 
+        kind = block.get("kind")
         with self.container:
-            if block.get("kind") != "tool":
-                text = block.get("text") or ""
-                body = ui.markdown(text).classes("grad-msg grad")
-                return {"kind": block.get("kind"), "text": text, "body": body}
-            return {"kind": "tool", **_tool_card(block)}
+            if kind == "tool":
+                return {"kind": "tool", **_tool_card(block)}
+            text = block.get("text") or ""
+            if kind == "thinking":
+                # Drawn while it streams like everything else, and hidden or
+                # shown by a class on the chat root rather than by whether it
+                # was built -- so the statusline's switch costs no re-render and
+                # takes no scroll position with it.
+                with _reasoning_card() as card:
+                    body = ui.markdown(text).classes("body")
+                return {"kind": kind, "text": text, "body": body, "card": card}
+            body = ui.markdown(text).classes("grad-msg grad")
+            return {"kind": kind, "text": text, "body": body}
 
     def _update(self, drawn: dict[str, Any], block: dict[str, Any]) -> None:
         if drawn["kind"] != "tool":
@@ -238,6 +435,21 @@ class _Tail:
             _paint_output(drawn, block)
 
 
+def _reasoning_card() -> Any:
+    """The box a run of reasoning is drawn in, head included."""
+    card = kit.el("div", "grad-reasoning")
+    with card:
+        kit.text("reasoning", "head")
+    return card
+
+
+#: Block kinds that are already what they are and must not go through
+#: `parse_message`. A tool card is structured; reasoning is the agent's own
+#: working, and running the gate/expectation patterns over it would let a turn
+#: *thinking about* a gate be mistaken for one asking for a decision.
+STRUCTURED_KINDS = ("tool", "thinking")
+
+
 def _has_gate(record: dict[str, Any]) -> bool:
     """Did this turn end by asking for a decision?
 
@@ -246,7 +458,7 @@ def _has_gate(record: dict[str, Any]) -> bool:
     """
     blocks = record.get("blocks") or [{"kind": "text", "text": record.get("text") or ""}]
     for block in blocks:
-        if block.get("kind") == "tool":
+        if block.get("kind") in STRUCTURED_KINDS:
             continue
         for part in models.parse_message(block.get("text") or ""):
             if part.get("kind") == "gate":
@@ -254,12 +466,11 @@ def _has_gate(record: dict[str, Any]) -> bool:
     return False
 
 
-def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, streaming: Any) -> None:
+def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline: Any) -> None:
     session = workspace.session
 
     async def settle(record: dict[str, Any]) -> None:
         tail.clear()
-        streaming.style("display: none")
         # `awaiting_gate` was a state nothing ever entered: the header knew how
         # to render "AWAITING YOUR CALL" and the titlebar had a GATE chip, but
         # every path set running/paused/idle, so a turn that ended by asking for
@@ -273,7 +484,16 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, streaming: 
 
     async def send(prompt: str | None = None) -> None:
         prompt = (prompt if isinstance(prompt, str) else (entry.value or "")).strip()
-        if not prompt or session.busy:
+        if not prompt:
+            return
+        if session.busy:
+            # Said, not swallowed. This guard is what stops two turns
+            # interleaving into one block list, but it used to return in
+            # silence -- so a prompt typed while the previous turn was still
+            # winding down simply did not happen, with the text left in the box
+            # and nothing to say why. That is the same symptom as the interrupt
+            # bug it usually followed, and it made that bug much harder to see.
+            workspace.say("a turn is still running — stop it first (Esc)")
             return
         entry.value = ""
         with transcript:
@@ -302,12 +522,24 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, streaming: 
             )
             entry.on("keydown.enter.prevent", send)
             kit.button("SEND ⏎", tone="primary", on_click=send)
-            kit.button("■", tone="neutral", title="interrupt (Esc)", on_click=session.interrupt)
+            kit.button(
+                "■",
+                tone="neutral",
+                title="interrupt (Esc)",
+                # Through the workspace, so what the session says about the
+                # interrupt reaches the status bar. Bound straight to
+                # `session.interrupt`, the three answers it can give -- nothing
+                # is running, one is already in flight, one has been asked for --
+                # all went to the same place: nowhere.
+                on_click=workspace.interrupt_turn,
+            )
 
     workspace.chat_send = send
 
     ui.keyboard(
-        on_key=lambda e: session.interrupt() if (e.key == "Escape" and e.action.keydown) else None
+        on_key=lambda e: workspace.interrupt_turn()
+        if (e.key == "Escape" and e.action.keydown)
+        else None
     )
 
 
@@ -337,7 +569,7 @@ def _message(record: dict[str, Any], workspace: Any) -> None:
             kit.text("∇", "grad-avatar", tag="span")
             kit.text("grad", "", tag="span")
         for block in record.get("blocks") or [{"kind": "text", "text": text}]:
-            if block.get("kind") == "tool":
+            if block.get("kind") in STRUCTURED_KINDS:
                 _block(ui, block, workspace)
                 continue
             # Prose is parsed on the way *in* to the transcript rather than on
@@ -360,6 +592,9 @@ def _block(ui: Any, block: dict[str, Any], workspace: Any) -> None:
                 kit.pre(block["text"])
     elif kind == "tool":
         _tool_card(block)
+    elif kind == "thinking":
+        with _reasoning_card():
+            ui.markdown(block.get("text") or "").classes("body")
     elif kind == "expectation":
         with kit.el("div", "grad-card"):
             with kit.row("head attention", gap=9):

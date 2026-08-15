@@ -451,3 +451,128 @@ def test_the_options_actually_ask_for_partial_messages(monkeypatch):
     options = agent.build_options(config_mod.load())
     assert isinstance(options, sdk.ClaudeAgentOptions)
     assert options.include_partial_messages is True
+
+
+# ---------------------------------------------------------------------------
+# the reasoning (`TurnStream`, the third kind of block)
+# ---------------------------------------------------------------------------
+def thinking(text: str) -> FakeStreamEvent:
+    return FakeStreamEvent(
+        {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": text}}
+    )
+
+
+def test_the_reasoning_is_a_block_of_its_own_and_not_part_of_the_answer():
+    """The chat window's statusline switches this on and off, so it has to be
+    separable. `text` is what the agent *said*; the working is a different
+    claim and the transcript records it as one."""
+    stream = agent.TurnStream()
+    stream.feed(thinking("the ceiling is the binding constraint"))
+    stream.feed(delta("Raise the ceiling."))
+    stream.feed(FakeMessage([
+        ThinkingBlock("the ceiling is the binding constraint"),
+        FakeBlock("Raise the ceiling."),
+    ]))
+    assert kinds(stream) == ["thinking", "text"]
+    assert stream.text == "Raise the ceiling."
+    assert stream.thinking == "the ceiling is the binding constraint"
+
+
+def test_reasoning_is_not_printed_by_the_command_line():
+    """`feed` returns what a CLI prints. The reasoning is a block a UI may draw,
+    not something the terminal session starts emitting."""
+    stream = agent.TurnStream()
+    printed = stream.feed(thinking("hmm")) + stream.feed(delta("Yes."))
+    assert printed == "Yes."
+
+
+def test_a_finished_thinking_block_does_not_repeat_the_deltas_that_built_it():
+    """The same trap `TextStream` exists for, one channel over: the SDK sends
+    `thinking_delta` events *and* the `ThinkingBlock` containing all of them."""
+    stream = agent.TurnStream()
+    stream.feed(thinking("first "))
+    stream.feed(thinking("second"))
+    stream.feed(FakeMessage([ThinkingBlock("first second")]))
+    assert stream.thinking == "first second"
+    assert kinds(stream) == ["thinking"]
+
+
+def test_reasoning_resumes_below_a_call_rather_than_above_it():
+    """Interleaved thinking: the order is the information here too. Reasoning
+    that happened *after* a command must not be appended to the block that was
+    open before it ran."""
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ThinkingBlock("check the ledger first")]))
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "ls"})]))
+    stream.feed(FakeMessage([ToolResult("tu_1", "one")]))
+    stream.feed(FakeMessage([ThinkingBlock("one entry, so the claim holds")]))
+    assert kinds(stream) == ["thinking", "tool", "thinking"]
+    assert [b["text"] for b in stream.blocks if b["kind"] == "thinking"] == [
+        "check the ledger first",
+        "one entry, so the claim holds",
+    ]
+
+
+def test_a_turn_that_only_reasoned_still_settles_as_something():
+    """`Session.ask` keeps a turn when it produced blocks. Reasoning is blocks,
+    so an interrupted turn that had only got as far as thinking is not recorded
+    as a prompt that went unanswered."""
+    stream = agent.TurnStream()
+    stream.feed(thinking("still working out what to run"))
+    assert stream.text == ""
+    assert stream.blocks and stream.blocks[0]["kind"] == "thinking"
+
+
+def test_a_call_is_stamped_so_the_tasks_window_can_age_it():
+    """Wall clock, not monotonic: it goes into the session file and is read back
+    in another process, where a monotonic reading means nothing."""
+    import time
+
+    stream = agent.TurnStream()
+    stream.feed(FakeMessage([ToolUse("tu_1", "Bash", {"command": "sleep 60"})]))
+    started = stream.blocks[0]["started"]
+    assert isinstance(started, float)
+    assert abs(started - time.time()) < 60
+
+
+def test_the_reasoning_is_asked_for_as_text_rather_than_assumed(monkeypatch):
+    """Capturing thinking blocks is not enough to have any: Opus 4.7+ defaults
+    `display` to "omitted" and sends them with a signature and no text. The chat
+    window's reasoning switch had nothing to reveal no matter how correctly the
+    stream was read -- one flag away from the feature, and indistinguishable
+    from a toggle that does nothing."""
+    sdk = pytest.importorskip("claude_agent_sdk", reason="the SDK is not installed")
+    from core import config as config_mod
+
+    monkeypatch.setattr(agent, "system_prompt", lambda: "prompt")
+    options = agent.build_options(config_mod.load(reload=True))
+    assert options.thinking == {"type": "adaptive", "display": "summarized"}
+
+
+def test_reasoning_can_be_turned_off_from_the_config(workspace, monkeypatch):
+    sdk = pytest.importorskip("claude_agent_sdk", reason="the SDK is not installed")
+    from core import config as config_mod, paths
+
+    config = paths.root() / "config" / "grad.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[agent]\nreasoning = "omitted"\n', encoding="utf-8")
+    monkeypatch.setattr(agent, "system_prompt", lambda: "prompt")
+    options = agent.build_options(config_mod.load(reload=True))
+    assert options.thinking == {"type": "adaptive", "display": "omitted"}
+
+
+def test_an_sdk_without_the_option_still_builds_a_session(monkeypatch):
+    """Feature-detected rather than assumed, for the same reason the deny probe
+    exists: this option is newer than the permission mode, and the SDK's shape
+    has changed between releases."""
+    import dataclasses
+
+    from core import config as config_mod
+
+    class OldOptions:
+        pass
+
+    class OldSdk:
+        ClaudeAgentOptions = dataclasses.make_dataclass("ClaudeAgentOptions", ["model"])
+
+    assert agent.thinking_option(config_mod.load(reload=True), OldSdk) == {}

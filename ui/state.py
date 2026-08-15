@@ -25,7 +25,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable
 
-from core import jsonl, paths
+from core import appdata, jsonl, paths
 from ui import layout as layout_mod, models, registry
 from ui.tasks import envelope_message, run_tool
 
@@ -41,7 +41,16 @@ FLUSH_HZ = 15
 
 
 def layout_dir() -> Path:
-    return paths.data_dir() / "layouts"
+    """Under the app directory, but keyed to this workspace.
+
+    Both halves are load-bearing. Out of the repo, because an arrangement of
+    panes is a property of this machine's screen and not of the research. Keyed
+    to the workspace, because it used to live *inside* the root and so a switch
+    to a fresh folder opened the default arrangement rather than carrying the
+    old one across -- one flat directory would quietly hand every workspace the
+    same panes. Per-project within that, which is the next line down.
+    """
+    return appdata.workspace_state_dir() / "layouts"
 
 
 def layout_path(project: str | None) -> Path:
@@ -95,8 +104,18 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
     "preflight": lambda w: models.preflight_model(),
     "funnel": lambda w: models.funnel_model(w.selection.get("funnel.trace")),
     "queue": lambda w: models.queue_model(),
-    "tasks": lambda w: models.tasks_model(),
+    # The agent's own calls are read from the live session rather than from a
+    # file, so they are passed in: `ui/models.py` never reaches for the session,
+    # and the tasks window is the one place that wants both halves of "what is
+    # running on this machine right now".
+    "tasks": lambda w: models.tasks_model(agent=models.agent_calls_model(w.session)),
 }
+
+
+#: Windows whose model must be built on the event loop. `tasks` reads the live
+#: SDK session rather than a file -- no I/O to move off, and a real race if it
+#: were read from a worker thread while the loop mutates it.
+LOOP_BOUND = frozenset({"tasks"})
 
 
 def current_project() -> str | None:
@@ -134,6 +153,11 @@ class Workspace:
         self.models: dict[str, Any] = {}
         self.selection: dict[str, Any] = {}
         self.notice: str | None = None
+        #: Whether the agent's reasoning is on screen. Kept here rather than in
+        #: the chat window's closure so it survives the window being redrawn --
+        #: switching session rebuilds that closure, and a display preference that
+        #: silently reset itself would read as the toggle having broken.
+        self.show_reasoning = False
         #: Set by the chat window once it is built. A gate card in the
         #: transcript needs to send the approval back into the same session, and
         #: routing it through here keeps the gate card from having to reach into
@@ -149,6 +173,8 @@ class Workspace:
         self._retile: Callable[[], None] | None = None
         #: Strong references to in-flight tasks; see `spawn`.
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: Drops a poll that arrives while the previous one is still awaiting.
+        self._ticking = False
         #: The root this client believes it is on. `GRAD_ROOT` is process-wide,
         #: so another client switching folders moves this one's paths out from
         #: under it; `tick` compares against `paths.root()` and catches up.
@@ -178,21 +204,56 @@ class Workspace:
             self.rebuild(window_id)
         return self.models.get(window_id)
 
-    def rebuild(self, window_id: str) -> bool:
-        """Recompute one window's model. Returns whether it changed."""
+    def _compute(self, window_id: str) -> Any:
+        """Run one window's builder. Safe to call off the event loop: everything
+        in `MODEL_BUILDERS` reads files and returns plain data, and none of it
+        touches a NiceGUI element."""
         builder = MODEL_BUILDERS.get(window_id)
         if builder is None:
-            return False
+            return None
         try:
-            value = builder(self)
+            return builder(self)
         except Exception as exc:  # noqa: BLE001 - a window's own failure is its own
             log.exception("model for %s failed", window_id)
-            value = {"error": f"{type(exc).__name__}: {exc}"}
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def _apply(self, window_id: str, value: Any) -> bool:
         mark = _fingerprint(value)
         changed = self._fingerprints.get(window_id) != mark
         self.models[window_id] = value
         self._fingerprints[window_id] = mark
         return changed
+
+    def rebuild(self, window_id: str) -> bool:
+        """Recompute one window's model, on this thread. Returns whether it
+        changed. The poll uses `rebuild_off_thread`; this is the lazy path taken
+        by `model()` when a window renders before its first tick."""
+        if window_id not in MODEL_BUILDERS:
+            return False
+        return self._apply(window_id, self._compute(window_id))
+
+    async def rebuild_off_thread(self, window_id: str) -> bool:
+        """`rebuild`, with the file I/O moved off the event loop.
+
+        Every builder here reads files, and one of them opens a socket:
+        `tools/lab.py:_listening` probes Lab's port with a 0.4 second timeout,
+        on the poll, while the notebook window is open. On the loop that is a
+        400ms freeze of the entire app -- every window, the chat stream and the
+        pane dragging included -- waiting on a TCP connect. It costs a
+        millisecond while Lab is answering, which is why it read as harmless;
+        it is a port that has stopped answering that makes the app look hung.
+
+        `tasks` is deliberately not offloaded. It reads the live SDK session
+        rather than a file, so there is no I/O to move, and reading that object
+        from another thread while the loop mutates it is a race for no gain.
+        """
+        if window_id not in MODEL_BUILDERS:
+            return False
+        if window_id in LOOP_BOUND:
+            value = self._compute(window_id)
+        else:
+            value = await asyncio.to_thread(self._compute, window_id)
+        return self._apply(window_id, value)
 
     def invalidate(self, window_id: str) -> None:
         """Force this window to redraw on the next tick even if its file did not
@@ -200,8 +261,26 @@ class Workspace:
         self._fingerprints.pop(window_id, None)
         self.models.pop(window_id, None)
 
-    def tick(self) -> None:
-        """One poll: rebuild the open windows, redraw the ones that moved.
+    def _caught_up_after_move(self) -> bool:
+        """Whether the workspace root moved under this client, handling it if so.
+
+        Another client switching folders moves every path the models read, so
+        catching up has to happen before any of them are rebuilt -- and the
+        rebuild is then pointless, because `reload` has already done it.
+        """
+        if str(paths.root()) == self._root:
+            return False
+        self._root = str(paths.root())
+        self.project = current_project()
+        rebind = getattr(self.session, "rebind", None)
+        if rebind is not None:
+            self.spawn(rebind(), "workspace rebind")
+        self.reload()
+        self.say(f"workspace moved to {paths.root()}")
+        return True
+
+    def _redraw_chrome(self) -> None:
+        """The half of a pass that must happen on the event loop.
 
         The titlebars are refreshed separately from the bodies. `chat` has no
         entry in `MODEL_BUILDERS` -- its body redraws from its own stream rather
@@ -211,27 +290,61 @@ class Workspace:
         tiled, which is exactly what `_titlebar`'s docstring says must not
         happen.
         """
-        if str(paths.root()) != self._root:
-            # Another client switched the workspace. Everything below reads
-            # files under the root, so catching up has to come first.
-            self._root = str(paths.root())
-            self.project = current_project()
-            rebind = getattr(self.session, "rebind", None)
-            if rebind is not None:
-                self.spawn(rebind(), "workspace rebind")
-            self.reload()
-            self.say(f"workspace moved to {paths.root()}")
-            return
-        for window_id in self.layout.windows:
-            if self.rebuild(window_id):
-                redraw = self._redraw.get(window_id)
-                if redraw is not None:
-                    _guard(redraw, window_id)
         for window_id, redraw in list(self._titlebars.items()):
             if window_id in self.layout.windows:
                 _guard(redraw, f"{window_id}.titlebar")
         for redraw in self._chrome:
             _guard(redraw, "chrome")
+
+    def tick(self) -> None:
+        """Refresh now, on this thread.
+
+        What a window's own buttons call after they have changed something: the
+        user is waiting for the result of a click, and one synchronous pass is
+        the shortest path to it. The repeating two-second poll is `poll`, which
+        is the one that must not block.
+        """
+        if self._caught_up_after_move():
+            return
+        for window_id in list(self.layout.windows):
+            if self.rebuild(window_id) and window_id in self.layout.windows:
+                redraw = self._redraw.get(window_id)
+                if redraw is not None:
+                    _guard(redraw, window_id)
+        self._redraw_chrome()
+
+    async def poll(self) -> None:
+        """`tick`, with the file I/O off the event loop. The timer's callback.
+
+        The redraws stay on the loop, because they build NiceGUI elements and
+        those belong to the loop that owns the client. Only the builders move --
+        see `rebuild_off_thread` for the 400ms socket probe that motivates it.
+
+        A pass that arrives while the previous one is still awaiting is dropped
+        rather than queued. A poll that outruns `POLL_SECONDS` is a slow disk or
+        a hung port, and stacking a second pass on top of it turns one slow poll
+        into an unbounded pile of them -- each holding a thread, all rebuilding
+        the same windows.
+        """
+        if self._ticking:
+            return
+        self._ticking = True
+        try:
+            if self._caught_up_after_move():
+                return
+            # Snapshotted, because the rebuilds below await: a retile landing
+            # mid-pass would otherwise have this iterating a list that changed
+            # under it. A window that opened during the pass is picked up by the
+            # next one, two seconds later.
+            for window_id in list(self.layout.windows):
+                changed = await self.rebuild_off_thread(window_id)
+                if changed and window_id in self.layout.windows:
+                    redraw = self._redraw.get(window_id)
+                    if redraw is not None:
+                        _guard(redraw, window_id)
+            self._redraw_chrome()
+        finally:
+            self._ticking = False
 
     # -- layout moves -------------------------------------------------------
     def toggle(self, window_id: str) -> None:
@@ -460,12 +573,29 @@ class Workspace:
         could say "AGENT PAUSED" while tokens were still streaming. Interrupting
         is the thing the SDK can actually do, and `Session.interrupt` is already
         the tested path for it -- Escape and the chat window's own button use it.
+
+        What it *says* comes from the session rather than from here, because only
+        the session knows which of the three answers applies: nothing was
+        running, an interrupt is already in flight, or one has just been asked
+        for. The line used to be a fixed "interrupting the turn…" printed
+        whatever happened, which is how a refused interrupt looked like a
+        successful one.
         """
         session = self.session
-        if session is None or not getattr(session, "busy", False):
+        if session is None:
             return
-        session.interrupt()
-        self.say("interrupting the turn…")
+        self.say(session.interrupt())
+
+    def toggle_reasoning(self) -> bool:
+        """Show or hide the agent's reasoning. Returns the new state.
+
+        No redraw: the blocks are always in the DOM and a class on the chat root
+        decides whether they are drawn. Rebuilding the transcript to hide a block
+        would cost its scroll position, which is the same reason the poll never
+        touches this window.
+        """
+        self.show_reasoning = not self.show_reasoning
+        return self.show_reasoning
 
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""

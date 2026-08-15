@@ -39,13 +39,31 @@ import json
 import logging
 import re
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 
-from core import config as config_mod, paths
-from ui import katex, kit, sessions, shell, state as state_mod
+from core import appdata, config as config_mod, instance, paths
+from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
 ROLES = ("user", "assistant")
 STATIC_URL = "/grad-static"
+
+#: The port `run()` bound, so the rest of the app can name its own origin. The
+#: embedded Lab scopes its framing headers to one origin and is started by a
+#: button in the notebook window, which would otherwise have to assume the
+#: default port and be wrong on every `--port`. Set at launch rather than read
+#: from the environment because `ui.run` is where the number is decided.
+PORT = 8080
+
+#: How long the SDK's own interrupt is given to end the turn before the client
+#: is taken down instead. The same shape as `ui/tasks.py:cancel` -- ask the thing
+#: that knows how to stop cleanly, then stop it anyway -- and for the same
+#: reason: a control that reports "interrupting…" and leaves the session busy
+#: forever is worse than no control, because the composer then silently refuses
+#: every prompt after it.
+INTERRUPT_GRACE_S = 8.0
+#: How often `_stop_turn` checks whether the turn it asked to stop has settled.
+SETTLE_POLL_S = 0.1
 
 # Where anything the transcript must not carry goes instead: this handler is the
 # app's own log, not user-visible text and not the persisted session file.
@@ -73,6 +91,11 @@ class Session:
         # rather than at claim time means `most_recent` can tell "another window
         # is in this session" from "the window that was in it is gone".
         sessions.register(key)
+        #: Where a message that has nowhere else to go is put on screen. Set by
+        #: `build` to the workspace's status bar; None in tests and on the CLI.
+        #: An interrupt that failed used to be swallowed entirely, which is how
+        #: pressing STOP twice became the way to stop a turn.
+        self.notify: Any = None
         self.client: Any = None
         #: The turn in flight, as `agent.TurnStream` blocks: prose, and the tool
         #: calls between it. The chat window's timer draws from here, so a card
@@ -89,7 +112,15 @@ class Session:
         #: Ours names the file; this one is what makes reopening continue rather
         #: than merely redisplay. See the note in `ui/sessions.py`.
         self.sdk_session_id: str | None = None
-        self._task: asyncio.Task[None] | None = None
+        #: Set while no turn is in flight, so an interrupt can wait for the turn
+        #: it asked to stop without polling `busy` -- which the *next* turn sets
+        #: back to True, and a waiter watching that flag would never wake.
+        self._idle = asyncio.Event()
+        self._idle.set()
+        #: The interrupt in progress, if one is. Held so the next turn can wait
+        #: for it: a fire-and-forget interrupt can outlive the turn it was aimed
+        #: at and land on the one after it.
+        self._stopping: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         if self.client is not None:
@@ -234,6 +265,7 @@ class Session:
         await self.close()
         self.blocks = []
         self.busy = False
+        self._idle.set()
         self.settled.clear()
         # Sessions live under the root's data directory, so the one that was
         # open belongs to the folder just left -- and the claim on it does too.
@@ -252,10 +284,18 @@ class Session:
         if self.busy:
             return
         self.busy = True
+        self._idle.clear()
         try:
+            # Before `start`, and before anything is sent. An interrupt is a
+            # control request to the CLI, and one still in flight is aimed at a
+            # turn that has already ended -- so without this it lands on the
+            # turn about to be issued and kills it the moment it starts, which
+            # is a turn that produces nothing and explains nothing.
+            await self._stopped()
             await self.start()
         except Exception:
             self.busy = False
+            self._idle.set()
             raise
 
         self.settled.append({"role": "user", "text": prompt})
@@ -271,7 +311,15 @@ class Session:
             # rather than inline is what stops the two surfaces disagreeing about
             # whether the budget applies.
             result = await agent.drive_turn(
-                self.client, prompt, stream, session=self.session_id
+                self.client,
+                prompt,
+                stream,
+                # Recorded as it arrives rather than read off the return value,
+                # which an interrupted turn never reaches. That id is what lets
+                # the rebuilt client `resume` this conversation, so losing it on
+                # exactly the turns that end in a rebuild cost the whole thread.
+                on_session_id=self._remember_sdk_session,
+                session=self.session_id,
             )
             if result.get("sdk_session_id"):
                 self.sdk_session_id = result["sdk_session_id"]
@@ -298,6 +346,10 @@ class Session:
             )
         finally:
             self.busy = False
+            # Woken here rather than at the end of the block: an interrupt that
+            # is waiting for this turn is waiting to stop *doing* things, and
+            # persisting and settling the transcript below are not that.
+            self._idle.set()
             # The first thing asked is what the session is about, and naming it
             # from the prompt beats leaving every session called "empty session"
             # until someone renames it by hand. An explicit title is never
@@ -318,23 +370,118 @@ class Session:
             self._persist()
             await on_settle(record)
 
-    def interrupt(self) -> None:
-        """Interrupt the turn in flight, if there is one.
+    def interrupt(self) -> str:
+        """Stop the turn in flight, and say what was done about it.
 
         Bound to a button and to Escape, so it fires when nothing is running.
-        The result has to be consumed: a bare `create_task` drops any SDK error
-        and Python logs "Task exception was never retrieved".
+
+        This used to be one `create_task` around `client.interrupt()` with every
+        exception swallowed, and it had three failure modes that all looked the
+        same from the composer -- the turn stays busy, so the *next* prompt is
+        silently refused and nothing on screen says why. Pressing STOP a second
+        time appeared to fix it, which is the bug as reported:
+
+        * the SDK refused the interrupt (not connected, control request
+          errored), and nothing said so;
+        * the interrupt was accepted but the turn did not end, and the session
+          stayed busy for the life of the app;
+        * the interrupt arrived late, after the turn had already ended, and
+          landed on whatever was issued next.
+
+        So: the failure is reported, the turn is *made* to end, and the pending
+        interrupt is something the next turn waits for. The message is returned
+        rather than pushed, because the two callers already have somewhere to
+        put a line and disagree about where.
         """
-        if not (self.busy and self.client and hasattr(self.client, "interrupt")):
-            return
+        if not self.busy:
+            return "nothing is running"
+        if self._stopping is not None and not self._stopping.done():
+            return "already stopping — the turn is being taken down"
+        self._stopping = asyncio.create_task(self._stop_turn())
+        return "interrupting the turn…"
 
-        async def _interrupt() -> None:
+    async def _stop_turn(self) -> None:
+        """Ask the SDK to stop, then make sure the turn actually stopped.
+
+        The escalation is `ui/tasks.py:cancel`'s, for the same reason: the tool's
+        own stop verb is the one that ends things cleanly, and the blunt
+        instrument is what happens when it does not work. Here the blunt
+        instrument is dropping the client, which ends `receive_response` and lets
+        `ask` settle the partial turn the way any other failure settles.
+
+        **The client is dropped either way**, and that is deliberate rather than
+        laziness about the happy path. The client owns the CLI subprocess and the
+        message stream, and an interrupted turn is precisely the case where what
+        is left in that stream is unclear -- a result the aborted turn never
+        emitted, or one nobody read. Reusing it made the *next* turn end
+        instantly on a message belonging to the last one, with nothing drawn.
+        A fresh client cannot have a stale message in it, and `resume` carries
+        the conversation across, so what is paid is a restart on a deliberate,
+        occasional action.
+        """
+        # Captured once, and every step below acts on *this* client rather than
+        # on `self.client`. There are two awaits in here, each long enough for
+        # `ask` to have settled the turn and built a fresh client underneath --
+        # and the fresh one belongs to a turn nobody asked to stop. Taking it
+        # down, or clearing the busy flag it set, stops a turn that started
+        # after the interrupt.
+        client = self.client
+        if client is not None and hasattr(client, "interrupt"):
             try:
-                await self.client.interrupt()
-            except Exception:  # noqa: BLE001 - a failed interrupt must not kill the app
-                pass
+                await client.interrupt()
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                log.warning("the SDK refused the interrupt", exc_info=exc)
+                self.say(
+                    f"the SDK refused the interrupt ({type(exc).__name__}) — "
+                    "stopping the turn the hard way"
+                )
+        if not await self._idles_within(INTERRUPT_GRACE_S):
+            self.say(f"the turn did not stop within {INTERRUPT_GRACE_S:.0f}s — taking the client down")
+        # Whether it stopped when asked or had to be taken down, the client goes
+        # -- unless it is no longer ours to take down.
+        if self.client is not client:
+            return
+        await self.close()
+        if self.client is not client and self.client is not None:
+            return
+        if self.busy and not await self._idles_within(INTERRUPT_GRACE_S):
+            # The turn outlived the client that was feeding it. Whatever it is
+            # waiting for is not going to arrive, and a composer that stays
+            # locked on the outcome of that is the failure this whole method is
+            # about -- so the flag is cleared and the fact is said out loud
+            # rather than left to be inferred from a session that never answers.
+            self.busy = False
+            self._idle.set()
+            self.say("the turn is still winding down — the composer is usable again")
 
-        self._task = asyncio.create_task(_interrupt())
+    async def _idles_within(self, seconds: float) -> bool:
+        """Has the turn settled inside this window? Never raises."""
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _stopped(self) -> None:
+        """Wait for a pending interrupt, so it cannot land on the next turn."""
+        pending, self._stopping = self._stopping, None
+        if pending is None or pending.done():
+            return
+        # Bounded: `_stop_turn` bounds itself, and a hang here would be the very
+        # thing this method exists to prevent, one layer up.
+        await asyncio.wait([pending], timeout=INTERRUPT_GRACE_S * 2)
+
+    def _remember_sdk_session(self, sdk_session_id: str) -> None:
+        self.sdk_session_id = sdk_session_id
+
+    def say(self, message: str) -> None:
+        """A line for the status bar, when there is one to put it in."""
+        log.info("%s", message)
+        if self.notify is not None:
+            try:
+                self.notify(message)
+            except Exception:  # noqa: BLE001 - a notice must not kill a turn
+                log.exception("could not report: %s", message)
 
     def path(self) -> Path:
         return sessions.path_for(self.session_id)
@@ -435,6 +582,52 @@ def build() -> None:
     ui.add_body_html(f'<script src="{STATIC_URL}/tiling.js"></script>', shared=True)
     katex.install(nicegui_app)
 
+    @nicegui_app.get("/__grad/show")
+    def _show() -> dict[str, bool]:
+        """How a second launch hands over to this one.
+
+        The launcher cannot raise another process's window, and on Windows it
+        may not even be allowed to try -- foreground rights belong to the
+        process that has them. So the running instance raises its own window,
+        and the only thing crossing the boundary is the request. Unauthenticated
+        like the rest of this port, and harmless: the whole effect is that a
+        window the user already owns becomes visible.
+        """
+        return {"shown": desktop.show_window()}
+
+    @nicegui_app.get("/__grad/notebook/{name}")
+    def _notebook(name: str) -> Any:
+        """One notebook, rendered read-only, for the pane's iframe.
+
+        Served from this app rather than from Lab so the pane has something to
+        show whether or not a Lab server is running -- and so what it shows can
+        be sandboxed, which Lab cannot be. `ui/render.py` explains the rest; the
+        name is validated there, against a directory rather than a pattern.
+        """
+        from fastapi.responses import HTMLResponse, PlainTextResponse  # noqa: PLC0415
+
+        try:
+            body = render.notebook_html(name)
+        except render.NotAllowed:
+            return PlainTextResponse("no such notebook in this workspace", status_code=404)
+        except OSError as exc:
+            return PlainTextResponse(f"could not read it: {exc}", status_code=503)
+        return HTMLResponse(
+            body,
+            headers={
+                # It is a document built from untrusted stored output and it
+                # needs nothing from anywhere: no scripts, no fetches, no
+                # framing by anyone but us. The iframe is sandboxed as well --
+                # this is the half that holds if the sandbox attribute is ever
+                # dropped by an edit that looks unrelated.
+                "Content-Security-Policy": (
+                    "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; "
+                    f"frame-ancestors {desktop.origin(PORT)} http://localhost:{PORT}"
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
+
     @ui.page("/")
     def index() -> None:
         from nicegui import context  # noqa: PLC0415 - page scope, not import scope
@@ -442,6 +635,11 @@ def build() -> None:
         session = Session(_client_key())
         session.adopt()
         workspace = state_mod.Workspace(session, _current_project())
+        # The one place both exist. A turn's own failures already reach the
+        # transcript; this is for the things that happen *around* a turn -- an
+        # interrupt the SDK refused, a client that had to be taken down -- which
+        # have no turn to be written into.
+        session.notify = workspace.say
         # Per client, not `app.on_shutdown`: that would accumulate one handler
         # per connection and hold every session's subprocess open until the app
         # itself exits.
@@ -525,7 +723,7 @@ def _storage_secret() -> str:
     Persisted rather than generated per launch so a restart does not orphan
     every transcript written before it.
     """
-    path = paths.data_dir() / "ui_storage_secret"
+    path = appdata.state_dir() / "ui_storage_secret"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
@@ -536,14 +734,88 @@ def _storage_secret() -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def run(*, native: bool = True, port: int = 8080) -> None:
+def _install_desktop(native: bool) -> None:
+    """Startup wiring that only makes sense once the loop and window exist.
+
+    Registered as a NiceGUI startup handler rather than done before `ui.run`,
+    because both halves need things that do not exist yet at call time: the
+    event loop `desktop.request_quit` dispatches onto, and the pywebview window
+    whose close button is being reinterpreted.
+    """
+    from nicegui import app as nicegui_app  # noqa: PLC0415
+
+    @nicegui_app.on_startup
+    def _wire() -> None:
+        desktop.bind_loop(asyncio.get_running_loop())
+        if not native:
+            # Browser mode has no window to hide and no tray to hide it to; the
+            # tab is the affordance and closing it is the user's business.
+            return
+        desktop.start_tray(on_restart_lab=_restart_lab_here)
+        window = getattr(nicegui_app.native, "main_window", None)
+        if window is None:
+            return
+
+        def _on_closing() -> bool:
+            """False cancels the close, which is how pywebview spells "hide"."""
+            if desktop.hide_to_tray():
+                return False
+            desktop.request_quit()
+            return False
+
+        try:
+            window.events.closing += _on_closing
+        except Exception:  # noqa: BLE001 - an un-hookable window just closes
+            log.debug("could not intercept the window close", exc_info=True)
+
+    @nicegui_app.on_shutdown
+    def _unwire() -> None:
+        from core import instance  # noqa: PLC0415
+
+        instance.release()
+
+
+def _restart_lab_here() -> None:
+    """Restart Lab bound to this app's origin. Also the tray's menu entry."""
+    from core import spawn  # noqa: PLC0415
+
+    argv = [
+        sys.executable, "-m", "tools.lab", "start",
+        "--ui-origin", desktop.origin(PORT), "--force",
+    ]
+    try:
+        spawn.run(argv, cwd=str(paths.root()), capture_output=True, text=True, timeout=90)
+    except Exception:  # noqa: BLE001 - reported by the window's next poll
+        log.exception("could not restart Lab")
+
+
+def run(*, native: bool = True, port: int | None = None) -> None:
     """`ui.run(native=True)` gives a real desktop window via pywebview, so the
     packaging question is answered without Electron or Tauri. Browser mode is
-    the fallback when pywebview misbehaves on Windows."""
+    the fallback when pywebview misbehaves on Windows.
+
+    `port=None` means "choose one" -- see `ui/desktop.py:choose_port` for why
+    that is a walk-up from 8080 rather than anything random.
+    """
     from nicegui import ui
 
+    global PORT
+
+    port = desktop.choose_port(port)
+    PORT = port
+    appdata.ensure()
+    # Here as well as in `agent.py:main`, because this is a public entry point:
+    # anything that imports `ui.app` and calls `run` -- a launch config, a test
+    # harness, a shortcut written before the CLI existed -- skips `main`
+    # entirely, and would then open on an empty app directory while the state it
+    # wanted sat unmigrated in the workspace. Idempotent, so running twice costs
+    # a stat per entry.
+    for name in appdata.migrate_legacy():
+        log.info("moved data/%s into %s", name, appdata.app_dir())
     paths.ensure_workspace()
+    instance.publish(port)
     build()
+    _install_desktop(native)
     # `window_size` is passed *only* in native mode, and that is not a
     # nicety: NiceGUI turns `native` on whenever a window size is given, so
     # passing it unconditionally made `native=False` unreachable and the
