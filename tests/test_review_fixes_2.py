@@ -270,6 +270,81 @@ def test_rerunning_write_replaces_the_prose_rather_than_stacking_it():
 
 
 # ---------------------------------------------------------------------------
+# numbers that are not numbers
+# ---------------------------------------------------------------------------
+NAN, INF = float("nan"), float("inf")
+
+
+@pytest.mark.parametrize("rate", [NAN, INF, -INF])
+def test_a_non_finite_rate_cannot_disable_the_smoke_cost_cap(workspace, cfg, rate):
+    """NaN is the input that turned the cap off while passing the check written
+    to stop exactly that.
+
+    `rate < 0` and `rate > 0` are both False for NaN, so the affordability
+    block was skipped whole: no wall-clock clamp, no refusal, and
+    `projected_cost_usd` recorded as nan. The infinities are here because they
+    reach `int()`, which raises OverflowError -- exit 1, "a bug in the CLI",
+    for what is a typo in a config file.
+    """
+    from tests.test_gates import make_submission
+
+    sub = make_submission(workspace)
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=rate)
+    assert exc.value.code in {"smoke_value_invalid", "smoke_rate_invalid", "smoke_too_expensive"}
+
+
+@pytest.mark.parametrize("value", [NAN, INF])
+def test_a_non_finite_spec_estimate_is_refused_not_crashed(workspace, cfg, value):
+    """`int(nan)` is a ValueError and `int(inf)` an OverflowError, so a spec
+    carrying either came out as exit 1 rather than as a gate refusal."""
+    from tests.test_gates import make_submission
+
+    sub = make_submission(workspace)
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_smoke_caps(
+            sub, cfg, requested={"cost_usd": value}, rate_usd_per_hour=1.05
+        )
+    assert exc.value.code in {"smoke_value_invalid", "smoke_too_expensive"}
+
+
+@pytest.mark.parametrize("literal", ["nan", "inf", "-inf"])
+def test_a_non_finite_ceiling_in_the_config_is_refused_at_load(workspace, literal):
+    """`nan` and `inf` are valid TOML floats. Neither can bound a spend, and
+    both look like a number in the file."""
+    from core import config as config_mod
+    from core.errors import ConfigError
+
+    path = workspace / "config" / "grad.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"[spend]\nmonthly_usd = {literal}\n", encoding="utf-8")
+    config_mod._cache.clear()  # noqa: SLF001
+    with pytest.raises(ConfigError) as exc:
+        config_mod.load(path, reload=True)
+    assert "finite" in exc.value.message or "negative" in exc.value.message
+    config_mod._cache.clear()  # noqa: SLF001
+
+
+def test_a_non_finite_host_rate_is_refused_at_load(workspace):
+    from core import config as config_mod
+    from core.errors import ConfigError
+
+    path = workspace / "config" / "grad.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[hosts.box]\nhostname = '10.0.0.7'\nrate_usd_per_hour = nan\n", encoding="utf-8"
+    )
+    config_mod._cache.clear()  # noqa: SLF001
+    # At load, not at first use: `_validate` walks the host inventory itself, so
+    # a bad rate is a startup error rather than one that surfaces later from
+    # inside a submitter.
+    with pytest.raises(ConfigError) as exc:
+        config_mod.load(path, reload=True)
+    assert "finite" in exc.value.message
+    config_mod._cache.clear()  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
 # the prose rule, and the honest prose it must not refuse
 # ---------------------------------------------------------------------------
 def _written(body: str) -> str:

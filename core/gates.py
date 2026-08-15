@@ -13,6 +13,7 @@ exception to that: it is a *different*, hard-capped path, checked by
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from typing import Any
 
 from core import budget as budget_mod, jsonl, ledger_store as ls, paths
@@ -271,6 +272,51 @@ def check_submit(
 MIN_SMOKE_WALL_S = 60
 
 
+def _finite(value: Any, what: str) -> float:
+    """A float that can actually bound something, or a refusal.
+
+    `nan` and `inf` are valid TOML floats, so both a spec's `[estimate]` and a
+    host's rate can carry them, and neither is caught by a sign check. They fail
+    in opposite and equally bad ways:
+
+      * **NaN fails every comparison.** `rate < 0` and `rate > 0` are both
+        False, so the affordability block below was skipped entirely -- no
+        wall-clock clamp, no cost refusal, `projected_cost_usd` recorded as
+        `nan`. A rate of NaN was the one input that disabled the cost cap while
+        passing the check written to stop exactly that (`rate_usd_per_hour is
+        None`).
+      * **Infinity converts to nothing.** `int(inf)` raises OverflowError and
+        `int(nan)` raises ValueError, so a non-finite cost reached
+        `int(affordable_s)` and came out as exit 1, "a bug in the CLI" --
+        when it is a bug in a file the user can fix.
+
+    Refused here rather than at the config loader alone, because the spec and
+    the rate are not config: one is a file the agent writes, the other is a
+    lookup.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise GateRefusal(
+            "smoke_value_invalid",
+            f"{what} is not a number ({value!r})",
+            EXIT_SPEND,
+            fix="give it a finite number, or remove it to take the configured default",
+        ) from None
+    if not math.isfinite(number):
+        raise GateRefusal(
+            "smoke_value_invalid",
+            f"{what} is {number}, which cannot bound anything -- a cap that is not a "
+            "finite number is not a cap",
+            EXIT_SPEND,
+            fix=(
+                "give it a finite number. `nan` and `inf` are valid TOML floats and neither "
+                "can be compared against a spend"
+            ),
+        )
+    return number
+
+
 def check_smoke_caps(
     sub: Submission,
     cfg: Config,
@@ -298,11 +344,14 @@ def check_smoke_caps(
     requested = requested or {}
     max_steps = int(cfg.get("smoke", "max_steps", 1))
     max_wall = int(cfg.get("smoke", "max_wall_clock_s", 600))
-    max_cost = float(cfg.get("smoke", "max_cost_usd", 0.50))
+    max_cost = _finite(cfg.get("smoke", "max_cost_usd", 0.50), "smoke.max_cost_usd")
 
     steps = int(requested.get("steps", max_steps))
     wall = int(requested.get("timeout_s", max_wall))
-    cost = float(requested.get("cost_usd", sub.estimate.get("smoke_cost_usd", max_cost)))
+    cost = _finite(
+        requested.get("cost_usd", sub.estimate.get("smoke_cost_usd", max_cost)),
+        "the smoke cost estimate",
+    )
 
     clamped = {
         "steps": min(steps, max_steps),
@@ -313,7 +362,7 @@ def check_smoke_caps(
 
     # A spec whose *minimum* possible smoke cost is above the cap cannot be
     # smoked at all, and saying so is better than silently billing more.
-    floor_cost = float(sub.estimate.get("smoke_cost_usd", 0.0))
+    floor_cost = _finite(sub.estimate.get("smoke_cost_usd", 0.0), "estimate.smoke_cost_usd")
     if floor_cost > max_cost:
         raise GateRefusal(
             "smoke_too_expensive",
@@ -337,7 +386,7 @@ def check_smoke_caps(
             detail={**clamped, "target": target_name},
         )
 
-    rate = float(rate_usd_per_hour)
+    rate = _finite(rate_usd_per_hour, f"the hourly rate for {target_name}")
     if rate < 0:
         raise GateRefusal(
             "smoke_rate_invalid",

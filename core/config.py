@@ -7,6 +7,7 @@ must not silently raise a ceiling.
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -235,7 +236,14 @@ class Config:
                 # A negative rate would make `collect` book negative actuals,
                 # which *reduce* rolling spend -- a typo that raises the ceiling.
                 # Zero is legitimate (a host that is free to use is still
-                # ledgered); below zero is not.
+                # ledgered); below zero is not. Neither is nan, which fails
+                # every comparison a gate makes against it, or inf, which is a
+                # price no run can be under.
+                if not math.isfinite(float(rate)):
+                    raise ConfigError(
+                        f"host {name!r} has a non-finite rate_usd_per_hour ({rate})",
+                        fix="rate_usd_per_hour must be a finite number; use 0 for a free host",
+                    )
                 if float(rate) < 0:
                     raise ConfigError(
                         f"host {name!r} has a negative rate_usd_per_hour ({rate})",
@@ -345,6 +353,19 @@ def _validate(cfg: Config, path: Path) -> None:
             raise ConfigError(
                 f"[{section}] {key} must be a number, not {type(value).__name__}",
                 fix=f"fix {section}.{key} in {path}",
+            )
+        # TOML has literal `nan` and `inf`, so these reach the gates as ordinary
+        # floats. Neither belongs in a ceiling: NaN fails every comparison, so a
+        # gate written as `if spend > ceiling` waves everything through, and inf
+        # is a ceiling that can never be reached. Both read as "no limit" while
+        # looking like a number in the file.
+        if not math.isfinite(value):
+            raise ConfigError(
+                f"[{section}] {key} must be a finite number, not {value}",
+                fix=(
+                    f"fix {section}.{key} in {path}; nan and inf are valid TOML floats "
+                    "but neither can bound anything"
+                ),
             )
         if value < 0:
             raise ConfigError(
