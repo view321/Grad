@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import sys
 import time
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import hooks
-from core import config as config_mod, credentials, paths, quota_log
+from core import appdata, config as config_mod, credentials, paths, quota_log
 from core.errors import EXIT_PROJECT_BUDGET
 
 BUILTIN_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -800,6 +801,38 @@ async def run_probe() -> int:
 
 
 # ---------------------------------------------------------------------------
+def _configure_logging() -> None:
+    """Log to a file under the app directory, and say so nowhere on screen.
+
+    The desktop app is a GUI process with no console to print a traceback into,
+    so before this the only record of a window that failed to render was a
+    `log.exception` written to a handler that did not exist. Rotating, because
+    this is the one file here nobody will ever remember to delete.
+
+    stderr keeps its handler when there *is* a console: the CLI is the same
+    entry point, and swallowing its output to a file nobody asked for would be
+    worse than the problem being solved.
+    """
+    from logging.handlers import RotatingFileHandler  # noqa: PLC0415
+
+    root = logging.getLogger()
+    if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        return
+    appdata.ensure()
+    try:
+        handler = RotatingFileHandler(
+            appdata.logs_dir() / "grad.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+        )
+    except OSError:  # a locked or unwritable log must not stop the app opening
+        return
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    )
+    root.addHandler(handler)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="grad",
@@ -812,11 +845,15 @@ def main() -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=8080,
-        help="port for --ui; move it when something else already holds 8080",
+        default=None,
+        help="pin the --ui port; by default 8080, or the next free port above it",
     )
     parser.add_argument("--check", action="store_true", help="report environment and auth posture, then exit")
     args = parser.parse_args()
+
+    _configure_logging()
+    for name in appdata.migrate_legacy():
+        logging.getLogger("grad").info("moved data/%s into %s", name, appdata.app_dir())
 
     if args.check:
         print(json.dumps(preflight_environment(), indent=2))
@@ -824,12 +861,31 @@ def main() -> None:
     if args.probe:
         raise SystemExit(asyncio.run(run_probe()))
     if args.ui:
+        from core import instance  # noqa: PLC0415
+
+        # One workspace at a time. Two would fight over the layout file, the
+        # transcript directory and the Lab server's recorded origin, and the
+        # second would bind a different port -- which is exactly the mismatch
+        # that stops Lab embedding. See `core/instance.py`.
+        try:
+            instance.acquire()
+        except instance.AlreadyRunning as running:
+            if instance.show_running(running.info):
+                return
+            raise SystemExit(
+                f"{running}\nIt is not answering on that port. If it is wedged, end the "
+                "`python` process holding it and start again."
+            ) from None
+
         from ui.app import run as run_ui  # noqa: PLC0415
 
         # A non-default port also moves the app's origin, and the embedded Lab
         # scopes its `frame-ancestors` to that origin -- so `tools.lab` needs
         # `--ui-origin http://127.0.0.1:<port>` to match, or the iframe is blocked.
-        run_ui(port=args.port)
+        try:
+            run_ui(port=args.port)
+        finally:
+            instance.release()
         return
 
     prompt = " ".join(args.prompt) if args.prompt else None

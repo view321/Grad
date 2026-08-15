@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from core import config as config_mod, paths
+from core import appdata, config as config_mod, paths, spawn
 from core.cli import Cli, main
 from core.errors import EXIT_CHECK_FAILED, ConfigError, GradError, NotFound, UsageError
 
@@ -55,7 +55,7 @@ def _jupyter() -> Any:
 
 
 def _conn_path(name: str) -> Path:
-    d = paths.data_dir() / CONNECTION_DIR
+    d = appdata.state_dir() / CONNECTION_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{name}.json"
 
@@ -70,8 +70,11 @@ def _start_kernel(name: str, kernel_name: str) -> dict[str, Any]:
     for every cell, so the kernel must survive the CLI exiting. A
     `KernelManager`-owned kernel does not -- it is torn down with its manager,
     which is correct for a notebook server and useless here. So the connection
-    file is written first and `ipykernel_launcher` is spawned detached
-    (DETACHED_PROCESS on Windows, a new session elsewhere).
+    file is written first and `ipykernel_launcher` is spawned detached.
+
+    Through `core/spawn.py` rather than by hand: the flags for "outlives me and
+    shows no window, for its children too" are subtle enough that a second copy
+    of them is a second thing to get wrong, and this one *was* the second copy.
     """
     jc = _jupyter()
     conn = _conn_path(name)
@@ -79,15 +82,6 @@ def _start_kernel(name: str, kernel_name: str) -> dict[str, Any]:
     jc.write_connection_file(fname=str(conn), kernel_name=kernel_name)
 
     log = conn.with_suffix(".log")
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
-        )
-    else:
-        start_new_session = True
-
     with open(log, "wb") as fh:
         proc = subprocess.Popen(
             [sys.executable, "-m", "ipykernel_launcher", "-f", str(conn)],
@@ -95,8 +89,7 @@ def _start_kernel(name: str, kernel_name: str) -> dict[str, Any]:
             stdout=fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
+            **spawn.detached(),
         )
     conn.with_suffix(".pid").write_text(str(proc.pid), encoding="utf-8")
     return {"connection_file": str(conn), "kernel_name": kernel_name, "pid": proc.pid, "started": True}
@@ -432,7 +425,7 @@ def cmd_stop(args: argparse.Namespace) -> dict[str, Any]:
 
 @cli.command("status", "which kernels have connection files")
 def cmd_status(_: argparse.Namespace) -> dict[str, Any]:
-    d = paths.data_dir() / CONNECTION_DIR
+    d = appdata.state_dir() / CONNECTION_DIR
     return {
         "kernels": [p.stem for p in d.glob("*.json")] if d.exists() else [],
         "figures_dir": str(paths.figures_dir()),

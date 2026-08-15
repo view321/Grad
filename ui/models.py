@@ -720,9 +720,42 @@ def notebook_model() -> dict[str, Any]:
         "lab_running": bool(lab.get("running")),
         "lab_port": lab.get("port"),
         "lab_token": lab.get("token"),
+        "lab_origin": lab.get("ui_origin"),
+        "origin_mismatch": origin_mismatch(lab),
         "ruler": 88,
         "error": lab_error,
     }
+
+
+def app_port() -> int:
+    """The port `ui/app.py` bound. Imported lazily to avoid a cycle: `app`
+    imports the shell, which imports this module."""
+    from ui import app as app_mod  # noqa: PLC0415
+
+    return int(getattr(app_mod, "PORT", 8080))
+
+
+def origin_mismatch(lab: dict[str, Any]) -> bool:
+    """Whether the running Lab was scoped to a different origin than this app.
+
+    Lab fixes `frame-ancestors` at launch from the origin it was given, so an
+    app that has since moved ports cannot embed it -- and the browser reports
+    that as *"127.0.0.1 refused to connect"*, which reads as a dead server and
+    sends you hunting for a process that is running perfectly well. Detecting it
+    is what lets the window say the true thing instead.
+
+    Only the port is compared. `config/jupyter/jupyter_server_config.py`
+    deliberately allows both `127.0.0.1:<port>` and `localhost:<port>`, because
+    a browser treats them as different origins and which one the window opened
+    on is not Lab's business -- so a host difference is not a mismatch, and
+    flagging one would put a banner on a perfectly good server.
+    """
+    if not lab.get("running"):
+        return False
+    recorded = str(lab.get("ui_origin") or "").rstrip("/")
+    if not recorded:
+        return False
+    return recorded.rsplit(":", 1)[-1] != str(app_port())
 
 
 def lab_url(state: dict[str, Any], notebook: str | None = None) -> str:

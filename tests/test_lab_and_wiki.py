@@ -16,7 +16,7 @@ import json
 
 import pytest
 
-from core import jsonl, paths
+from core import appdata, jsonl, paths
 from core.errors import ConfigError, GradError, UsageError
 from tools import lab, wiki
 
@@ -66,7 +66,7 @@ def test_status_reports_not_running_before_a_start(workspace):
 def test_the_token_is_not_in_the_status_payload(workspace):
     """A status output is the sort of thing that ends up in a screenshot."""
     jsonl.write_json(
-        paths.data_dir() / "lab" / "lab.json",
+        appdata.state_dir() / "lab" / "lab.json",
         {"port": 8889, "token": "super-secret", "pid": 1, "url": "http://127.0.0.1:8889/lab"},
     )
     payload = lab.cmd_status(argparse.Namespace(json=True))
@@ -77,7 +77,7 @@ def test_the_token_is_not_in_the_status_payload(workspace):
 
 def test_url_includes_the_token_because_the_iframe_needs_it(workspace):
     jsonl.write_json(
-        paths.data_dir() / "lab" / "lab.json",
+        appdata.state_dir() / "lab" / "lab.json",
         {"port": 8889, "token": "tok123", "pid": 1},
     )
     result = lab.cmd_url(argparse.Namespace(path="notebooks/a.ipynb", json=True))
@@ -223,8 +223,22 @@ def _server_app(monkeypatch, origin: str):
     source = (_repo_root() / "config" / "jupyter" / "jupyter_server_config.py").read_text(
         encoding="utf-8"
     )
-    config = type("Config", (), {})()
-    config.ServerApp = type("ServerApp", (), {})()
+
+    class _Section:
+        """`get_config()` returns a traitlets `Config`, which creates a section
+        the first time one is touched -- `c.ServerApp.ip = ...` needs no
+        declaration, and neither does `c.LanguageServerManager.node_roots`. A
+        stub that predeclares the sections it happens to know about turns a new
+        setting in the real config into an AttributeError here, which says
+        nothing about the setting and everything about the stub.
+        """
+
+        def __getattr__(self, name: str):
+            section = _Section()
+            setattr(self, name, section)  # traitlets caches it; so does this
+            return section
+
+    config = _Section()
     namespace: dict = {"get_config": lambda: config}
     monkeypatch.setenv("GRAD_UI_ORIGIN", origin)
     exec(compile(source, "jupyter_server_config.py", "exec"), namespace)
@@ -429,15 +443,38 @@ def test_a_page_that_cannot_answer_falls_back_to_the_port_the_app_bound(workspac
 # ---------------------------------------------------------------------------
 # no console windows
 # ---------------------------------------------------------------------------
-def test_a_detached_child_and_a_quiet_one_do_not_ask_for_both_flags(workspace):
-    """`CREATE_NO_WINDOW` and `DETACHED_PROCESS` are mutually exclusive --
-    passing both fails with ERROR_INVALID_PARAMETER rather than being
-    redundant."""
+def test_a_long_lived_child_keeps_a_console_so_its_own_children_stay_quiet(workspace):
+    """`DETACHED_PROCESS` gives a child no console, so the first console program
+    *it* starts is given a fresh -- visible -- one. That is where the `npm
+    prefix` window came from: jupyter-lsp probing for language servers under a
+    Lab server we had started detached.
+
+    `CREATE_NO_WINDOW` is the fix and is also mutually exclusive with
+    `DETACHED_PROCESS` (both together is ERROR_INVALID_PARAMETER, not
+    redundancy), so this asserts the swap rather than the coexistence.
+    """
+    import subprocess
+
     from core import spawn
 
-    quiet = spawn.quiet().get("creationflags", 0)
-    detached = spawn.detached().get("creationflags", 0)
-    assert not (quiet and detached and quiet & detached)
+    if not spawn.WINDOWS:
+        assert spawn.detached() == {"start_new_session": True}
+        return
+
+    flags = spawn.detached()["creationflags"]
+    assert flags & subprocess.CREATE_NO_WINDOW
+    assert not flags & subprocess.DETACHED_PROCESS
+    # The half of the promise the console was never carrying: a Ctrl+C to our
+    # group must not reach it.
+    assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+
+
+def test_the_verify_kernel_is_spawned_through_the_same_one_definition(workspace):
+    """`tools/nb.py` had its own hand-rolled copy of the flags, which meant its
+    detached kernels had the same invisible-grandchild problem."""
+    source = __import__("inspect").getsource(__import__("tools.nb", fromlist=["nb"]))
+    assert "**spawn.detached()" in source
+    assert "DETACHED_PROCESS" not in source
 
 
 def test_the_lab_server_is_started_without_a_console(workspace, monkeypatch):

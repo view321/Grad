@@ -39,11 +39,12 @@ import json
 import logging
 import re
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 
-from core import config as config_mod, paths
-from ui import katex, kit, sessions, shell, state as state_mod
+from core import appdata, config as config_mod, instance, paths
+from ui import desktop, katex, kit, sessions, shell, state as state_mod
 ROLES = ("user", "assistant")
 STATIC_URL = "/grad-static"
 
@@ -570,6 +571,19 @@ def build() -> None:
     ui.add_body_html(f'<script src="{STATIC_URL}/tiling.js"></script>', shared=True)
     katex.install(nicegui_app)
 
+    @nicegui_app.get("/__grad/show")
+    def _show() -> dict[str, bool]:
+        """How a second launch hands over to this one.
+
+        The launcher cannot raise another process's window, and on Windows it
+        may not even be allowed to try -- foreground rights belong to the
+        process that has them. So the running instance raises its own window,
+        and the only thing crossing the boundary is the request. Unauthenticated
+        like the rest of this port, and harmless: the whole effect is that a
+        window the user already owns becomes visible.
+        """
+        return {"shown": desktop.show_window()}
+
     @ui.page("/")
     def index() -> None:
         from nicegui import context  # noqa: PLC0415 - page scope, not import scope
@@ -665,7 +679,7 @@ def _storage_secret() -> str:
     Persisted rather than generated per launch so a restart does not orphan
     every transcript written before it.
     """
-    path = paths.data_dir() / "ui_storage_secret"
+    path = appdata.state_dir() / "ui_storage_secret"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(secrets.token_urlsafe(32), encoding="utf-8")
@@ -676,17 +690,88 @@ def _storage_secret() -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def run(*, native: bool = True, port: int = 8080) -> None:
+def _install_desktop(native: bool) -> None:
+    """Startup wiring that only makes sense once the loop and window exist.
+
+    Registered as a NiceGUI startup handler rather than done before `ui.run`,
+    because both halves need things that do not exist yet at call time: the
+    event loop `desktop.request_quit` dispatches onto, and the pywebview window
+    whose close button is being reinterpreted.
+    """
+    from nicegui import app as nicegui_app  # noqa: PLC0415
+
+    @nicegui_app.on_startup
+    def _wire() -> None:
+        desktop.bind_loop(asyncio.get_running_loop())
+        if not native:
+            # Browser mode has no window to hide and no tray to hide it to; the
+            # tab is the affordance and closing it is the user's business.
+            return
+        desktop.start_tray(on_restart_lab=_restart_lab_here)
+        window = getattr(nicegui_app.native, "main_window", None)
+        if window is None:
+            return
+
+        def _on_closing() -> bool:
+            """False cancels the close, which is how pywebview spells "hide"."""
+            if desktop.hide_to_tray():
+                return False
+            desktop.request_quit()
+            return False
+
+        try:
+            window.events.closing += _on_closing
+        except Exception:  # noqa: BLE001 - an un-hookable window just closes
+            log.debug("could not intercept the window close", exc_info=True)
+
+    @nicegui_app.on_shutdown
+    def _unwire() -> None:
+        from core import instance  # noqa: PLC0415
+
+        instance.release()
+
+
+def _restart_lab_here() -> None:
+    """Restart Lab bound to this app's origin. Also the tray's menu entry."""
+    from core import spawn  # noqa: PLC0415
+
+    argv = [
+        sys.executable, "-m", "tools.lab", "start",
+        "--ui-origin", desktop.origin(PORT), "--force",
+    ]
+    try:
+        spawn.run(argv, cwd=str(paths.root()), capture_output=True, text=True, timeout=90)
+    except Exception:  # noqa: BLE001 - reported by the window's next poll
+        log.exception("could not restart Lab")
+
+
+def run(*, native: bool = True, port: int | None = None) -> None:
     """`ui.run(native=True)` gives a real desktop window via pywebview, so the
     packaging question is answered without Electron or Tauri. Browser mode is
-    the fallback when pywebview misbehaves on Windows."""
+    the fallback when pywebview misbehaves on Windows.
+
+    `port=None` means "choose one" -- see `ui/desktop.py:choose_port` for why
+    that is a walk-up from 8080 rather than anything random.
+    """
     from nicegui import ui
 
     global PORT
 
+    port = desktop.choose_port(port)
     PORT = port
+    appdata.ensure()
+    # Here as well as in `agent.py:main`, because this is a public entry point:
+    # anything that imports `ui.app` and calls `run` -- a launch config, a test
+    # harness, a shortcut written before the CLI existed -- skips `main`
+    # entirely, and would then open on an empty app directory while the state it
+    # wanted sat unmigrated in the workspace. Idempotent, so running twice costs
+    # a stat per entry.
+    for name in appdata.migrate_legacy():
+        log.info("moved data/%s into %s", name, appdata.app_dir())
     paths.ensure_workspace()
+    instance.publish(port)
     build()
+    _install_desktop(native)
     # `window_size` is passed *only* in native mode, and that is not a
     # nicety: NiceGUI turns `native` on whenever a window size is given, so
     # passing it unconditionally made `native=False` unreachable and the

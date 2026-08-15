@@ -29,6 +29,29 @@ def workspace(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolate_app_dir(tmp_path, monkeypatch):
+    """Point the *installation* at a temp directory too, for every test.
+
+    `GRAD_ROOT` isolates the workspace; it does not isolate `core/appdata.py`,
+    which resolves outside the root by design -- the Lab server's port and
+    token, the window layouts, the chat transcripts, the instance lock. Without
+    this, running the suite writes into the developer's real
+    `%LOCALAPPDATA%\\Grad`: it would overwrite the `lab.json` of a Lab server
+    they have open, and tests would read each other's leftovers through it
+    rather than starting clean.
+
+    Autouse and separate from `workspace`, because the app directory is reached
+    by modules that have no workspace at all.
+    """
+    # A *sibling* of the workspace, never a child. `workspace` points GRAD_ROOT
+    # at `tmp_path`, so nesting the app directory inside it would make the one
+    # property this split exists for -- app state is not in the workspace --
+    # untestable, and true in production but false in every test.
+    monkeypatch.setenv("GRAD_APP_DIR", str(tmp_path.parent / f"{tmp_path.name}-appdata"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clean_process_state():
     """Module-level registries outlive a fixture, so they are emptied around
     every test. Both exist for the same reason -- a task and a session are

@@ -106,17 +106,25 @@ def config_path() -> Path:
 
 
 def cache_dir() -> Path:
-    return _p("data", "cache")
+    """Regenerable downloads, which are an installation's business rather than a
+    workspace's -- so this is the one path here that resolves outside the root.
+    See `core/appdata.py` for the split."""
+    from core import appdata  # noqa: PLC0415
+
+    return appdata.cache_dir()
 
 
 def ensure_workspace() -> None:
-    """Create the directories the CLIs write into. Cheap and idempotent."""
+    """Create the directories the CLIs write into. Cheap and idempotent.
+
+    `cache_dir` is absent on purpose: it lives under the app directory now, and
+    `appdata.ensure` is what creates that side.
+    """
     for d in (
         ledger_dir(),
         preflight_dir(),
         data_dir(),
         papers_dir(),
-        cache_dir(),
         notes_dir(),
         notebooks_dir(),
         figures_dir(),

@@ -14,9 +14,25 @@ another for the `tasklist` that checks whether a previous server is still alive.
 `CREATE_NO_WINDOW` is the flag for "console app, no window". It is **mutually
 exclusive with `DETACHED_PROCESS`** -- passing both fails with
 `ERROR_INVALID_PARAMETER` rather than being redundant -- so `detached()` is a
-separate function rather than an argument, and it does not need the flag: a
-detached process has no console at all, which is a stronger promise than having
-one that is not shown.
+separate function rather than an argument.
+
+**Which of the two a long-lived child gets is not a matter of taste.**
+`DETACHED_PROCESS` reads like the stronger promise -- no console at all, rather
+than one that is merely hidden -- and it is the weaker one in the only way that
+matters here, because a console is *inherited*. A detached child has none to
+lend, so the first console program *it* starts is given a fresh one, and a fresh
+console is the black window this module exists to prevent. That is not
+hypothetical: the Lab server was started detached, and `jupyter-lsp` runs
+`npm prefix -g` to locate language servers (`npm` is `npm.cmd` on Windows, so
+that is `cmd.exe`). The window appeared a second after the Lab tab opened, from
+a grandchild nobody here wrote.
+
+So `detached()` asks for `CREATE_NO_WINDOW` too: the child gets a console of its
+own -- not the parent's, so closing a terminal cannot signal it -- and it is
+never shown, and every console descendant inherits that invisibility. The
+"outlives its parent" half of the promise is carried by
+`CREATE_NEW_PROCESS_GROUP`, which is what actually keeps a Ctrl+C to our group
+away from it; process lifetime was never tied to the console.
 
 Everything here is a no-op off Windows, where none of it is a problem.
 """
@@ -31,11 +47,11 @@ WINDOWS = os.name == "nt"
 
 #: "This is a console application; do not give it a window."
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if WINDOWS else 0
-#: "This process does not belong to my console, and gets none of its own." The
-#: two flags above cannot be combined; see the module docstring.
+#: "A console of its own, never shown, and its own process group." Not
+#: `DETACHED_PROCESS`, which the two flags above cannot be combined with anyway
+#: -- and which is what gave *grandchildren* windows. See the module docstring.
 DETACHED = (
-    getattr(subprocess, "DETACHED_PROCESS", 0)
-    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 ) if WINDOWS else 0
 
 
@@ -50,7 +66,11 @@ def quiet() -> dict[str, Any]:
 
 
 def detached() -> dict[str, Any]:
-    """Keyword arguments for a child that must outlive its parent.
+    """Keyword arguments for a child that must outlive its parent, quietly.
+
+    Quietly for its whole subtree, which is the part that is easy to get wrong:
+    see the module docstring for why this is `CREATE_NO_WINDOW` rather than
+    `DETACHED_PROCESS`.
 
     `start_new_session` off Windows is the same idea by another mechanism: the
     child leads its own process group, so a signal to ours does not reach it.

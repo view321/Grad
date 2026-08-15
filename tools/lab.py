@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from core import jsonl, paths, spawn
+from core import appdata, jsonl, paths, spawn
 from core.cli import Cli, main
 from core.errors import ConfigError, GradError
 
@@ -71,11 +71,14 @@ DEFAULT_PORT = 8889
 
 
 def _state_path() -> Path:
-    return paths.data_dir() / "lab" / "lab.json"
+    """Under the app directory, not the workspace: this file carries the Lab
+    server's token, and a freshly minted secret does not belong in a folder
+    somebody will eventually commit."""
+    return appdata.state_dir() / "lab" / "lab.json"
 
 
 def _log_path() -> Path:
-    return paths.data_dir() / "lab" / "lab.log"
+    return appdata.logs_dir() / "lab.log"
 
 
 def _jupyter_config_dir() -> Path:

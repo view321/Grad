@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ui import kit, registry
+from ui import desktop, kit, registry
 from ui.state import POLL_SECONDS, Workspace
 
 
@@ -106,9 +106,49 @@ def build(workspace: Workspace) -> None:
     retile()
 
     # One poll for the whole workspace; see the note at the top of ui/state.py.
-    ui.timer(POLL_SECONDS, workspace.tick)
+    ui.timer(POLL_SECONDS, workspace.poll)
 
+    _install_quit_guard(ui, workspace)
     _bind_client_events(ui, workspace, windows)
+
+
+def _install_quit_guard(ui: Any, workspace: Workspace) -> None:
+    """The dialog Quit raises when something is still running.
+
+    Built here, during the page, and only *opened* later: a NiceGUI element
+    belongs to the client whose slot context created it, and the tray's Quit
+    arrives on another thread entirely with no client in scope. So the dialog is
+    constructed while there is one, and `desktop.request_quit` reaches it by
+    dispatching onto this loop.
+
+    The last client to build wins, which is right for the app this is: one
+    native window, one workspace, enforced by `core/instance.py`. In browser
+    mode with two tabs open the prompt appears in one of them -- still a prompt,
+    still blocking the quit, which is the property that matters.
+    """
+    dialog = ui.dialog().props("persistent")
+    with dialog:
+        card = kit.column("grad-pad", gap=9).style(
+            "background: var(--grad-paper); border: var(--grad-border); min-width: 440px"
+        )
+
+    async def confirm(report: dict[str, Any]) -> bool:
+        card.clear()
+        with card:
+            kit.text("Quit while work is running?", "grad-label")
+            kit.text(desktop.busy_sentence(report))
+            kit.note(
+                "Quitting ends this app and the commands it started. A Lab kernel keeps "
+                "running — Lab is a separate server — but anything Grad launched, including "
+                "a verify on a fresh kernel, is stopped where it stands."
+            )
+            with kit.row("", gap=9):
+                kit.button("KEEP RUNNING", tone="primary", on_click=lambda: dialog.submit(False))
+                kit.button("QUIT ANYWAY", tone="danger", on_click=lambda: dialog.submit(True))
+        dialog.open()
+        return bool(await dialog)
+
+    desktop.bind_confirm(confirm)
 
 
 # ---------------------------------------------------------------------------

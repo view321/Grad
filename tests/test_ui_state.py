@@ -325,7 +325,15 @@ async def test_switching_folder_reloads_the_project_and_its_layout(workspace, tm
     assert budget_mod.current_project() is None
     assert space.project is None
     assert [c.windows for c in space.layout.columns] != stacked
-    assert state_mod.layout_dir() == paths.data_dir() / "layouts"
+    # The layout followed the switch without living in the workspace. Both
+    # halves matter: it is keyed to the new root (so the arrangement above came
+    # back to its default rather than carrying over), and it resolves under the
+    # app directory (so a pane arrangement is never a file somebody commits).
+    from core import appdata
+
+    assert state_mod.layout_dir() == appdata.workspace_state_dir() / "layouts"
+    assert appdata.app_dir() in state_mod.layout_dir().parents
+    assert paths.root() not in state_mod.layout_dir().parents
 
 
 @pytest.mark.asyncio

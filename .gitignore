@@ -52,10 +52,21 @@ reports/**/claims.tex
 # client's transcript is keyed by, so it is a credential in everything but name;
 # the session files are the conversations themselves, and the layouts and kernel
 # pid are one machine's, not the repository's.
+#
+# These now live under `core/appdata.py`'s directory instead -- outside the
+# workspace entirely, which is a better answer than ignoring them. The entries
+# stay because a checkout that predates the move still has the files until
+# `migrate_legacy` runs, and an un-ignored credential is not something to leave
+# resting on a startup path having been taken.
 data/ui_storage_secret
 data/ui_session-*.jsonl
 data/layouts/
 data/kernel/
+
+# JupyterLab's own runtime state, written into the config directory it is
+# pointed at rather than into data/. Generated on first start, per machine.
+config/jupyter/lab/
+config/jupyter/migrated
 
 # Credentials never live in the workspace (HANDOFF §9). This is belt and braces.
 .env

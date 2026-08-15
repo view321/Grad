@@ -60,6 +60,18 @@
     const totalPx = panes.reduce((sum, p) => sum + size(p), 0);
 
     handle.classList.add('dragging');
+    // The same class the *retile* drag sets, and for the reason recorded beside
+    // its rule in `ui/tokens.py`: a cross-origin iframe hit-tests the pointer
+    // before this document does. Cross into the embedded Lab mid-resize and the
+    // `mousemove` below simply stops arriving -- the divider stalls under a
+    // cursor that is still moving -- and so does the `mouseup`, which is worse:
+    // `onUp` never runs, so the listeners stay attached and the next stray
+    // movement goes on resizing with no button held. Only the title-bar drag
+    // was setting it, and this is the drag that starts *adjacent* to a pane.
+    //
+    // The inline cursor below outranks the class's `grabbing`, so the resize
+    // cursor is still the one shown.
+    document.body.classList.add('grad-dragging');
     document.body.style.cursor = vertical ? 'row-resize' : 'col-resize';
 
     const onMove = (moveEvent) => {
@@ -76,6 +88,7 @@
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
       handle.classList.remove('dragging');
+      document.body.classList.remove('grad-dragging');
       document.body.style.cursor = '';
       emit('grad_resize', {
         axis: vertical ? 'slots' : 'columns',
@@ -299,22 +312,47 @@
    * living inside it, so the pane tree can be torn down and rebuilt around it
    * without the browser reloading the document. */
   const frames = new Map();
+  //: Assigned at the bottom of this block, where the loop it starts is defined.
+  //: Only ever called from `gradRegisterFrame`, which runs long after.
+  let startLoop = () => {};
+
+  /* Placing an overlay costs a layout, and writing the four position properties
+   * dirties layout again for the next reader. On the overwhelming majority of
+   * passes the numbers are identical -- a pane that has not moved -- so the box
+   * is remembered and the writes are skipped. This matters far more than it
+   * looks: with a whole JupyterLab document in the frame, the layout each
+   * needless write forces is not a small one. */
+  const place = (frame, next) => {
+    if (frame.__gradBox === next) return;
+    frame.__gradBox = next;
+    if (next === null) {
+      frame.style.display = 'none';
+      return;
+    }
+    frame.style.display = 'block';
+    frame.style.left = `${next[0]}px`;
+    frame.style.top = `${next[1]}px`;
+    frame.style.width = `${next[2]}px`;
+    frame.style.height = `${next[3]}px`;
+  };
 
   const reflowFrames = () => {
     frames.forEach((frame, anchorId) => {
       const anchor = document.getElementById(anchorId);
       if (!anchor) {
-        frame.style.display = 'none';
+        place(frame, null);
         return;
       }
       const box = anchor.getBoundingClientRect();
       const visible = box.width > 1 && box.height > 1 && box.bottom > 0 && box.top < window.innerHeight;
-      frame.style.display = visible ? 'block' : 'none';
-      if (!visible) return;
-      frame.style.left = `${Math.round(box.left)}px`;
-      frame.style.top = `${Math.round(box.top)}px`;
-      frame.style.width = `${Math.round(box.width)}px`;
-      frame.style.height = `${Math.round(box.height)}px`;
+      if (!visible) {
+        place(frame, null);
+        return;
+      }
+      const next = [Math.round(box.left), Math.round(box.top), Math.round(box.width), Math.round(box.height)];
+      const held = frame.__gradBox;
+      if (held && held[0] === next[0] && held[1] === next[1] && held[2] === next[2] && held[3] === next[3]) return;
+      place(frame, next);
     });
   };
 
@@ -322,6 +360,7 @@
     let frame = frames.get(anchorId);
     if (frame && frame.dataset.src === src) {
       reflowFrames();
+      startLoop();
       return;
     }
     if (frame) frame.remove();
@@ -337,6 +376,7 @@
     document.body.appendChild(frame);
     frames.set(anchorId, frame);
     reflowFrames();
+    startLoop();
   };
 
   window.gradDropFrame = (anchorId) => {
@@ -368,13 +408,43 @@
 
   window.addEventListener('resize', reflowFrames);
   window.addEventListener('scroll', reflowFrames, true);
-  // The pane tree is rebuilt by the server on every retile, so the anchor is a
-  // different element each time; polling one frame per animation frame is both
-  // cheaper and more reliable than trying to observe a node that keeps being
-  // replaced.
-  const tick = () => {
-    reflowFrames();
+
+  /* The pane tree is rebuilt by the server on every retile, so the anchor is a
+   * different element each time; polling is more reliable than trying to
+   * observe a node that keeps being replaced. What it does not have to be is
+   * *per frame*. Everything a person does directly -- dragging a divider,
+   * scrolling, resizing the window -- already reflows on its own event, so this
+   * loop only has to catch changes the server made, and 15 Hz is well under the
+   * rate anyone notices a frame settling into a new pane.
+   *
+   * The difference is not academic. The old loop measured and repositioned
+   * sixty times a second for the lifetime of the page, whether or not anything
+   * had moved and whether or not a frame existed at all -- and every one of
+   * those passes reached into a layout containing an embedded JupyterLab. It
+   * ran hardest in exactly the state it was most expensive in. */
+  const POLL_MS = 66;
+  let looping = false;
+  let lastPoll = 0;
+
+  const tick = (now) => {
+    if (!frames.size) {
+      // Nothing to place: stop entirely rather than idle. `gradRegisterFrame`
+      // starts it again, so the workspace pays nothing for this until a window
+      // that embeds something is actually open.
+      looping = false;
+      return;
+    }
+    if (now - lastPoll >= POLL_MS) {
+      lastPoll = now;
+      reflowFrames();
+    }
     window.requestAnimationFrame(tick);
   };
-  window.requestAnimationFrame(tick);
+
+  startLoop = () => {
+    if (looping) return;
+    looping = true;
+    lastPoll = 0;
+    window.requestAnimationFrame(tick);
+  };
 })();

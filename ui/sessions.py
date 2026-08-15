@@ -36,7 +36,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from core import paths
+from core import appdata
 from core.ledger_store import now_iso
 
 PREFIX = "ui_session"
@@ -50,7 +50,17 @@ TITLE_CHARS = 60
 
 
 def sessions_dir() -> Path:
-    return paths.data_dir()
+    """Transcripts, under the app directory but keyed to this workspace.
+
+    Both halves matter. They are private, so they do not belong in a folder that
+    gets committed; and `ui/app.py:rebind` promises that switching the workspace
+    root switches which conversation is on screen, which one flat directory
+    shared by every folder ever opened would quietly break. See
+    `core/appdata.py:workspace_state_dir`.
+    """
+    d = appdata.workspace_state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def new_id() -> str:
