@@ -200,3 +200,113 @@ def test_deleting_a_session_is_idempotent(workspace):
     assert sessions.delete("abc") is True
     assert sessions.delete("abc") is False
     assert sessions.listing() == []
+
+
+# ---------------------------------------------------------------------------
+# listing cost
+# ---------------------------------------------------------------------------
+def test_reading_a_written_session_stops_at_the_header(workspace, monkeypatch):
+    """`listing()` calls `read_meta` once per session, so a scan to the end
+    would make listing cost the total size of every transcript in the
+    workspace -- and transcripts grow with the conversations most worth coming
+    back to."""
+    sessions.write("abc", [user("hello"), assistant("hi")], title="a title")
+
+    path = sessions.path_for("abc")
+    real_open = open
+    read_lines: list[int] = []
+
+    class CountingFile:
+        def __init__(self, handle):
+            self._handle = handle
+            self._count = 0
+
+        def __iter__(self):
+            for line in self._handle:
+                self._count += 1
+                yield line
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            read_lines.append(self._count)
+            return self._handle.__exit__(*exc)
+
+    def counting_open(file, *args, **kwargs):
+        handle = real_open(file, *args, **kwargs)
+        if str(file) == str(path):
+            return CountingFile(handle.__enter__().__class__ and handle)
+        return handle
+
+    monkeypatch.setattr("builtins.open", counting_open)
+    meta = sessions.read_meta(path)
+
+    assert meta["messages"] == 2
+    assert read_lines == [1], "the header alone answered it"
+
+
+def test_a_legacy_file_with_no_header_still_falls_back_to_a_full_scan(workspace):
+    """One file, once. A transcript written before this format existed has no
+    header, so its title is its first user message and its count is its lines."""
+    write_raw(workspace, sessions.LEGACY_ID, [user("from before"), assistant("hi")])
+    meta = sessions.read_meta(sessions.path_for(sessions.LEGACY_ID))
+    assert meta["title"] == "from before"
+    assert meta["messages"] == 2
+
+
+# ---------------------------------------------------------------------------
+# one client per session
+# ---------------------------------------------------------------------------
+def test_a_session_is_claimed_by_one_client_at_a_time(workspace):
+    """`_persist` writes the whole file, so two clients on one session is two
+    writers and the loser's turns disappear with nothing to say they had."""
+    sessions.write("abc", [user("hello")])
+    assert sessions.claim("abc", "client-1") is True
+    assert sessions.claim("abc", "client-2") is False
+    assert sessions.claim("abc", "client-1") is True, "the holder may re-take it"
+    assert sessions.holder("abc") == "client-1"
+
+    sessions.release("client-1")
+    assert sessions.holder("abc") is None
+    assert sessions.claim("abc", "client-2") is True
+
+
+def test_a_second_window_gets_the_next_session_not_the_same_one(workspace):
+    import os
+    import time
+
+    for index, session_id in enumerate(("older", "newer")):
+        sessions.write(session_id, [user(f"q{index}")])
+        stamp = time.time() + index
+        os.utime(sessions.path_for(session_id), (stamp, stamp))
+
+    assert sessions.most_recent("client-1") == "newer"
+    assert sessions.most_recent("client-2") == "older"
+    # Nothing left to hand out.
+    assert sessions.most_recent("client-3") is None
+
+
+def test_most_recent_without_an_owner_claims_nothing(workspace):
+    sessions.write("abc", [user("hello")])
+    assert sessions.most_recent() == "abc"
+    assert sessions.holder("abc") is None
+
+
+def test_a_claim_is_scoped_to_the_workspace_it_was_made_in(monkeypatch, tmp_path, workspace):
+    """Every root has a `default`, so a claim keyed on the bare id would let one
+    client switching workspaces find another client's claim on a file it has
+    never seen."""
+    sessions.write(sessions.LEGACY_ID, [user("in the first workspace")])
+    assert sessions.claim(sessions.LEGACY_ID, "client-1") is True
+
+    other = tmp_path / "another-workspace"
+    other.mkdir()
+    monkeypatch.setenv("GRAD_ROOT", str(other))
+    from core import paths
+
+    paths.ensure_workspace()
+    sessions.write(sessions.LEGACY_ID, [user("in the second workspace")])
+
+    assert sessions.holder(sessions.LEGACY_ID) is None
+    assert sessions.claim(sessions.LEGACY_ID, "client-2") is True

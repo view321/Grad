@@ -51,6 +51,22 @@ CLAUDE_TOKEN = "claude_oauth_token"
 # absence is a note, not an error.
 ASTA_KEY = "asta_api_key"
 
+#: Every credential this project knows, in one tuple so nothing derived from it
+#: can be added to and then forgotten. `status()` reports these,
+#: `tools/jobs.py` accepts these, and `scrub_environment` removes the `GRAD_*`
+#: fallback of each -- and it was that last one that drifted: two credentials
+#: were added to the lookup and not to the scrub, leaving the agent's own
+#: environment holding tokens §9 says must not be in it.
+ALL: tuple[str, ...] = (
+    HF_TOKEN,
+    OPENROUTER_KEY,
+    VOYAGE_KEY,
+    S2_KEY,
+    CONTEXT7_KEY,
+    CLAUDE_TOKEN,
+    ASTA_KEY,
+)
+
 
 def _keyring() -> Any:
     try:
@@ -117,12 +133,7 @@ def present(name: str) -> bool:
 
 def status() -> dict[str, bool]:
     """Which credentials exist. Values are never returned."""
-    return {
-        n: present(n)
-        for n in (
-            HF_TOKEN, OPENROUTER_KEY, VOYAGE_KEY, S2_KEY, CONTEXT7_KEY, CLAUDE_TOKEN, ASTA_KEY,
-        )
-    }
+    return {n: present(n) for n in ALL}
 
 
 def _env_fallback_allowed() -> bool:
@@ -137,6 +148,15 @@ def scrub_environment() -> list[str]:
     export silently bills the API instead of the subscription (HANDOFF §2).
     """
     removed = []
+    # The GRAD_* fallbacks are derived from `ALL` rather than listed, and that
+    # is the fix for a real gap: the list used to be written out by hand, so
+    # `claude_oauth_token` and `asta_api_key` were added to `get()`'s lookup and
+    # not to this one. The agent inherits its environment, so each omission
+    # handed it exactly the environment-resident credential §9 argues must not
+    # exist -- and `GRAD_CLAUDE_OAUTH_TOKEN` is the worst of them, because
+    # `core/haiku.py` passes that token to subprocesses on purpose and the
+    # scrub is what bounds who else can read it. Deriving it means adding a
+    # credential cannot silently widen the boundary again.
     for var in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -145,16 +165,7 @@ def scrub_environment() -> list[str]:
         "OPENROUTER_API_KEY",
         "VOYAGE_API_KEY",
         "CONTEXT7_API_KEY",
-        # The GRAD_* fallbacks too. They exist for CI and first-run bootstrap,
-        # where no agent is running; leaving them in place under the agent would
-        # hand it exactly the environment-resident credentials §9 argues must
-        # not exist, and with them the ability to reach a remote without going
-        # through the submitters that hold the spend ceilings.
-        f"GRAD_{HF_TOKEN.upper()}",
-        f"GRAD_{OPENROUTER_KEY.upper()}",
-        f"GRAD_{VOYAGE_KEY.upper()}",
-        f"GRAD_{S2_KEY.upper()}",
-        f"GRAD_{CONTEXT7_KEY.upper()}",
+        *(f"GRAD_{name.upper()}" for name in ALL),
     ):
         if os.environ.pop(var, None) is not None:
             removed.append(var)

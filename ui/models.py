@@ -300,6 +300,12 @@ def sessions_model(current: str | None = None) -> dict[str, Any]:
 
     listed, error = _safe(sessions_mod.listing, [])
     rows = list(listed or [])
+    for row in rows:
+        # Held by *another* window. Opening it there too would put two writers
+        # on one file, so the picker says so rather than letting the refusal
+        # arrive as a surprise on click.
+        held = sessions_mod.holder(row["id"])
+        row["held_elsewhere"] = bool(held) and row["id"] != current
     return {
         "rows": rows,
         "current": current,

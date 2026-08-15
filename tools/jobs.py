@@ -675,15 +675,7 @@ def _download_artifacts(r: ls.Run, dest: Path) -> None:
 # setup runs at import time -- listing it here would read all four entries out
 # of Windows Credential Manager on every `jobs.py` invocation, including
 # `collect` and `ceilings`.
-CREDENTIAL_NAMES = (
-    credentials.HF_TOKEN,
-    credentials.OPENROUTER_KEY,
-    credentials.VOYAGE_KEY,
-    credentials.S2_KEY,
-    credentials.CONTEXT7_KEY,
-    credentials.CLAUDE_TOKEN,
-    credentials.ASTA_KEY,
-)
+CREDENTIAL_NAMES = credentials.ALL
 
 
 def _credential_args(p: argparse.ArgumentParser) -> None:

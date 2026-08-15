@@ -24,15 +24,6 @@ from ui import tasks as tasks_mod
 SETTLE_TIMEOUT_S = 60.0
 
 
-@pytest.fixture(autouse=True)
-def clean_registry():
-    """The registry is module-level on purpose -- a task outlives the client
-    that started it -- so it also outlives a test unless it is emptied."""
-    tasks_mod.reset()
-    yield
-    tasks_mod.reset()
-
-
 def script(workspace, name: str, body: str) -> str:
     (workspace / f"{name}.py").write_text(textwrap.dedent(body), encoding="utf-8")
     return name

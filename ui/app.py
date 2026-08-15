@@ -100,6 +100,33 @@ class Session:
         await self.client.__aenter__()
 
     # -- named sessions -----------------------------------------------------
+    def adopt(self) -> None:
+        """Take a session for this client, and load it.
+
+        The most recent one *no other window is in*, or a new one when they are
+        all taken. Two clients on one session is two writers on one file --
+        `_persist` writes the whole thing, so the loser's turns disappear -- and
+        `Session` has been one-per-client since it was written, for exactly that
+        reason. What changed is only that the file is now chosen rather than
+        derived from the client's own key, so the claim has to be explicit.
+
+        Opening the most recent rather than a blank one is deliberate: reopening
+        the app is not a request to start over.
+        """
+        chosen = sessions.most_recent(self.key)
+        if chosen is None:
+            # A fresh workspace, or every session already open in another
+            # window. Either way this client needs one of its own.
+            chosen = sessions.LEGACY_ID if not sessions.listing() else sessions.new_id()
+            sessions.claim(chosen, self.key)
+        self.session_id = chosen
+        self.restore()
+
+    async def release(self) -> None:
+        """Hand the session back and shut the client down, on disconnect."""
+        sessions.release(self.key)
+        await self.close()
+
     async def open_session(self, session_id: str) -> str:
         """Switch to a stored session: its transcript, and its conversation.
 
@@ -115,8 +142,15 @@ class Session:
             return "a turn is still running — interrupt it first"
         if session_id == self.session_id:
             return f"already in {self.title or session_id}"
+        if not sessions.claim(session_id, self.key):
+            # Refused rather than shared. Both windows would write the whole
+            # file on every turn, and the loser's turns would vanish with
+            # nothing on screen to say they had.
+            return "another window has that session open"
 
         self._persist()
+        sessions.release(self.key)
+        sessions.claim(session_id, self.key)
         await self.close()
         self.session_id = session_id
         self.blocks = []
@@ -139,8 +173,10 @@ class Session:
         if self.busy:
             return "a turn is still running — interrupt it first"
         self._persist()
+        sessions.release(self.key)
         await self.close()
         self.session_id = sessions.new_id()
+        sessions.claim(self.session_id, self.key)
         self.title = title.strip()
         self.created_at = None
         self.sdk_session_id = None
@@ -182,11 +218,9 @@ class Session:
         self.busy = False
         self.settled.clear()
         # Sessions live under the root's data directory, so the one that was
-        # open belongs to the folder just left. Picking the new root's most
-        # recent avoids opening an empty session that shadows a real one, and
-        # avoids showing the old workspace's conversation under a new name.
-        self.session_id = sessions.most_recent() or sessions.LEGACY_ID
-        self.restore()
+        # open belongs to the folder just left -- and the claim on it does too.
+        sessions.release(self.key)
+        self.adopt()
 
     async def ask(self, prompt: str, on_settle: Any) -> None:
         await self.start()
@@ -356,17 +390,12 @@ def build() -> None:
         from nicegui import context  # noqa: PLC0415 - page scope, not import scope
 
         session = Session(_client_key())
-        # The most recent session, or the one that existed before sessions did.
-        # A cold start opening a *new* empty conversation would leave yesterday's
-        # work one click away rather than on screen, and reopening the app is not
-        # a request to start over.
-        session.session_id = sessions.most_recent() or sessions.LEGACY_ID
-        session.restore()
+        session.adopt()
         workspace = state_mod.Workspace(session, _current_project())
         # Per client, not `app.on_shutdown`: that would accumulate one handler
         # per connection and hold every session's subprocess open until the app
         # itself exits.
-        context.client.on_disconnect(session.close)
+        context.client.on_disconnect(session.release)
         shell.build(workspace)
 
 

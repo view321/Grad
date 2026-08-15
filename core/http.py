@@ -24,6 +24,34 @@ from core.errors import ConfigError, UpstreamError
 _last_request: dict[str, float] = {}
 
 
+def candidate_id(identifier: Any, title: Any = "", text: Any = "") -> str | None:
+    """The key the funnel fuses candidates on, or None when there is not one.
+
+    Both tier-1 clients mint ids in one `s2:` namespace, deliberately: it is one
+    corpus, so a paper found through both has to fuse to a single candidate
+    rather than rank twice under two names.
+
+    That sharing is also why an id-less hit cannot be given a shared literal.
+    Formatting a missing identifier produced `"s2:None"`, and since `corpus.rrf`
+    fuses by id, *every* hit without one -- from either client, across every
+    query in the run -- collapsed into a single phantom candidate. Distinct
+    papers vanished into each other with nothing on screen to say so, which is
+    the same class of failure as an empty result that reads as "the literature
+    has nothing on this".
+
+    So: the real id when there is one; a digest of what the reranker would read
+    when there is not, which fuses genuine duplicates and separates genuine
+    distinctions; and None when there is neither, because a hit with no id, no
+    title and no text has nothing to rank and nothing to cite.
+    """
+    if identifier not in (None, ""):
+        return f"s2:{identifier}"
+    material = f"{title or ''}\n{str(text or '')[:400]}".strip()
+    if not material:
+        return None
+    return "s2:t-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 def _httpx() -> Any:
     try:
         import httpx  # noqa: PLC0415
@@ -111,9 +139,16 @@ class SemanticScholar:
         for item in data.get("data", []):
             snippet = item.get("snippet", {})
             paper = item.get("paper", {})
+            key = candidate_id(
+                paper.get("corpusId") or paper.get("paperId"),
+                paper.get("title"),
+                snippet.get("text", ""),
+            )
+            if key is None:
+                continue
             out.append(
                 {
-                    "id": f"s2:{paper.get('corpusId') or paper.get('paperId')}",
+                    "id": key,
                     "paper_id": paper.get("paperId"),
                     "title": paper.get("title"),
                     "year": (paper.get("publicationDate") or "")[:4] or None,
@@ -128,19 +163,24 @@ class SemanticScholar:
     def paper_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         fields = "title,abstract,year,externalIds,citationCount,authors"
         data = self._get("/paper/search", {"query": query, "limit": limit, "fields": fields})
-        return [
-            {
-                "id": f"s2:{p.get('paperId')}",
-                "paper_id": p.get("paperId"),
-                "title": p.get("title"),
-                "year": p.get("year"),
-                "abstract": p.get("abstract") or "",
-                "citations": p.get("citationCount"),
-                "source": "s2.paper",
-                "external": p.get("externalIds", {}),
-            }
-            for p in data.get("data", [])
-        ]
+        out = []
+        for p in data.get("data", []):
+            key = candidate_id(p.get("paperId"), p.get("title"), p.get("abstract"))
+            if key is None:
+                continue
+            out.append(
+                {
+                    "id": key,
+                    "paper_id": p.get("paperId"),
+                    "title": p.get("title"),
+                    "year": p.get("year"),
+                    "abstract": p.get("abstract") or "",
+                    "citations": p.get("citationCount"),
+                    "source": "s2.paper",
+                    "external": p.get("externalIds", {}),
+                }
+            )
+        return out
 
     def neighbours(self, paper_id: str, *, direction: str = "citations", limit: int = 20) -> list[dict[str, Any]]:
         """Citation-graph expansion.
@@ -224,6 +264,9 @@ class Asta:
         self._session: str | None = None
         self._protocol = MCP_PROTOCOL_VERSION
         self._id = 0
+        #: Set only once `initialize` *and* the notification after it have
+        #: succeeded. See `_handshake` for why this is not inferred.
+        self._ready = False
 
     @property
     def authenticated(self) -> bool:
@@ -313,10 +356,16 @@ class Asta:
     def _handshake(self) -> None:
         """`initialize`, then the notification that says the client is ready.
 
-        Once per client. The session id and the negotiated protocol version both
-        come out of this, and every request after it carries them.
+        Once per client, and `_ready` is an explicit flag rather than something
+        inferred from `_session` or `_id`. Inferring it from the request counter
+        was wrong in the case that matters: `_call` increments the counter before
+        it sends, so an `initialize` that *failed* -- a timeout, a 429 on the
+        very first call -- left the counter non-zero and every later request
+        skipped the handshake and went straight to `tools/call` on a connection
+        that was never initialised. One transient failure poisoned the client for
+        the life of the process.
         """
-        if self._session is not None or self._id:
+        if self._ready:
             return
         result = self._call(
             "initialize",
@@ -331,6 +380,7 @@ class Asta:
             self._protocol = negotiated
         # A notification: no id, so no reply is expected and none is waited for.
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        self._ready = True
 
     def tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Call one MCP tool, through the disk cache.
@@ -359,11 +409,11 @@ class Asta:
         """Full-text excerpts. The reason to prefer this over a metadata search:
         ~500 words of the paper itself is what stage 3 triages on."""
         data = self.tool("snippet_search", {"query": query, "limit": limit})
-        return [_row(item, source="asta.snippet") for item in _rows(data, "snippet_search")]
+        return _normalise(_rows(data, "snippet_search"), "asta.snippet")
 
     def paper_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         data = self.tool("search_papers_by_relevance", {"query": query, "limit": limit})
-        return [_row(item, source="asta.paper") for item in _rows(data, "search_papers_by_relevance")]
+        return _normalise(_rows(data, "search_papers_by_relevance"), "asta.paper")
 
     def neighbours(
         self, paper_id: str, *, direction: str = "citations", limit: int = 20
@@ -379,7 +429,7 @@ class Asta:
         if direction != "citations":
             return []
         data = self.tool("get_citations", {"paper_id": paper_id, "limit": limit})
-        return [_row(item, source="asta.citations") for item in _rows(data, "get_citations")]
+        return _normalise(_rows(data, "get_citations"), "asta.citations")
 
 
 def _mcp_payload(resp: Any) -> Any:
@@ -479,7 +529,23 @@ def _rows(data: Any, tool_name: str) -> list[dict[str, Any]]:
     return [c for c in candidates if isinstance(c, dict)]
 
 
-def _row(item: dict[str, Any], *, source: str) -> dict[str, Any]:
+def _normalise(items: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    """Hits in the funnel's vocabulary, dropping any that cannot be fused.
+
+    A hit with no identifier, no title and no text has nothing for the reranker
+    to read and nothing to cite. Dropping it costs no recall; keeping it under a
+    shared placeholder id cost real recall, because fusion is by id -- see
+    `candidate_id`.
+    """
+    out = []
+    for item in items:
+        row = _row(item, source=source)
+        if row is not None:
+            out.append(row)
+    return out
+
+
+def _row(item: dict[str, Any], *, source: str) -> dict[str, Any] | None:
     """One hit, in the shape the funnel already fuses and reranks.
 
     `paper_search.py` does not know which tier a candidate came from, and it
@@ -503,12 +569,15 @@ def _row(item: dict[str, Any], *, source: str) -> dict[str, Any]:
         or paper.get("id")
     )
     text = snippet.get("text") or item.get("text") or ""
+    key = candidate_id(identifier, paper.get("title"), text)
+    if key is None:
+        return None
     year = paper.get("year")
     if year is None:
         year = (str(paper.get("publicationDate") or "")[:4]) or None
     external = paper.get("externalIds") or paper.get("external_ids") or {}
     return {
-        "id": f"s2:{identifier}",
+        "id": key,
         "paper_id": paper.get("paperId") or paper.get("paper_id") or paper.get("id"),
         "title": paper.get("title"),
         "year": year,

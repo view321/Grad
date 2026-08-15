@@ -92,6 +92,7 @@ def _sessions(ui: Any, workspace: Any) -> None:
         options = {
             row["id"]: f"{row['title']}  ·  {row['messages']} msg"
             + ("" if row["resumable"] else "  ·  transcript only")
+            + ("" if not row["held_elsewhere"] else "  ·  open in another window")
             for row in listed
         }
         # A brand-new session has no file on disk until something is said in it,

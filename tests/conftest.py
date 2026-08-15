@@ -29,6 +29,21 @@ def workspace(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def clean_process_state():
+    """Module-level registries outlive a fixture, so they are emptied around
+    every test. Both exist for the same reason -- a task and a session are
+    process-wide facts rather than per-client ones -- and both would otherwise
+    let one test decide another's outcome."""
+    from ui import sessions, tasks
+
+    tasks.reset()
+    sessions.reset_claims()
+    yield
+    tasks.reset()
+    sessions.reset_claims()
+
+
+@pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     """Every HTTP client in this project goes through `core.http._httpx`, so
     replacing it is enough to make the suite's "no network" claim mechanical.

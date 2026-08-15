@@ -82,10 +82,18 @@ def id_of(path: Path) -> str:
 
 
 def read_meta(path: Path) -> dict[str, Any]:
-    """The header record, and the fallback title when there is not one.
+    """The header record, the title, and how many messages are in the file.
 
-    Reads line by line and stops as soon as it has both a meta record and a
-    title, so listing a session does not cost reading its whole transcript.
+    Stops at the header when the header carries everything -- which it does for
+    any session this version wrote, because `write` records the count alongside
+    the title. That matters because `listing()` calls this once per session: a
+    scan-to-the-end here would make listing cost the total size of every
+    transcript in the workspace, and transcripts grow with the conversations
+    that are most worth coming back to.
+
+    The full scan is still the fallback, for the one case that needs it: a file
+    written before this format existed has no header, so its title is its first
+    user message and its count is its lines. That is one file, once.
     """
     meta: dict[str, Any] = {}
     title = ""
@@ -106,6 +114,8 @@ def read_meta(path: Path) -> dict[str, Any]:
                     continue
                 if record.get("type") == "meta":
                     meta = {k: v for k, v in record.items() if k != "type"}
+                    if meta.get("title") and isinstance(meta.get("messages"), int):
+                        return meta
                     continue
                 messages += 1
                 if not title and record.get("role") == "user":
@@ -199,13 +209,70 @@ def write(
         "title": title,
         "created_at": created_at or now_iso(),
         "sdk_session_id": sdk_session_id,
+        # Written here so `read_meta` can answer from the header alone. The
+        # count is free at this point -- the records are in hand -- and it is
+        # what keeps listing a workspace from costing a read of every transcript
+        # in it.
+        "messages": len(records),
     }
     lines = [json.dumps(meta, ensure_ascii=False)]
     lines += [json.dumps(record, ensure_ascii=False) for record in records]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def most_recent() -> str | None:
-    """The session to open on a cold start, or None for a new workspace."""
-    sessions = listing()
-    return sessions[0]["id"] if sessions else None
+# ---------------------------------------------------------------------------
+# who has which session open
+# ---------------------------------------------------------------------------
+#: Sessions held by a live client, in this process, keyed by **path**. A session
+#: is written wholesale by the client that owns it, so two clients on one
+#: session is two writers on one file and the later `_persist` silently discards
+#: the other's turns. `app.Session` was always one-per-client for exactly this
+#: reason; the claim keeps that true now that the *file* is chosen rather than
+#: derived from the client's own key.
+#:
+#: By path rather than by id because an id is only unique within a workspace:
+#: every root has a `default`, and one client switching roots would otherwise
+#: find another client's claim on a file it has never seen.
+_claimed: dict[str, str] = {}
+
+
+def _key(session_id: str) -> str:
+    return str(path_for(session_id))
+
+
+def claim(session_id: str, owner: str) -> bool:
+    """Take a session for one client. False if another client already has it."""
+    key = _key(session_id)
+    held = _claimed.get(key)
+    if held is not None and held != owner:
+        return False
+    _claimed[key] = owner
+    return True
+
+
+def release(owner: str) -> None:
+    for key in [k for k, held in _claimed.items() if held == owner]:
+        del _claimed[key]
+
+
+def holder(session_id: str) -> str | None:
+    return _claimed.get(_key(session_id))
+
+
+def reset_claims() -> None:
+    """Drop every claim. For tests -- module state outlives a fixture."""
+    _claimed.clear()
+
+
+def most_recent(owner: str | None = None) -> str | None:
+    """The session to open on a cold start, or None for a new workspace.
+
+    With an `owner`, the most recent one *nobody else is in*. A second window
+    opening the first one's conversation would not merely show it twice: both
+    would write the whole file on every turn, and the loser's turns would
+    disappear with nothing to say they had.
+    """
+    for row in listing():
+        if owner is None or claim(row["id"], owner):
+            return row["id"]
+    return None

@@ -280,6 +280,71 @@ def test_prose_where_a_result_set_was_expected_says_what_arrived(workspace, tran
         call_with(workspace, transport, "I could not find anything about that.")
 
 
+def test_hits_with_no_id_stay_distinct_instead_of_fusing_into_one(workspace, transport):
+    """`corpus.rrf` fuses by id, so a shared placeholder is not a cosmetic
+    problem: every id-less hit -- from either client, across every query in the
+    run -- collapsed into one phantom candidate and the rest vanished."""
+    rows = call_with(workspace, transport, {"data": [
+        {"title": "One paper", "text": "the first excerpt"},
+        {"title": "Another paper", "text": "the second excerpt"},
+    ]})
+    assert len({row["id"] for row in rows}) == 2
+    assert not any(row["id"].endswith("None") for row in rows)
+
+
+def test_the_same_id_less_paper_from_both_clients_still_fuses(workspace, transport, monkeypatch):
+    """The other half: the fallback has to be *stable*, or the deduplication the
+    shared namespace exists for stops working for exactly these hits."""
+    asta_row = call_with(workspace, transport, {"data": [
+        {"title": "Attention Is All You Need", "text": "an excerpt"},
+    ]})[0]
+
+    class FakeHttpx:
+        @staticmethod
+        def get(url, params=None, headers=None, timeout=None):
+            return FakeResponse(payload={"data": [
+                {"snippet": {"text": "an excerpt"},
+                 "paper": {"title": "Attention Is All You Need"}},
+            ]})
+
+    monkeypatch.setattr(http, "_httpx", lambda: FakeHttpx)
+    s2_row = http.SemanticScholar(config_mod.load(reload=True)).snippet_search("attention")[0]
+    assert asta_row["id"] == s2_row["id"]
+
+
+def test_a_hit_with_nothing_to_rank_is_dropped(workspace, transport):
+    """No id, no title, no text: nothing for the reranker to read and nothing to
+    cite. Dropping it costs no recall; keeping it under a placeholder did."""
+    rows = call_with(workspace, transport, {"data": [
+        {"year": 2017},
+        {"paperId": "p1", "title": "A real one"},
+    ]})
+    assert [row["title"] for row in rows] == ["A real one"]
+
+
+def test_a_failed_handshake_can_be_retried(workspace, transport):
+    """The guard used to be `if self._id:`, and `_call` increments that counter
+    *before* it sends -- so an `initialize` that failed left the counter
+    non-zero and every later request skipped straight to `tools/call` on a
+    connection that was never initialised. One 429 poisoned the client."""
+    posts, queue = transport
+    client_ = client()
+
+    queue.append(FakeResponse(status_code=429, text="slow down"))
+    with pytest.raises(UpstreamError):
+        client_.snippet_search("attention")
+    assert client_._ready is False  # noqa: SLF001
+
+    queue.append(FakeResponse(payload=rpc({"protocolVersion": "2025-06-18"})))
+    queue.append(FakeResponse(status_code=202, text=""))
+    queue.append(FakeResponse(payload=rpc(tool_result({"data": [
+        {"paperId": "p1", "title": "Attention"},
+    ]}))))
+    rows = client_.snippet_search("attention")
+    assert [row["title"] for row in rows] == ["Attention"]
+    assert methods(posts)[-3:] == ["initialize", "notifications/initialized", "tools/call"]
+
+
 def test_the_backward_citation_direction_is_refused_rather_than_faked(workspace, transport):
     """Asta publishes `get_citations` and no references counterpart. Answering
     the backward direction with the forward one would double-count it into RRF
