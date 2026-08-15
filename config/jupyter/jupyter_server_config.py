@@ -27,6 +27,7 @@ only, by `tools/lab.py`.
 """
 
 import os
+import re
 
 # The Grad UI's origin. `tools/lab.py` sets this when it launches the server, so
 # the two cannot drift apart; the default matches ui/app.py's default port.
@@ -58,7 +59,14 @@ c.ServerApp.tornado_settings = {
         "X-Frame-Options": "",
     },
 }
-c.ServerApp.allow_origin = _APP_ORIGIN
+# The same pair of hosts as the CSP above, and for the same reason. `allow_origin`
+# takes exactly one origin, so setting it to `127.0.0.1:<port>` rejects the
+# websocket when the app is opened on `localhost:<port>` -- and *that* failure is
+# the confusing half: the page renders, the frame loads, and only the kernel
+# connection dies. `allow_origin_pat` is the regex form, which is how both can be
+# named without widening this to `*`.
+_ORIGINS = [_APP_ORIGIN] + ([_LOCALHOST_ALIAS.strip()] if _LOCALHOST_ALIAS else [])
+c.ServerApp.allow_origin_pat = "|".join(re.escape(origin) for origin in _ORIGINS)
 c.ServerApp.allow_credentials = True
 
 # The websocket the kernel connection rides on.

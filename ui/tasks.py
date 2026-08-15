@@ -44,7 +44,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from core import paths
+from core import paths, spawn
 
 log = logging.getLogger("grad.ui")
 
@@ -244,6 +244,10 @@ async def _run(task: Task) -> None:
             cwd=str(paths.root()),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # The desktop app is a GUI process with no console to lend, so
+            # Windows would give each of these a fresh one -- a black window over
+            # the workspace for as long as the command runs. See `core/spawn.py`.
+            **spawn.quiet(),
         )
     except OSError as exc:
         task.note(f"could not start: {exc}")
@@ -411,7 +415,7 @@ async def run_tool(*argv: str, timeout: float = 120.0, stdin: str | None = None)
     down a pipe instead and the CLI reads it with `--stdin`.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-u",  # see `_run`: every one of these is a pipe
             "-m",
@@ -420,16 +424,17 @@ async def run_tool(*argv: str, timeout: float = 120.0, stdin: str | None = None)
             stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **spawn.quiet(),  # see `_run`
         )
     except OSError as exc:
         return {"ok": False, "error": {"message": f"could not run the command: {exc}"}}
     try:
         out, err = await asyncio.wait_for(
-            proc.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
+            process.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        process.kill()
+        await process.wait()
         return {
             "ok": False,
             "error": {

@@ -299,3 +299,182 @@ def test_repowiki_is_invoked_with_one_path_and_a_supported_format(workspace, mon
     assert result["html"].endswith("index.html")
     html = (wiki.output_dir() / "index.html").read_text(encoding="utf-8")
     assert "core/budget.py" in html
+
+
+# ---------------------------------------------------------------------------
+# the app ships the server it embeds
+# ---------------------------------------------------------------------------
+def test_the_desktop_app_brings_the_lab_server_with_it(workspace):
+    """The notebook window's interior *is* Lab, so an app installed without a
+    Lab server ships a window whose only content is a button that fails. That
+    was the state: `lab` was an extra nobody's install line mentioned."""
+    import tomllib
+
+    doc = tomllib.loads((_repo_root() / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = doc["project"]["optional-dependencies"]
+    assert "grad[lab]" in extras["ui"]
+    assert any(p.startswith("jupyterlab==") for p in extras["lab"])
+
+
+def test_the_extension_set_stays_opt_in(workspace):
+    """Heavier than everything else in the file put together, and a preference
+    rather than a requirement -- so it is a second extra rather than a reason
+    to make the first one enormous."""
+    import tomllib
+
+    doc = tomllib.loads((_repo_root() / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = doc["project"]["optional-dependencies"]
+    assert "grad[lab-extensions]" not in extras["ui"]
+    for pin in extras["lab-extensions"]:
+        assert "==" in pin, f"{pin} is not pinned exactly"
+
+
+def test_the_missing_jupyter_message_names_an_install_that_provides_it(workspace, monkeypatch):
+    from core.errors import ConfigError
+
+    monkeypatch.setattr(lab.shutil, "which", lambda name: None)
+    with pytest.raises(ConfigError) as exc:
+        lab._executable()
+    assert "[ui]" in (exc.value.fix or "")
+
+
+# ---------------------------------------------------------------------------
+# the origin the iframe is framed from
+# ---------------------------------------------------------------------------
+def test_the_websocket_accepts_both_spellings_of_the_loopback_host(workspace, monkeypatch):
+    """`allow_origin` takes exactly one origin, and `127.0.0.1:8080` and
+    `localhost:8080` are different origins to a browser. Naming only one is the
+    confusing half of the failure: the page renders, the frame loads, and only
+    the kernel connection dies."""
+    import re
+
+    app = _server_app(monkeypatch, "http://127.0.0.1:8080")
+    pattern = app.allow_origin_pat
+    assert re.fullmatch(pattern, "http://127.0.0.1:8080")
+    assert re.fullmatch(pattern, "http://localhost:8080")
+    assert not re.fullmatch(pattern, "http://evil.example")
+    assert getattr(app, "allow_origin", "") != "*"
+
+
+def test_a_server_running_on_the_wrong_origin_is_restarted(workspace, monkeypatch):
+    """Framing headers are fixed at launch, and a blocked frame is reported by
+    the browser as "127.0.0.1 refused to connect" -- which reads as a dead port
+    and sends you looking for a server that is running perfectly well."""
+    from core import jsonl
+
+    state = {"port": 8889, "pid": 4242, "ui_origin": "http://127.0.0.1:8080", "token": "t"}
+    jsonl.write_json(lab._state_path(), state)
+    monkeypatch.setattr(lab, "_listening", lambda port: True)
+    monkeypatch.setattr(lab, "_alive", lambda pid: True)
+
+    class Restarted(Exception):
+        """A sentinel, so "it got as far as launching" is an assertion rather
+        than a mock of the launch itself."""
+
+    stopped: list[bool] = []
+    monkeypatch.setattr(lab, "cmd_stop", lambda _: stopped.append(True))
+    monkeypatch.setattr(lab, "_executable", lambda: (_ for _ in ()).throw(Restarted()))
+
+    # Same origin: left alone, which is the one case worth not restarting.
+    same = lab.cmd_start(_start_namespace("http://127.0.0.1:8080"))
+    assert same["already_running"] is True
+    assert stopped == []
+
+    # Different origin: the server has to come down for the header to change.
+    with pytest.raises(Restarted):
+        lab.cmd_start(_start_namespace("http://127.0.0.1:9000"))
+    assert stopped == [True]
+
+
+def _start_namespace(origin: str):
+    import argparse
+
+    return argparse.Namespace(port=lab.DEFAULT_PORT, ui_origin=origin, force=False)
+
+
+def test_the_window_asks_the_page_which_origin_it_is_on(workspace):
+    """`--port` moves the app, and pywebview may open `localhost` where the
+    config assumed `127.0.0.1`. The page knows the answer to both; guessing
+    covers neither."""
+    import asyncio
+
+    pytest.importorskip("nicegui", reason="the ui extra is not installed")
+    from ui.windows import notebook as notebook_window
+
+    class Page:
+        @staticmethod
+        async def run_javascript(code, timeout=None):
+            assert "location.origin" in code
+            return "http://localhost:8099"
+
+    assert asyncio.run(notebook_window._origin(Page)) == "http://localhost:8099"
+
+
+def test_a_page_that_cannot_answer_falls_back_to_the_port_the_app_bound(workspace, monkeypatch):
+    import asyncio
+
+    pytest.importorskip("nicegui", reason="the ui extra is not installed")
+    from ui import app as app_mod
+    from ui.windows import notebook as notebook_window
+
+    class Gone:
+        @staticmethod
+        async def run_javascript(code, timeout=None):
+            raise RuntimeError("the client disconnected")
+
+    monkeypatch.setattr(app_mod, "PORT", 9123)
+    assert asyncio.run(notebook_window._origin(Gone)) == "http://127.0.0.1:9123"
+
+
+# ---------------------------------------------------------------------------
+# no console windows
+# ---------------------------------------------------------------------------
+def test_a_detached_child_and_a_quiet_one_do_not_ask_for_both_flags(workspace):
+    """`CREATE_NO_WINDOW` and `DETACHED_PROCESS` are mutually exclusive --
+    passing both fails with ERROR_INVALID_PARAMETER rather than being
+    redundant."""
+    from core import spawn
+
+    quiet = spawn.quiet().get("creationflags", 0)
+    detached = spawn.detached().get("creationflags", 0)
+    assert not (quiet and detached and quiet & detached)
+
+
+def test_the_lab_server_is_started_without_a_console(workspace, monkeypatch):
+    """Every button in the workspace runs a CLI, and `ui.run(native=True)` is a
+    GUI process with no console to lend -- so Windows gave each child a fresh
+    one, which is a black window over the workspace."""
+    from core import spawn
+
+    seen: dict = {}
+
+    class Fake:
+        returncode = None
+        pid = 999
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **kwargs):
+        seen.update(kwargs)
+        return Fake()
+
+    monkeypatch.setattr(lab, "_executable", lambda: "jupyter")
+    monkeypatch.setattr(lab, "_free_port", lambda preferred: preferred)
+    monkeypatch.setattr(lab, "_listening", lambda port: True)
+    monkeypatch.setattr(lab.subprocess, "Popen", fake_popen)
+    lab.cmd_start(_start_namespace("http://127.0.0.1:8080"))
+
+    for key, value in spawn.detached().items():
+        assert seen.get(key) == value
+
+
+def test_the_workspaces_own_commands_are_started_without_a_console(workspace):
+    """`tasklist` for the liveness check and the CLI itself were two windows
+    per Lab start."""
+    from core import spawn
+    from ui import tasks as tasks_mod
+
+    source = __import__("inspect").getsource(tasks_mod)
+    assert source.count("**spawn.quiet()") >= 2
+    assert spawn.quiet() == ({} if not spawn.WINDOWS else {"creationflags": spawn.NO_WINDOW})

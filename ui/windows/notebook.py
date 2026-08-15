@@ -201,6 +201,36 @@ def _failure(verify: dict[str, Any]) -> None:
                         kit.pre(verify["fix"])
 
 
+#: What the Lab server is told to allow when the page cannot be asked. The port
+#: is `ui/app.py`'s, recorded when it ran, so this is right for a default launch
+#: and is only a guess when the browser has gone away mid-click.
+def _fallback_origin() -> str:
+    from ui import app as app_mod  # noqa: PLC0415 - avoids a cycle at import time
+
+    return f"http://127.0.0.1:{getattr(app_mod, 'PORT', 8080)}"
+
+
+async def _origin(ui: Any) -> str:
+    """The origin this page is actually on, asked of the page itself.
+
+    Lab's framing headers are scoped to one origin and fixed at launch, and
+    getting it wrong does not fail loudly: the browser reports a blocked frame
+    as *"127.0.0.1 refused to connect"*, which reads as a dead port and sends
+    you looking for a server that is running perfectly well.
+
+    There are two ways to be wrong that guessing cannot cover, and the page
+    knows the answer to both. `--port` moves the app and `agent.py --ui`'s own
+    help already warned that Lab would need telling; and `http://localhost:8080`
+    and `http://127.0.0.1:8080` are *different origins* to a browser, so which
+    one the window happens to be opened on decides whether the frame loads.
+    """
+    try:
+        origin = await ui.run_javascript("window.location.origin", timeout=3.0)
+    except Exception:  # noqa: BLE001 - a page that cannot answer is not an error
+        origin = ""
+    return str(origin or "").strip() or _fallback_origin()
+
+
 def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) -> None:
     if not model.get("lab_running"):
         kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
@@ -210,7 +240,9 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
         # is nothing useful to do while this runs.
         async def start_lab() -> None:
             workspace.say("starting JupyterLab …")
-            payload = await run_tool("tools.lab", "start", "--json", timeout=90)
+            payload = await run_tool(
+                "tools.lab", "start", "--ui-origin", await _origin(ui), "--json", timeout=90
+            )
             workspace.say(envelope_message(payload))
             workspace.invalidate("notebook")
             workspace.tick()

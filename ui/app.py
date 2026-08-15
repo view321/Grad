@@ -47,6 +47,13 @@ from ui import katex, kit, sessions, shell, state as state_mod
 ROLES = ("user", "assistant")
 STATIC_URL = "/grad-static"
 
+#: The port `run()` bound, so the rest of the app can name its own origin. The
+#: embedded Lab scopes its framing headers to one origin and is started by a
+#: button in the notebook window, which would otherwise have to assume the
+#: default port and be wrong on every `--port`. Set at launch rather than read
+#: from the environment because `ui.run` is where the number is decided.
+PORT = 8080
+
 #: How long the SDK's own interrupt is given to end the turn before the client
 #: is taken down instead. The same shape as `ui/tasks.py:cancel` -- ask the thing
 #: that knows how to stop cleanly, then stop it anyway -- and for the same
@@ -675,6 +682,9 @@ def run(*, native: bool = True, port: int = 8080) -> None:
     the fallback when pywebview misbehaves on Windows."""
     from nicegui import ui
 
+    global PORT
+
+    PORT = port
     paths.ensure_workspace()
     build()
     # `window_size` is passed *only* in native mode, and that is not a

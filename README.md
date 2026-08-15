@@ -62,9 +62,14 @@ mirror of Anthropic's limit.** The meter says so on screen.
 pip install -e ".[agent,notebook,retrieval,remote,ui,math,dev]"
 ```
 
-Optional extras, each pinned and each independently skippable: `lab` (the
-embedded JupyterLab, pinned exactly because the 3→4 break is what killed the
-Tabnine extension), `wiki` (RepoWiki), `evolve` (ShinkaEvolve).
+`ui` brings the embedded JupyterLab with it (the `lab` extra, pinned exactly
+because the 3→4 break is what killed the Tabnine extension). That is not a
+convenience: the notebook window's interior *is* Lab, so an app installed
+without it ships a window whose only content is a button that fails.
+
+Optional extras, each pinned and each independently skippable:
+`lab-extensions` (LSP, git — `python-lsp-server[all]` is heavier than everything
+else here put together), `wiki` (RepoWiki), `evolve` (ShinkaEvolve).
 
 The core — ledger, preflight, gates, submitters — needs only the standard
 library plus a file lock. Everything heavier is optional and imported at the
