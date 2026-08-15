@@ -55,7 +55,17 @@ def _jupyter() -> Any:
 
 
 def _conn_path(name: str) -> Path:
-    d = appdata.state_dir() / CONNECTION_DIR
+    """Per workspace, not per installation.
+
+    Kernel names reach this unqualified -- `default` is the one most commands
+    get -- so a single directory shared by every workspace means opening a
+    second folder and running a cell reconnects to the *first* folder's kernel:
+    same name, same connection file, a live kernel on the other end with another
+    project's imports and another project's `cwd`. Verifying a notebook against
+    that is exactly the "works in the kernel that grew it" failure `nb verify`
+    exists to catch, arrived at from the opposite direction.
+    """
+    d = appdata.workspace_state_dir() / CONNECTION_DIR
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{name}.json"
 
@@ -425,7 +435,7 @@ def cmd_stop(args: argparse.Namespace) -> dict[str, Any]:
 
 @cli.command("status", "which kernels have connection files")
 def cmd_status(_: argparse.Namespace) -> dict[str, Any]:
-    d = appdata.state_dir() / CONNECTION_DIR
+    d = appdata.workspace_state_dir() / CONNECTION_DIR
     return {
         "kernels": [p.stem for p in d.glob("*.json")] if d.exists() else [],
         "figures_dir": str(paths.figures_dir()),

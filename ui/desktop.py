@@ -220,6 +220,14 @@ def open_lab_window(url: str) -> bool:
 
     if _lab_window is not None:
         try:
+            # Navigated, not merely raised. Selecting a different notebook and
+            # clicking again used to show the window still displaying the old
+            # one -- and if that notebook's kernel had since been culled, what
+            # you got was a Lab sitting on a dead connection, which reads as
+            # "the Lab window loses its kernel" rather than as "this window was
+            # never told to move".
+            if getattr(_lab_window, "get_current_url", None) and url != _lab_window.get_current_url():
+                _lab_window.load_url(url)
             _lab_window.show()
             _lab_window.restore()
             return True

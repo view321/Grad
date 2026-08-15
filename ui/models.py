@@ -716,7 +716,15 @@ def notebook_model() -> dict[str, Any]:
     lab, lab_error = _safe(lab_tool.lab_state, {})
     lab = lab or {}
     return {
-        "notebooks": [{"name": n, "verify": verify_state(n, store=store)} for n in names],
+        # `mtime` is in the model rather than read at draw time because it is
+        # what the read-only render's URL is keyed on: the iframe rebuilds only
+        # when its `src` changes, so without it an edit made in Lab would leave
+        # a stale document on screen. It is also what moves the fingerprint, so
+        # the pane redraws at all.
+        "notebooks": [
+            {"name": n, "verify": verify_state(n, store=store), "mtime": _mtime(directory / n)}
+            for n in names
+        ],
         "lab_running": bool(lab.get("running")),
         "lab_port": lab.get("port"),
         "lab_token": lab.get("token"),
@@ -725,6 +733,16 @@ def notebook_model() -> dict[str, Any]:
         "ruler": 88,
         "error": lab_error,
     }
+
+
+def _mtime(path: Path) -> int:
+    """Whole seconds, so a fingerprint does not churn on filesystems that report
+    sub-second precision differently between reads. A file that vanished between
+    the glob and here is zero rather than an exception."""
+    try:
+        return int(path.stat().st_mtime)
+    except OSError:
+        return 0
 
 
 def app_port() -> int:
@@ -755,18 +773,42 @@ def origin_mismatch(lab: dict[str, Any]) -> bool:
     recorded = str(lab.get("ui_origin") or "").rstrip("/")
     if not recorded:
         return False
-    return recorded.rsplit(":", 1)[-1] != str(app_port())
+    # A portless origin -- `http://127.0.0.1`, or anything this cannot parse --
+    # makes `rsplit` hand back the *host*, which never equals a port number, so
+    # every healthy server would be flagged. That is precisely the false banner
+    # this function exists to avoid, so an origin whose shape cannot be read is
+    # treated as agreeing rather than as disagreeing.
+    authority = recorded.split("//", 1)[-1]
+    if ":" not in authority:
+        return False
+    return authority.rsplit(":", 1)[-1] != str(app_port())
 
 
-def lab_url(state: dict[str, Any], notebook: str | None = None) -> str:
-    """The iframe src, or `about:blank` when there is nothing to embed."""
+#: The Lab workspace the app's own window uses. JupyterLab keeps one layout per
+#: named workspace *on the server*, and two clients on the same one do not
+#: cooperate -- Lab detects the collision, and what the second client sees is a
+#: reload that drops its kernel connections mid-cell. Giving the app's window a
+#: name of its own means opening Lab in a browser at the same time is two
+#: independent sessions rather than a fight, which is the whole failure.
+APP_LAB_WORKSPACE = "grad-app"
+
+
+def lab_url(
+    state: dict[str, Any], notebook: str | None = None, *, lab_workspace: str | None = None
+) -> str:
+    """A URL into the running Lab, or `about:blank` when there is nothing to open.
+
+    `lab_workspace` names a JupyterLab workspace; omit it for the default one a
+    browser would use. See `APP_LAB_WORKSPACE`.
+    """
     if not state.get("lab_running"):
         return "about:blank"
     base = f"http://127.0.0.1:{state['lab_port']}"
     token = state.get("lab_token") or ""
+    root = f"/lab/workspaces/{lab_workspace}" if lab_workspace else "/lab"
     if notebook:
-        return f"{base}/lab/tree/notebooks/{notebook}?token={token}"
-    return f"{base}/lab?token={token}"
+        return f"{base}{root}/tree/notebooks/{notebook}?token={token}"
+    return f"{base}{root}?token={token}"
 
 
 # ---------------------------------------------------------------------------

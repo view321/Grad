@@ -532,7 +532,11 @@ def test_a_stream_that_never_answers_is_bounded_by_the_deadline(workspace, trans
 
     config = paths.root() / "config" / "grad.toml"
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text("[retrieval]\nrequest_deadline_s = -1\n", encoding="utf-8")
+    # Zero rather than negative: the deadline is `monotonic() + value`, so zero
+    # is already behind us by the first check and the stream is bounded on the
+    # first pass -- while staying a value the config validator accepts. A
+    # negative one tested the timeout through a setting that is now refused.
+    config.write_text("[retrieval]\nrequest_deadline_s = 0\n", encoding="utf-8")
 
     _, queue = transport
     handshake(queue)
@@ -547,7 +551,11 @@ def test_the_deadline_message_names_the_key_that_moves_it(workspace, transport):
 
     config = paths.root() / "config" / "grad.toml"
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text("[retrieval]\nrequest_deadline_s = -1\n", encoding="utf-8")
+    # Zero rather than negative: the deadline is `monotonic() + value`, so zero
+    # is already behind us by the first check and the stream is bounded on the
+    # first pass -- while staying a value the config validator accepts. A
+    # negative one tested the timeout through a setting that is now refused.
+    config.write_text("[retrieval]\nrequest_deadline_s = 0\n", encoding="utf-8")
 
     _, queue = transport
     handshake(queue)

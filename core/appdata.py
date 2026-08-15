@@ -47,7 +47,12 @@ from pathlib import Path
 log = logging.getLogger("grad.appdata")
 
 #: Subdirectories of the app root, created together by `ensure`.
-_SUBDIRS = ("state", "logs", "cache", "workspaces")
+#:
+#: `cache` is deliberately absent. Its only consumer -- `core/http.py:_cache_path`
+#: -- creates it on demand, and creating it here would make `migrate_legacy`'s
+#: "the destination already exists, leave it alone" guard fire on every single
+#: run, so a legacy `data/cache` would never move at all.
+_SUBDIRS = ("state", "logs", "workspaces")
 
 
 def app_dir() -> Path:
@@ -134,15 +139,47 @@ def ensure() -> None:
 # ---------------------------------------------------------------------------
 # migration
 # ---------------------------------------------------------------------------
-#: `data/<name>` in a workspace -> where it lives now. Only entries that are
-#: unambiguously app state; `data/papers`, `data/corpus.sqlite` and `data/mnist`
-#: are cited or downloaded research and are deliberately absent.
+#: `data/<name>` in a workspace -> which directory it belongs in now. Only
+#: entries that are unambiguously app state; `data/papers`, `data/corpus.sqlite`
+#: and `data/mnist` are cited or downloaded research and are deliberately absent.
+#:
+#: The bucket is *which* of the three roots, and it has to match what the code
+#: that reads the file actually resolves -- a migration that lands somewhere
+#: nothing reads is worse than none, because the old copy is gone and the app
+#: silently starts from defaults. `layouts` and `kernel` are per-workspace
+#: (`ui/state.py:layout_dir`, `tools/nb.py:_conn_path`); `lab` is one server per
+#: installation and `cache` is regenerable, so both are installation-wide.
+_INSTALL, _WORKSPACE, _CACHE = "install", "workspace", "cache"
 _LEGACY: tuple[tuple[str, str], ...] = (
-    ("layouts", "state"),
-    ("lab", "state"),
-    ("kernel", "state"),
-    ("cache", "cache"),
+    ("layouts", _WORKSPACE),
+    ("kernel", _WORKSPACE),
+    ("lab", _INSTALL),
+    ("cache", _CACHE),
 )
+
+#: Loose files rather than directories, matched by glob under `data/` itself.
+#: Transcripts are the conversations, so they are private, and they are keyed to
+#: the workspace for the reason `ui/sessions.py:sessions_dir` gives.
+#:
+#: `data/nb_verify.json` is *not* here on purpose. It records which notebooks
+#: verified clean on a fresh kernel, which is what the CITABLE chip and
+#: `report check` rest on -- evidence about the research rather than state about
+#: the machine -- so it stays in the workspace with the notebooks it describes.
+_LEGACY_FILES: tuple[tuple[str, str], ...] = (
+    ("ui_session-*.jsonl", _WORKSPACE),
+    ("ui_storage_secret", _INSTALL),
+)
+
+
+def _bucket_dir(bucket: str, name: str, base: Path) -> Path:
+    """Where a legacy entry lands, which must be exactly where the code that
+    reads it resolves. `data/cache` is the whole cache directory rather than a
+    child of it, because `core/http.py` reads `cache_dir()` itself."""
+    if bucket == _WORKSPACE:
+        return workspace_state_dir(base) / name
+    if bucket == _CACHE:
+        return cache_dir()
+    return state_dir() / name
 
 
 def _relocate(source: Path, target: Path) -> bool:
@@ -201,6 +238,40 @@ def _relocate(source: Path, target: Path) -> bool:
     return True
 
 
+def _relocate_files(legacy: Path, pattern: str, bucket: str, base: Path) -> list[str]:
+    """Move loose files sitting directly in `data/`, matched by glob.
+
+    A separate pass because these are not directories and the directory entries
+    are not globs. The transcripts are the reason it exists: they are the
+    conversations themselves, they sit at the top of `data/` rather than in a
+    subdirectory of their own, and a migration that moved the layouts but left
+    them behind would open a workspace with its whole history apparently gone --
+    still on disk, still private, and no longer anywhere the app looks.
+
+    Copy-then-delete, and never the other way, for the reason in `_relocate`.
+    """
+    target_dir = workspace_state_dir(base) if bucket == _WORKSPACE else state_dir()
+    moved: list[str] = []
+    for source in sorted(legacy.glob(pattern)):
+        if not source.is_file():
+            continue
+        target = target_dir / source.name
+        if target.exists():
+            continue
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        except OSError as exc:
+            log.debug("could not migrate %s: %s", source, exc)
+            continue
+        try:
+            source.unlink()
+        except OSError:  # copied safely; a duplicate beats a deletion
+            log.debug("left %s in place; it is in use", source)
+        moved.append(source.name)
+    return moved
+
+
 def migrate_legacy(root: Path | None = None) -> list[str]:
     """Move app state out of a workspace that predates this split.
 
@@ -220,11 +291,13 @@ def migrate_legacy(root: Path | None = None) -> list[str]:
         return []
     ensure()
     moved: list[str] = []
+    for pattern, bucket in _LEGACY_FILES:
+        moved += _relocate_files(legacy, pattern, bucket, base)
     for name, bucket in _LEGACY:
         source = legacy / name
         if not source.is_dir():
             continue
-        target = (app_dir() / bucket / name) if bucket != "cache" else cache_dir()
+        target = _bucket_dir(bucket, name, base)
         if target.exists():
             continue
         target.parent.mkdir(parents=True, exist_ok=True)

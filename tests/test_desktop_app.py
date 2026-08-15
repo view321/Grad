@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from pathlib import Path
 
 import pytest
 
 from core import appdata, instance, paths
-from ui import desktop, models, state as state_mod
+from tools import lab as lab_tool
+from ui import desktop, models, render, sessions, state as state_mod
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +90,77 @@ def test_migration_moves_app_state_and_leaves_research_alone(workspace):
     moved = appdata.migrate_legacy(workspace)
 
     assert "layouts" in moved
-    assert (appdata.state_dir() / "layouts" / "proj.json").exists()
+    # Where `ui/state.py:layout_dir` actually reads. A migration that lands
+    # anywhere else is worse than none: the old copy is gone and the app opens
+    # on defaults with no error to explain it.
+    assert (appdata.workspace_state_dir() / "layouts" / "proj.json").exists()
     assert not (legacy / "layouts").exists()
     # Untouched, and named in the assertion so deleting it from _LEGACY is a
     # deliberate act rather than a silent one.
     assert (legacy / "papers" / "a.pdf").exists()
 
 
-def test_a_locked_file_is_copied_and_left_rather_than_lost(workspace):
+def test_every_migration_target_is_where_its_reader_looks(workspace):
+    """The bug this guards is silent by construction, so it is asserted against
+    the readers rather than against a remembered path."""
+    from tools import nb as nb_tool
+
+    (workspace / "data" / "layouts").mkdir(parents=True, exist_ok=True)
+    (workspace / "data" / "layouts" / "p.json").write_text("{}", encoding="utf-8")
+    (workspace / "data" / "kernel").mkdir(parents=True, exist_ok=True)
+    (workspace / "data" / "kernel" / "default.json").write_text("{}", encoding="utf-8")
+    (workspace / "data" / "lab").mkdir(parents=True, exist_ok=True)
+    (workspace / "data" / "lab" / "lab.json").write_text("{}", encoding="utf-8")
+    (workspace / "data" / "ui_session-1.jsonl").write_text("{}\n", encoding="utf-8")
+
+    appdata.migrate_legacy(workspace)
+
+    assert (state_mod.layout_dir() / "p.json").exists()
+    assert nb_tool._conn_path("default").exists()
+    assert lab_tool._state_path().exists()
+    assert (sessions.sessions_dir() / "ui_session-1.jsonl").exists()
+
+
+def test_the_cache_is_actually_relocated(workspace):
+    """`ensure()` used to create the cache directory, so the "destination
+    already exists" guard fired on every run and `data/cache` never moved."""
+    legacy = workspace / "data" / "cache"
+    legacy.mkdir(parents=True, exist_ok=True)
+    (legacy / "abc.json").write_text("{}", encoding="utf-8")
+
+    assert "cache" in appdata.migrate_legacy(workspace)
+    assert (paths.cache_dir() / "abc.json").exists()
+    assert not legacy.exists()
+
+
+def test_transcripts_are_migrated_with_everything_else(workspace):
+    """They sit loose at the top of `data/` rather than in a subdirectory, so a
+    pass that only walked directories left the whole conversation history
+    behind -- still on disk, still private, no longer anywhere the app looks."""
+    (workspace / "data").mkdir(parents=True, exist_ok=True)
+    (workspace / "data" / "ui_session-20260815-abcd.jsonl").write_text("{}\n", encoding="utf-8")
+    (workspace / "data" / "ui_storage_secret").write_text("s3cret", encoding="utf-8")
+    # Evidence about the research rather than state about the machine: it stays
+    # with the notebooks it describes.
+    (workspace / "data" / "nb_verify.json").write_text("{}", encoding="utf-8")
+
+    appdata.migrate_legacy(workspace)
+
+    assert (sessions.sessions_dir() / "ui_session-20260815-abcd.jsonl").exists()
+    assert not (workspace / "data" / "ui_session-20260815-abcd.jsonl").exists()
+    assert (appdata.state_dir() / "ui_storage_secret").read_text(encoding="utf-8") == "s3cret"
+    assert (workspace / "data" / "nb_verify.json").exists()
+
+
+def test_a_locked_file_is_copied_and_left_rather_than_lost(workspace, monkeypatch):
     """The normal state when this runs: a Lab server is up and holding its own
     log open. A wholesale directory move fails on that handle and its fallback
     can delete some sources after copying them and abort on the locked one --
     leaving files neither here nor there. Copy, promote, then delete.
+
+    The lock is simulated rather than taken. Holding a real handle only blocks
+    the unlink on Windows -- POSIX unlinks open files happily -- so a test built
+    on one would assert nothing at all on the platform it did not run on.
     """
     legacy = workspace / "data" / "lab"
     legacy.mkdir(parents=True, exist_ok=True)
@@ -107,16 +168,21 @@ def test_a_locked_file_is_copied_and_left_rather_than_lost(workspace):
     held = legacy / "lab.log"
     held.write_text("serving\n", encoding="utf-8")
 
-    handle = open(held, "a", encoding="utf-8")  # noqa: SIM115 - the point of the test
-    try:
-        assert "lab" in appdata.migrate_legacy(workspace)
-        # Everything arrived, including the file that could not be removed.
-        assert (appdata.state_dir() / "lab" / "lab.json").exists()
-        assert (appdata.state_dir() / "lab" / "lab.log").read_text(encoding="utf-8") == "serving\n"
-        # And nothing was destroyed on the way: the locked original survives.
-        assert held.exists()
-    finally:
-        handle.close()
+    real_unlink = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self.name == "lab.log":
+            raise PermissionError(32, "in use by another process")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    assert "lab" in appdata.migrate_legacy(workspace)
+    # Everything arrived, including the file that could not be removed.
+    assert (appdata.state_dir() / "lab" / "lab.json").exists()
+    assert (appdata.state_dir() / "lab" / "lab.log").read_text(encoding="utf-8") == "serving\n"
+    # And nothing was destroyed on the way: the locked original survives.
+    assert held.exists()
 
 
 def test_a_failed_migration_leaves_the_sources_untouched(workspace, monkeypatch):
@@ -132,8 +198,8 @@ def test_a_failed_migration_leaves_the_sources_untouched(workspace, monkeypatch)
     monkeypatch.setattr(appdata.shutil, "copy2", explode)
     assert appdata.migrate_legacy(workspace) == []
     assert (legacy / "proj.json").read_text(encoding="utf-8") == '{"a": 1}'
-    assert not (appdata.state_dir() / "layouts").exists()
-    assert not (appdata.state_dir() / "layouts.incoming").exists()
+    assert not (appdata.workspace_state_dir() / "layouts").exists()
+    assert not (appdata.workspace_state_dir() / "layouts.incoming").exists()
 
 
 def test_migration_does_not_overwrite_the_live_location(workspace):
@@ -312,6 +378,78 @@ async def test_the_loop_bound_window_is_not_offloaded(workspace):
     move, and reading it from a worker thread while the loop mutates it is a
     race for no gain."""
     assert "tasks" in state_mod.LOOP_BOUND
+
+
+# ---------------------------------------------------------------------------
+# the read-only render
+# ---------------------------------------------------------------------------
+def _notebook(workspace, name: str = "n.ipynb", source: str = "print(1)"):
+    import nbformat
+
+    nb = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell(source)])
+    paths.notebooks_dir().mkdir(parents=True, exist_ok=True)
+    target = paths.notebooks_dir() / name
+    nbformat.write(nb, target)
+    return target
+
+
+def test_the_render_carries_no_script(workspace):
+    """It is stored output from a file that may have been cloned rather than
+    written here, shown in a sandboxed frame. The `basic` template is what makes
+    that possible; the `lab` one ships the JavaScript that draws it."""
+    _notebook(workspace)
+    body = render.notebook_html("n.ipynb")
+    # Pygments splits the source across spans, so the cell is asserted by its
+    # tokens rather than by its text.
+    assert "print" in body and "highlight" in body
+    assert "<script" not in body.lower()
+
+
+def test_the_render_refuses_anything_but_a_notebook_here(workspace):
+    """The name arrives from an HTTP path on an unauthenticated local port."""
+    _notebook(workspace)
+    for bad in ("../grad.toml", "sub/n.ipynb", "n.txt", "", "..%2Fx.ipynb"):
+        with pytest.raises(render.NotAllowed):
+            render.resolve(bad)
+
+
+def test_the_render_follows_the_file(workspace):
+    """An edit in Lab has to show up here. The cache is keyed on the file's
+    identity rather than on a clock, so it does -- and an unchanged file is not
+    re-rendered on every one of the poll's redraws."""
+    target = _notebook(workspace, source="print('first')")
+    first = render.notebook_html("n.ipynb")
+    assert render.notebook_html("n.ipynb") is first  # unchanged: same object
+
+    import nbformat  # noqa: PLC0415
+
+    nb = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("print('second')")])
+    nbformat.write(nb, target)
+    import os  # noqa: PLC0415
+
+    os.utime(target, (target.stat().st_atime, target.stat().st_mtime + 10))
+    assert "second" in render.notebook_html("n.ipynb")
+
+
+def test_a_notebook_being_written_is_a_message_not_a_crash(workspace):
+    """The agent writes notebooks while the pane is open, so a half-written file
+    is an ordinary event rather than an error state."""
+    paths.notebooks_dir().mkdir(parents=True, exist_ok=True)
+    (paths.notebooks_dir() / "half.ipynb").write_text('{"cells": [', encoding="utf-8")
+    body = render.notebook_html("half.ipynb")
+    assert "could not be rendered" in body
+
+
+def test_the_lab_window_gets_a_workspace_of_its_own(workspace):
+    """Two Lab clients on one server-side workspace do not cooperate: Lab
+    detects the collision and reloads, which drops the kernel connection of
+    whichever client was mid-cell. A browser tab keeps the default."""
+    state = {"lab_running": True, "lab_port": 8889, "lab_token": "t"}
+    app_url = models.lab_url(state, "n.ipynb", lab_workspace=models.APP_LAB_WORKSPACE)
+    tab_url = models.lab_url(state, "n.ipynb")
+    assert f"/lab/workspaces/{models.APP_LAB_WORKSPACE}/" in app_url
+    assert "/workspaces/" not in tab_url
+    assert app_url != tab_url
 
 
 class _FakeSession:

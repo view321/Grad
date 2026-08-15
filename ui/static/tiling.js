@@ -62,17 +62,43 @@
     handle.classList.add('dragging');
     // The same class the *retile* drag sets, and for the reason recorded beside
     // its rule in `ui/tokens.py`: a cross-origin iframe hit-tests the pointer
-    // before this document does. Cross into the embedded Lab mid-resize and the
-    // `mousemove` below simply stops arriving -- the divider stalls under a
-    // cursor that is still moving -- and so does the `mouseup`, which is worse:
-    // `onUp` never runs, so the listeners stay attached and the next stray
-    // movement goes on resizing with no button held. Only the title-bar drag
-    // was setting it, and this is the drag that starts *adjacent* to a pane.
+    // before this document does. Only the title-bar drag was setting it, and
+    // this is the drag that starts *adjacent* to a pane.
     //
     // The inline cursor below outranks the class's `grabbing`, so the resize
     // cursor is still the one shown.
     document.body.classList.add('grad-dragging');
     document.body.style.cursor = vertical ? 'row-resize' : 'col-resize';
+
+    /* Pointer capture, and listeners on the *handle* rather than the document.
+     *
+     * A drag has exactly one way to end correctly and several ways to end
+     * badly, and the bad ones all used to leave the same wreckage: the move
+     * listener still attached, `grad-dragging` still on the body, the resize
+     * cursor still showing, and the next stray movement going on resizing with
+     * no button held. Listening on the document catches none of them, because
+     * the events stop arriving at the document:
+     *
+     *   - the pointer crosses into the embedded Lab, which hit-tests first;
+     *   - it leaves the window entirely and the button comes up outside;
+     *   - the window loses focus mid-drag, or the OS cancels the gesture.
+     *
+     * `setPointerCapture` retargets every subsequent pointer event for this
+     * pointer to the handle until it is released, which covers the first two by
+     * construction -- capture outranks hit-testing, and events keep arriving
+     * past the window edge. `pointercancel` and `lostpointercapture` cover the
+     * third: whatever takes the gesture away, one of them fires, and both run
+     * the same teardown. `finish` is idempotent because releasing capture
+     * inside it raises `lostpointercapture` re-entrantly.
+     */
+    let done = false;
+    try {
+      handle.setPointerCapture(event.pointerId);
+    } catch (err) {
+      // No capture available (a synthetic event, an ancient engine). The
+      // listeners below still work; only the iframe and out-of-window cases
+      // degrade to the old behaviour, which `finish` then cleans up on blur.
+    }
 
     const onMove = (moveEvent) => {
       const delta = (vertical ? moveEvent.clientY : moveEvent.clientX) - startPos;
@@ -84,9 +110,21 @@
       reflowFrames();
     };
 
-    const onUp = () => {
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+    const finish = (endEvent) => {
+      if (done) return;
+      done = true;
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', finish);
+      handle.removeEventListener('lostpointercapture', finish);
+      window.removeEventListener('blur', finish);
+      try {
+        if (handle.hasPointerCapture?.(event.pointerId)) {
+          handle.releasePointerCapture(event.pointerId);
+        }
+      } catch (err) {
+        /* already released with the element, or never captured */
+      }
       handle.classList.remove('dragging');
       document.body.classList.remove('grad-dragging');
       document.body.style.cursor = '';
@@ -98,12 +136,18 @@
       });
     };
 
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
+    handle.addEventListener('lostpointercapture', finish);
+    window.addEventListener('blur', finish);
     event.preventDefault();
   };
 
-  document.addEventListener('mousedown', (event) => {
+  document.addEventListener('pointerdown', (event) => {
+    // Primary button only: a right-click on a divider is a context menu, not a
+    // resize that never ends because no `pointerup` for button 2 is coming.
+    if (event.button !== 0) return;
     const handle = event.target.closest?.('.grad-handle');
     if (handle) startDrag(handle, event);
   });

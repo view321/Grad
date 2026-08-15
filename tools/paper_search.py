@@ -230,19 +230,43 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             "seconds": round(budget.elapsed, 1),
         }
         if not args.no_citations and not budget.spent:
+            # Twenty calls live under that single check -- five seeds by two
+            # clients by two directions -- so testing the budget once at the top
+            # bounds nothing: the stage can run minutes past `stage1_budget_s`
+            # doing expansion after it has already decided it is out of time.
+            # Rechecked per call, and the loop is left rather than skipped, so
+            # what is already retrieved is kept and the trace still records how
+            # far it got.
             seeds = [c for c in list(candidates.values())[:5] if c.get("paper_id")]
+            expanded = 0
             for seed in seeds:
+                if budget.spent:
+                    break
                 for name, client in tier1:
+                    # A verb that was dropped in discovery was dropped because
+                    # this endpoint refused it or timed out. Asking the same
+                    # client again, per seed, spends the remaining budget
+                    # rediscovering a failure already recorded above.
+                    if (name, "neighbours") in dropped or budget.spent:
+                        continue
                     for direction in ("citations", "references"):
+                        if budget.spent:
+                            break
                         try:
                             hits = client.neighbours(
                                 seed["paper_id"], direction=direction, limit=10
                             )
                         except GradError:
+                            dropped.add((name, "neighbours"))
                             continue
+                        expanded += 1
                         rankings.append(hits)
                         for hit in hits:
                             candidates.setdefault(hit["id"], hit)
+            trace["stages"]["1_discovery"]["expansions"] = expanded
+            trace["stages"]["1_discovery"]["dropped"] = sorted(
+                f"{n}.{v}" for n, v in dropped
+            )
 
     if not args.no_local:
         local = _local_ranked(args.question, hyde, cfg, trace)

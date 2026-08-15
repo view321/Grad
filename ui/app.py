@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from core import appdata, config as config_mod, instance, paths
-from ui import desktop, katex, kit, sessions, shell, state as state_mod
+from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
 ROLES = ("user", "assistant")
 STATIC_URL = "/grad-static"
 
@@ -419,6 +419,12 @@ class Session:
         the conversation across, so what is paid is a restart on a deliberate,
         occasional action.
         """
+        # Captured once, and every step below acts on *this* client rather than
+        # on `self.client`. There are two awaits in here, each long enough for
+        # `ask` to have settled the turn and built a fresh client underneath --
+        # and the fresh one belongs to a turn nobody asked to stop. Taking it
+        # down, or clearing the busy flag it set, stops a turn that started
+        # after the interrupt.
         client = self.client
         if client is not None and hasattr(client, "interrupt"):
             try:
@@ -431,8 +437,13 @@ class Session:
                 )
         if not await self._idles_within(INTERRUPT_GRACE_S):
             self.say(f"the turn did not stop within {INTERRUPT_GRACE_S:.0f}s — taking the client down")
-        # Whether it stopped when asked or had to be taken down, the client goes.
+        # Whether it stopped when asked or had to be taken down, the client goes
+        # -- unless it is no longer ours to take down.
+        if self.client is not client:
+            return
         await self.close()
+        if self.client is not client and self.client is not None:
+            return
         if self.busy and not await self._idles_within(INTERRUPT_GRACE_S):
             # The turn outlived the client that was feeding it. Whatever it is
             # waiting for is not going to arrive, and a composer that stays
@@ -583,6 +594,39 @@ def build() -> None:
         window the user already owns becomes visible.
         """
         return {"shown": desktop.show_window()}
+
+    @nicegui_app.get("/__grad/notebook/{name}")
+    def _notebook(name: str) -> Any:
+        """One notebook, rendered read-only, for the pane's iframe.
+
+        Served from this app rather than from Lab so the pane has something to
+        show whether or not a Lab server is running -- and so what it shows can
+        be sandboxed, which Lab cannot be. `ui/render.py` explains the rest; the
+        name is validated there, against a directory rather than a pattern.
+        """
+        from fastapi.responses import HTMLResponse, PlainTextResponse  # noqa: PLC0415
+
+        try:
+            body = render.notebook_html(name)
+        except render.NotAllowed:
+            return PlainTextResponse("no such notebook in this workspace", status_code=404)
+        except OSError as exc:
+            return PlainTextResponse(f"could not read it: {exc}", status_code=503)
+        return HTMLResponse(
+            body,
+            headers={
+                # It is a document built from untrusted stored output and it
+                # needs nothing from anywhere: no scripts, no fetches, no
+                # framing by anyone but us. The iframe is sandboxed as well --
+                # this is the half that holds if the sandbox attribute is ever
+                # dropped by an edit that looks unrelated.
+                "Content-Security-Policy": (
+                    "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; "
+                    f"frame-ancestors {desktop.origin(PORT)} http://localhost:{PORT}"
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @ui.page("/")
     def index() -> None:

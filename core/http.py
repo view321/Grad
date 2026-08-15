@@ -839,6 +839,26 @@ def _mcp_payload(resp: Any, *, request_id: Any = None, deadline: float | None = 
             ) from exc
 
     answer: Any = None
+    #: `data:` lines seen since the last event boundary. An SSE event may carry
+    #: its payload across several of them, joined with newlines -- which is not
+    #: an exotic corner of the spec but the ordinary way a server emits a JSON
+    #: body large enough to wrap. Parsing each line on its own throws away every
+    #: such message as unparseable JSON, so a long enough answer looked exactly
+    #: like a stream that carried no result at all.
+    chunks: list[str] = []
+
+    def _frame() -> Any:
+        """The completed event's payload, or None if it is not one of ours."""
+        if not chunks:
+            return None
+        try:
+            value = json.loads("\n".join(chunks))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, dict) or not ("result" in value or "error" in value):
+            return None
+        return value
+
     for line in resp.iter_lines():
         if deadline is not None and time.monotonic() > deadline:
             raise UpstreamError(
@@ -849,14 +869,24 @@ def _mcp_payload(resp: Any, *, request_id: Any = None, deadline: float | None = 
                 ),
             )
         line = str(line).rstrip("\r")
-        if not line.startswith("data:"):
+        if line.startswith("data:"):
+            # Exactly one leading space is part of the framing, not the data.
+            chunks.append(line[6:] if line.startswith("data: ") else line[5:])
             continue
-        try:
-            frame = json.loads(line[5:].strip())
-        except json.JSONDecodeError:
+        if line:
+            continue  # `event:`, `id:`, `retry:`, or a `:` comment
+        frame = _frame()
+        chunks.clear()
+        if frame is None:
             continue
-        if not isinstance(frame, dict) or not ("result" in frame or "error" in frame):
-            continue
+        answer = frame
+        if request_id is None or frame.get("id") == request_id:
+            return answer
+    # A stream that ends without a trailing blank line still delivered its last
+    # event; dropping it would fail on precisely the well-formed response that
+    # arrived in one piece and closed.
+    frame = _frame()
+    if frame is not None:
         answer = frame
         if request_id is None or frame.get("id") == request_id:
             return answer

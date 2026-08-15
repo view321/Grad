@@ -375,6 +375,13 @@ _NUMERIC = (
     ("smoke", "max_steps"),
     ("smoke", "max_wall_clock_s"),
     ("smoke", "max_cost_usd"),
+    # Both bound a wall clock, and both are read straight into arithmetic on
+    # `time.monotonic()`. Unvalidated, a string here is a TypeError from inside
+    # a retrieval loop and a negative is a deadline that has already expired --
+    # every search failing instantly with a timeout message, which reads as an
+    # outage at the endpoint rather than as a typo in a config file.
+    ("retrieval", "request_deadline_s"),
+    ("retrieval", "stage1_budget_s"),
 )
 
 

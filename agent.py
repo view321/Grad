@@ -113,7 +113,16 @@ def thinking_option(cfg: Any, sdk: Any) -> dict[str, Any]:
     display = str(cfg.get("agent", "reasoning", "summarized")).lower()
     if display not in ("summarized", "omitted"):
         display = "summarized"
-    fields = {f.name for f in dataclasses.fields(sdk.ClaudeAgentOptions)}
+    try:
+        fields = {f.name for f in dataclasses.fields(sdk.ClaudeAgentOptions)}
+    except TypeError:
+        # Not a dataclass. `dataclasses.fields` raises rather than returning
+        # empty, and this whole function exists to tolerate an SDK whose options
+        # object is not the shape we expect -- so the release that changes it to
+        # an ordinary class or a TypedDict must degrade to "no reasoning
+        # settings", exactly as an SDK without the field already does, rather
+        # than take the app down before the first turn.
+        return {}
     if "thinking" not in fields:
         return {}
     # `adaptive` rather than a fixed budget: the model decides how much thinking

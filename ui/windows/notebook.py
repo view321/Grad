@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from pathlib import Path
+from urllib.parse import quote
 
 from ui import desktop, kit, models
 from ui.tasks import CANCELLED, envelope_message, run_tool, start, task_message
@@ -156,6 +157,20 @@ def _toolbar(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, An
                 value=name,
                 on_change=lambda e: workspace.select("notebook.name", e.value, window="notebook"),
             ).props("dense borderless").style("min-width: 180px")
+        view = _view(workspace)
+        with kit.el("div", "grad-group"):
+            kit.button(
+                "▤ READ",
+                tone="active" if view == "render" else "neutral",
+                on_click=lambda: workspace.select("notebook.view", "render", window="notebook"),
+                title="the notebook as a document — no kernel, nothing to break",
+            )
+            kit.button(
+                "⌨ LAB",
+                tone="active" if view == "lab" else "neutral",
+                on_click=lambda: workspace.select("notebook.view", "lab", window="notebook"),
+                title="JupyterLab, which is the only thing here that can edit",
+            )
         kit.text(f"ruler {model.get('ruler', 88)}", "grad-chip dashed")
         kit.button(
             "↗ OPEN IN LAB",
@@ -236,7 +251,20 @@ async def _origin(ui: Any) -> str:
     return str(origin or "").strip() or _fallback_origin()
 
 
+def _view(workspace: Any) -> str:
+    """Which surface the pane is showing. Reading is the default.
+
+    The pane is where you *look* at a notebook and Lab is where you change one,
+    so the cheap, always-available, no-kernel-required view is the one that
+    opens. Lab is a click away and is still the only thing that can edit.
+    """
+    return "lab" if workspace.selection.get("notebook.view") == "lab" else "render"
+
+
 def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) -> None:
+    if _view(workspace) == "render":
+        _rendered(ui, workspace, entry)
+        return
     if not model.get("lab_running"):
         kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
 
@@ -262,7 +290,12 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
             )
         return
 
-    if model.get("origin_mismatch"):
+    # Only when Lab would actually be *framed*. A Lab opened in a window of its
+    # own is a top-level document at its own origin, so `frame-ancestors` never
+    # applies to it and a mismatch is not a problem it has -- showing the banner
+    # there would be reporting a fault that cannot affect what the user is about
+    # to do.
+    if model.get("origin_mismatch") and not desktop.native_available():
         kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
         _origin_mismatch(ui, workspace, model)
         return
@@ -279,6 +312,26 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
     # iframe: Lab is a server we started ourselves, on its own port, behind a
     # token we minted, and it cannot function sandboxed.
     kit.run_js(f"window.gradRegisterFrame && window.gradRegisterFrame('{ANCHOR_ID}', {url!r}, false)")
+
+
+def _rendered(ui: Any, workspace: Any, entry: dict[str, Any]) -> None:
+    """The notebook as a document: code, markdown and stored output, no kernel.
+
+    Served by this app rather than by Lab, so it works with Lab stopped and can
+    be sandboxed -- stored output is arbitrary HTML from a file that may have
+    been cloned rather than written here. `ui/render.py` carries the reasoning.
+
+    The URL is same-origin and carries the notebook's mtime, which is what makes
+    an edit in Lab show up here: the iframe is only rebuilt when its `src`
+    changes, so a constant URL would leave a stale render on screen until the
+    pane happened to be retiled.
+    """
+    name = entry["name"]
+    stamp = entry.get("mtime") or 0
+    url = f"/__grad/notebook/{quote(name)}?v={stamp}"
+    anchor = kit.el("div", "grad-iframe-anchor")
+    anchor.props(f'id="{ANCHOR_ID}"')
+    kit.run_js(f"window.gradRegisterFrame && window.gradRegisterFrame('{ANCHOR_ID}', {url!r}, true)")
 
 
 async def _restart_lab(ui: Any, workspace: Any) -> None:
@@ -333,7 +386,7 @@ def _own_window(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str,
     which is what matters -- they are what decides whether a notebook is
     citable, and that must not be inside the window Lab owns.
     """
-    url = models.lab_url(model, entry["name"])
+    url = models.lab_url(model, entry["name"], lab_workspace=models.APP_LAB_WORKSPACE)
 
     def open_lab() -> None:
         if desktop.open_lab_window(url):
