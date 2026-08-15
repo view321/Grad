@@ -292,22 +292,6 @@ class _Statusline:
             )
 
 
-def _has_reasoning(session: Any) -> bool:
-    """Is there any reasoning in this session to show?
-
-    Scanned at the click rather than on the flush, because this is the one
-    moment the answer changes what the user is looking at -- and a scan of every
-    settled turn fifteen times a second to decide the wording of one chip is the
-    kind of thing `ui/state.py` exists to avoid.
-    """
-    live = getattr(session, "blocks", None) or []
-    if any(b.get("kind") == "thinking" for b in live):
-        return True
-    for record in getattr(session, "settled", None) or []:
-        if any(b.get("kind") == "thinking" for b in record.get("blocks") or []):
-            return True
-    return False
-
     def _paint_reasoning(self) -> None:
         showing = self.workspace.show_reasoning
         kit.set_text(self.reasoning, f"reasoning {'■ on' if showing else '□ off'}")
@@ -339,6 +323,23 @@ def _has_reasoning(session: Any) -> bool:
         kit.set_text(self.state, caption)
         kit.set_text(self.activity, activity)
         kit.set_text(self.clock, clock)
+
+
+def _has_reasoning(session: Any) -> bool:
+    """Is there any reasoning in this session to show?
+
+    Scanned at the click rather than on the flush, because this is the one
+    moment the answer changes what the user is looking at -- and a scan of every
+    settled turn fifteen times a second to decide the wording of one chip is the
+    kind of thing `ui/state.py` exists to avoid.
+    """
+    live = getattr(session, "blocks", None) or []
+    if any(b.get("kind") == "thinking" for b in live):
+        return True
+    for record in getattr(session, "settled", None) or []:
+        if any(b.get("kind") == "thinking" for b in record.get("blocks") or []):
+            return True
+    return False
 
 
 def _elapsed(started: float | None) -> str:
