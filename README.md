@@ -105,6 +105,77 @@ the only thing that forced a shell open beside the app on a fresh machine. The
 value goes down a pipe rather than in an argument — an argv is visible to
 anything that can list processes.
 
+## Update
+
+```bash
+grad --update
+```
+
+Or `python -m tools.update check` to see what it would do first, and
+`python -m tools.update apply --to v0.2.0` / `--rollback` to pin a specific
+release. The desktop app checks once a day in the background and shows an
+`↑ v0.2.0` button in the title bar; the workspace menu (`project ▾`) has the
+button that applies it. Nothing is ever applied on its own — a silent code
+change in the middle of a campaign changes the code that produced a number.
+
+**Updates move between release tags, not to whatever is on `main`.** A version
+you can cite is worth more here than a version that is merely newest, and it is
+what makes `--rollback` mean something: reproducing last month's result means
+running last month's code.
+
+**The dependency install is skipped unless it has to happen.** The install is
+editable, so the interpreter imports the working tree and a release that changed
+only Python code is live the moment the checkout moves. `pyproject.toml`
+changing between the two commits is the only thing that can alter what must be
+present in the environment, and that is exactly the condition on the reinstall
+— which is the difference between a two-second update and a two-minute one.
+When a reinstall *is* needed and Grad is running, the update refuses and says
+so: replacing a dependency underneath a live `import nicegui` is not something
+to do politely.
+
+### Two folders, and why it is worth keeping them apart
+
+The **installation** is the checkout: code, plus the `prompts/`, `skills/` and
+`config/grad.toml` that ship with it. An update replaces it. The **workspace**
+is the ledger, notebooks, notes, figures and reports — your research, which no
+update touches.
+
+They default to the same folder, which is the simplest thing that works and the
+one thing that makes updating awkward: research committed into the same
+repository as the code puts your notebooks on the same branch as upstream's
+releases, and every update becomes a merge whose conflicts land in an
+append-only ledger. The installers now ask for a separate folder, and an
+existing single-folder install can separate them at any time:
+
+```bash
+python -m tools.workspace move ~/Grad
+```
+
+It copies, verifies every file arrived, and leaves the originals alone unless
+you pass `--remove-originals`. The three shipped paths resolve workspace-first,
+so a `prompts/system.md` in your workspace still overrides the installed one.
+
+Grad refuses an update that would collide — a file the incoming release changes
+*and* you have edited — rather than checking for a dirty tree in general: on the
+default layout your own notebooks make the tree permanently dirty, and an
+updater blocked forever by them would be useless to exactly the people who need
+it.
+
+### Which code produced a number
+
+Every run record carries the version that submitted it (`code_version`: the
+release tag, the commit, and whether the checkout was modified). The README's
+claim is that every number in a report traces to a run record; that is only
+complete if the record says which code produced it.
+
+`python -m tools.report check` therefore has a fourth rule. A report whose cited
+runs straddle two versions is a finding — a number from one version is not
+comparable to a number from another — as is a run submitted from a checkout
+with uncommitted edits, because the code it names cannot be resolved by anyone
+else. Runs with no stamp at all pass silently: they predate the field, and
+refusing a report because its evidence is old would make the rule a reason to
+avoid updating.
+
 ### Retrieval without an institutional email, and without waiting
 
 Tier 1 defaults to **Papers with Code** (`paperswithcode.co/api/v1`) — the

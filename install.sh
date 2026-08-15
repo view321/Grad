@@ -108,6 +108,56 @@ case "$PLATFORM" in
 esac
 
 # ---------------------------------------------------------------------------
+# 3b. Where the research goes
+# ---------------------------------------------------------------------------
+# The workspace -- ledger, notebooks, notes, figures, reports -- defaults to this
+# folder, which is also the checkout. That is the simplest thing that works and
+# it is what makes updating awkward: research committed into the same repository
+# as the code puts your notebooks on the same branch as upstream's releases, and
+# every `grad update` becomes a merge.
+#
+# So this asks. Keeping them apart costs nothing and means an update is a
+# fast-forward over files nobody has edited.
+step "Choosing where your research will live"
+WORKSPACE="${GRAD_WORKSPACE:-}"
+if [ -z "$WORKSPACE" ]; then
+  if [ -s "$ROOT/ledger/runs.jsonl" ]; then
+    # Research is already here. Moving it is `grad workspace move`, which copies
+    # and verifies before it deletes anything -- not something to do silently
+    # from an installer.
+    WORKSPACE="$ROOT"
+    warn "this folder already holds a ledger, so it stays the workspace"
+    warn "to separate them later:  python -m tools.workspace move ~/Grad"
+  elif [ -t 0 ]; then
+    printf '  Workspace folder [%s]: ' "$HOME/Grad"
+    read -r REPLY || REPLY=""
+    WORKSPACE="${REPLY:-$HOME/Grad}"
+  else
+    WORKSPACE="$HOME/Grad"
+  fi
+fi
+
+if [ "$WORKSPACE" = "$ROOT" ]; then
+  ok "workspace: $ROOT (inside the installation)"
+else
+  "$VPY" -m tools.workspace use "$WORKSPACE" --create >/dev/null \
+    && ok "workspace: $WORKSPACE" \
+    || die "could not use $WORKSPACE as the workspace"
+fi
+
+# What the extras were, so `grad update` can reinstall with the same set rather
+# than guessing. Dropping `ui` on an update would take the desktop app off a
+# machine whose owner asked only for an update.
+"$VPY" - "$EXTRAS" <<'PY' >/dev/null 2>&1 || true
+import sys
+from core import update
+update.write_install_record(
+    extras=[x.strip() for x in sys.argv[1].split(",") if x.strip()],
+    installer="install.sh",
+)
+PY
+
+# ---------------------------------------------------------------------------
 # 4. The launcher
 # ---------------------------------------------------------------------------
 step "Creating the launcher"
@@ -153,11 +203,13 @@ fi
 
 printf '\n'
 step "Done"
-printf '  Workspace (your research, versioned):  %s\n' "$ROOT"
-printf '  App state (layouts, logs, Lab token):  %s\n' "$APP_STATE"
+printf '  Installation (the code, replaced by updates):  %s\n' "$ROOT"
+printf '  Workspace (your research, never touched):     %s\n' "$WORKSPACE"
+printf '  App state (layouts, logs, Lab token):         %s\n' "$APP_STATE"
 printf '\n'
 printf '  Start the workspace:   grad --ui\n'
 printf '  Ask a single question: grad "what is in the ledger?"\n'
+printf '  Update to the newest:  grad --update\n'
 printf '\n'
 if [ "$PLATFORM" = "windows" ]; then
   printf '  For a Start Menu shortcut, run install.ps1 as well:\n'

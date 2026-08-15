@@ -171,6 +171,20 @@ def _appbar(workspace: Workspace, windows: Any, projects: Any) -> None:
             title="switch project, or open another workspace folder",
             on_click=projects.open,
         )
+        # Only when there is something to do about it. A permanent "up to date"
+        # in the title bar is the same kind of noise as a permanent "tasks 0" in
+        # the status bar, and the menu answers the question for anyone who asks
+        # it. `update()` reads a cached file, never the network -- see
+        # `ui/models.py:update_model`.
+        update = workspace.update()
+        if update["available"]:
+            kit.button(
+                f"↑ {update['target']}",
+                tone="ghost",
+                classes="grad-appbar-btn",
+                title=f"{update['target']} is available — open the workspace menu to install it",
+                on_click=projects.open,
+            )
 
     with kit.el("div", "grad-appbar-cell"):
         state = header["agent_state"]
@@ -367,6 +381,78 @@ def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> N
 
             _ceilings(ui, workspace, model, menu)
             _credentials(ui, workspace, menu)
+            _updates(workspace, menu)
+
+
+def _updates(workspace: Workspace, menu: _Menu) -> None:
+    """Which Grad this is, and the one button that changes it.
+
+    Reads a cached answer -- `ui/models.py:update_model` explains why this must
+    never be the thing that talks to the network. The section is always drawn,
+    including when there is nothing to install: "you are on v0.2.0, checked an
+    hour ago" is the answer to a question people actually ask, and a section
+    that appeared only when an update existed would leave them with nowhere to
+    look for it.
+    """
+    model = workspace.update()
+
+    def act(coro: Any, what: str) -> None:
+        menu.close()
+        workspace.spawn(coro, what)
+
+    kit.text("THIS INSTALLATION", "grad-caption").style("margin-top: 16px")
+    kit.kv([("version", model["installed"]), ("last checked", model["checked"])])
+
+    if not model["is_checkout"]:
+        kit.note(
+            "This copy was not installed from a git checkout, so it cannot update itself. "
+            "Reinstall from the repository to get updates."
+        )
+        return
+
+    for warning in model["warnings"]:
+        kit.note(f"{warning['message']} — {warning['fix']}")
+    for blocker in model["blockers"]:
+        kit.error_strip(f"{blocker['message']} — {blocker['fix']}")
+
+    with kit.row("", gap=6).style("margin-top: 8px"):
+        if model["available"]:
+            kit.chip(f"{model['target']} AVAILABLE", "attention")
+            kit.button(
+                "UPDATE",
+                tone="primary",
+                title=(
+                    "quit first: this release changes dependencies"
+                    if model["needs_reinstall"]
+                    else "fast-forward this installation and migrate its state"
+                ),
+                on_click=lambda: act(workspace.apply_update(), "update"),
+            )
+        kit.button(
+            "CHECK NOW",
+            tone="neutral",
+            title="ask the remote whether there is a newer release",
+            on_click=lambda: act(workspace.check_update(), "update check"),
+        )
+        kit.spacer()
+
+    if model["available"] and model["needs_reinstall"]:
+        kit.text(
+            "this release changes dependencies, so it needs Grad closed — quit, then run "
+            "`grad update` in a terminal",
+            "grad-caption",
+        )
+    elif model["available"]:
+        kit.text(
+            f"{model['behind']} commit(s) behind · restart Grad afterwards to load it",
+            "grad-caption",
+        )
+    if model["dirty"]:
+        kit.text(
+            "the installation has uncommitted edits; runs submitted from it are stamped "
+            "as modified and `report check` will say so",
+            "grad-caption",
+        )
 
 
 #: The three ceilings a project carries, and the unit each is counted in.

@@ -501,6 +501,39 @@ class Workspace:
     def workspaces(self) -> dict[str, Any]:
         return models.workspaces_model()
 
+    def update(self) -> dict[str, Any]:
+        return models.update_model()
+
+    async def check_update(self) -> None:
+        """Ask the remote now, instead of waiting for the daily check.
+
+        `--json` and the same CLI the terminal runs, like every other button
+        here (§10): the answer lands in the same `update.json` the background
+        thread writes, so a check from the menu and a check from a shell cannot
+        leave the app showing two different things.
+        """
+        payload = await run_tool("tools.update", "check", "--json")
+        self.say(envelope_message(payload))
+        self.reload()
+
+    async def apply_update(self) -> None:
+        """Apply the update, and say what to do next.
+
+        Bounded by `run_tool`'s timeout, which is the right bound because of
+        what `core/update.py` will and will not do while Grad is running: a
+        release that changed dependencies is *refused* here, with the message
+        that it needs a quit and a terminal. What is left is a fast-forward and
+        a migration pass, which are file operations.
+
+        Nothing restarts itself. The new code is on disk and the running process
+        is still the old one, and an app that vanished and came back while a
+        turn was streaming would be a worse surprise than a line asking for a
+        restart.
+        """
+        payload = await run_tool("tools.update", "apply", "--json", timeout=300.0)
+        self.say(envelope_message(payload))
+        self.reload()
+
     def credentials(self) -> dict[str, Any]:
         return models.credentials_model()
 

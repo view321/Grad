@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from core import budget, gates, ledger_store as ls, paths
+from core import budget, gates, ledger_store as ls, paths, version
 from core.config import Config
 from core.errors import EXIT_RUNNING, EXIT_USAGE, GradError
 from core.submission import Submission
@@ -95,6 +95,13 @@ def record_submission(
         # fold has one spelling for "not attributed" and existing ledgers keep
         # loading unchanged.
         "project": project or budget.UNASSIGNED,
+        # Which Grad submitted this. The README's claim is that every number in
+        # a report traces to a run record; that is only complete if the record
+        # says which code produced it, because a run from before an update and
+        # one from after are two different experiments and nothing else in here
+        # can tell them apart. `report check` refuses a report that averages
+        # across a version -- see `core/report.py:check_code_versions`.
+        "code_version": version.stamp(),
         "platform": platform,
         "target": target,
         "submission_hash": sub.hash(),
@@ -149,6 +156,9 @@ def record_smoke_run(
             "smoke": True,
             "submitted_at": ls.now_iso(),
             "project": project or budget.UNASSIGNED,
+            # Smoke skips the gates but not the ledger, and not this either: a
+            # record without it would be the one hole in "which code ran this".
+            "code_version": version.stamp(),
             "platform": platform,
             "target": target,
             "submission_hash": sub.hash(),

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import hooks
-from core import appdata, config as config_mod, credentials, paths, quota_log
+from core import appdata, config as config_mod, credentials, migrate, paths, quota_log
 from core.errors import EXIT_PROJECT_BUDGET
 
 BUILTIN_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -57,7 +57,31 @@ def _sdk() -> Any:
 
 
 def system_prompt() -> str:
-    return (paths.root() / "prompts" / "system.md").read_text(encoding="utf-8")
+    """The prompt, plus the two paths it cannot state for itself.
+
+    `prompts/system.md` says to reach for "the skills in `skills/`", which is a
+    correct instruction only while the workspace and the installation are the
+    same folder. With the workspace pointed elsewhere the agent's cwd has no
+    `skills/` in it, and the model would go looking for a directory that is one
+    `..` away with nothing to say so.
+
+    Appended rather than templated into the file: the prompt is a document
+    someone edits, and a substitution marker in it is one more thing an edit can
+    break. The block is only added when the two directories actually differ, so
+    the standard install's prompt is byte-for-byte what the file says.
+    """
+    text = paths.prompt_path().read_text(encoding="utf-8")
+    root, skills = paths.root(), paths.skills_dir()
+    if skills.parent == root:
+        return text
+    return (
+        f"{text.rstrip()}\n\n"
+        "## Where things are\n\n"
+        f"Your working directory is the workspace: `{root}`. The ledger, notebooks, "
+        "notes and figures are there and every path you write should be relative to it.\n\n"
+        f"Grad itself is installed at `{paths.install_dir()}`, which is a separate "
+        f"folder you do not write to. The skills are there: `{skills}`.\n"
+    )
 
 
 def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str | None = None) -> Any:
@@ -858,12 +882,34 @@ def main() -> None:
         help="pin the --ui port; by default 8080, or the next free port above it",
     )
     parser.add_argument("--check", action="store_true", help="report environment and auth posture, then exit")
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="update to the newest release (python -m tools.update has the rest of it)",
+    )
+    parser.add_argument(
+        "--version", action="store_true", help="report which Grad this is, then exit"
+    )
     args = parser.parse_args()
 
     _configure_logging()
-    for name in appdata.migrate_legacy():
-        logging.getLogger("grad").info("moved data/%s into %s", name, appdata.app_dir())
+    for name in migrate.run_pending():
+        logging.getLogger("grad").info("migrated %s (state now under %s)", name, appdata.app_dir())
 
+    if args.version:
+        from core import version as version_mod  # noqa: PLC0415
+
+        print(version_mod.label())
+        return
+    if args.update:
+        # Delegated to the tool CLI rather than reimplemented: it owns the
+        # refusals, the exit codes and the `--json` envelope, and a second entry
+        # point that answered differently would be worse than no second entry
+        # point at all. This is the spelling for people who will never type
+        # `python -m`; everything else lives there.
+        from tools.update import cli as update_cli  # noqa: PLC0415
+
+        raise SystemExit(update_cli.run(["apply"]))
     if args.check:
         print(json.dumps(preflight_environment(), indent=2))
         return

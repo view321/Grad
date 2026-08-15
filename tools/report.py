@@ -907,6 +907,9 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
+    # Rule 4. Which code produced the numbers -- see `check_code_versions`.
+    findings += report_lib.check_code_versions(report_lib.cited_run_ids(tex, claims))
+
     findings += report_lib.check_latex(tex)
 
     payload = {
@@ -918,7 +921,7 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
         "findings": findings,
         "by_rule": {
             rule: sum(1 for f in findings if f.get("rule") == rule)
-            for rule in ("claims", "citations", "unjudged", "latex")
+            for rule in ("claims", "citations", "unjudged", "latex", "version")
         },
     }
     if findings:
