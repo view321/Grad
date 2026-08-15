@@ -9,6 +9,7 @@ a server or a real process; §24's discipline holds.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from pathlib import Path
 
@@ -69,6 +70,36 @@ def test_workspaces_with_the_same_name_do_not_collide(tmp_path):
     b = appdata.workspace_state_dir(tmp_path / "two" / "grad")
     assert a != b
     assert a.name.startswith("grad-") and b.name.startswith("grad-")
+
+
+def test_one_directory_spelled_two_ways_is_one_workspace(tmp_path):
+    """The key is a digest of the path's *text*, so an unresolved spelling is a
+    different workspace to it. Readers all arrive through `paths.root()`, which
+    resolves; `migrate_legacy` takes a root argument and may not -- and a
+    migration keyed differently from its reader is the silent kind of loss."""
+    target = tmp_path / "grad"
+    target.mkdir()
+    spellings = [
+        target,
+        tmp_path / "." / "grad",
+        tmp_path / "grad" / "sub" / "..",
+        Path(str(target) + os.sep),
+    ]
+    keys = {appdata.workspace_state_dir(s) for s in spellings}
+    assert len(keys) == 1, keys
+
+
+def test_a_migration_lands_where_an_unresolved_root_reads(tmp_path, monkeypatch):
+    """The whole point of resolving: `migrate_legacy` given a scruffy path must
+    write where a reader given the tidy one will look."""
+    root = tmp_path / "ws"
+    (root / "data" / "layouts").mkdir(parents=True)
+    (root / "data" / "layouts" / "p.json").write_text("{}", encoding="utf-8")
+
+    appdata.migrate_legacy(tmp_path / "ws" / "sub" / "..")
+
+    monkeypatch.setenv("GRAD_ROOT", str(root))
+    assert (state_mod.layout_dir() / "p.json").exists()
 
 
 def test_the_workspace_key_is_stable_across_calls(tmp_path):

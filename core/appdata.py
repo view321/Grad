@@ -104,10 +104,22 @@ def _key(root: Path) -> str:
     eventually have to look in here and work out which folder a directory
     belongs to. Case-folded first because Windows paths are case-insensitive and
     `D:\\Grad` and `d:\\grad` are the same workspace.
+
+    **Resolved first, and that is the load-bearing line.** The digest is taken
+    over the path's *text*, so two spellings of one directory are two different
+    workspaces to this function: `D:/work/grad` and `D:/work/./grad`, a relative
+    path and its absolute form, a symlink and its target. Every reader arrives
+    through `paths.root()`, which resolves; a caller that passes a root
+    explicitly -- `migrate_legacy` is the one that does -- may not have. Without
+    this line that caller writes into a key nothing ever reads, which is the
+    same silent failure as a migration landing in the wrong directory: the
+    source is gone, the destination is real, and the app opens on defaults with
+    nothing to explain it.
     """
-    text = str(root).casefold()
+    resolved = Path(root).resolve()
+    text = str(resolved).casefold()
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    return f"{_slug(root.name)}-{digest}"
+    return f"{_slug(resolved.name)}-{digest}"
 
 
 def workspace_state_dir(root: Path | None = None) -> Path:
@@ -285,7 +297,10 @@ def migrate_legacy(root: Path | None = None) -> list[str]:
     """
     from core import paths  # noqa: PLC0415
 
-    base = Path(root) if root is not None else paths.root()
+    # Resolved, so the destinations computed below are keyed exactly as the
+    # readers key them. `paths.root()` already resolves; an explicit argument
+    # has no such guarantee. See `_key`.
+    base = Path(root).resolve() if root is not None else paths.root()
     legacy = base / "data"
     if not legacy.is_dir():
         return []
