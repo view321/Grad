@@ -27,6 +27,33 @@ DEFAULTS: dict[str, Any] = {
         "stale_grace_factor": 3.0,
         "stale_grace_floor_s": 1800,
     },
+    # What one token of each kind counts as against a `quota_tokens` ceiling.
+    #
+    # These exist because the ceiling used to count `input + output` and nothing
+    # else, and on the first fortnight of real use that was 149k tokens out of
+    # 12.5M actually moved -- 1.2% of the flow. The other 98.8% is cache reads,
+    # which are what a long context costs on every tool round-trip, and the row
+    # in the README promising that token spend is "bounded, not merely measured"
+    # could not see any of it.
+    #
+    # The weights are ratios against one input token, taken from published
+    # per-token pricing: a cache read is a tenth of an input token, a cache write
+    # is 1.25 of one. Output is left at 1.0 rather than at its true multiple so
+    # that an existing `quota_tokens` ceiling keeps roughly the meaning it had
+    # for the two components it could already see -- this change is meant to
+    # reveal the missing 98%, not to silently reprice the 1.2%.
+    #
+    # They are configuration and not constants for the reason §10 gives about
+    # the meter as a whole: subscription quota is not linear in tokens and
+    # Anthropic exposes no remaining balance, so this is a stated assumption you
+    # control rather than a mirror of anyone's billing. Set them all to 1.0 for
+    # a raw count, or `weight_cache_read = 0` to go back to what it did before.
+    "quota": {
+        "weight_input": 1.0,
+        "weight_output": 1.0,
+        "weight_cache_read": 0.1,
+        "weight_cache_write": 1.25,
+    },
     "smoke": {
         # HANDOFF §6: the carve-out is hard-capped in code, not in prose.
         # "nothing useful can be trained inside them".
@@ -184,6 +211,31 @@ DEFAULTS: dict[str, Any] = {
         # actually produces text; "omitted" is the SDK's own default and is here
         # so turning the feature off is a config edit rather than a code one.
         "reasoning": "summarized",
+        # Compact the conversation once it passes this many tokens of context.
+        # 0 disables it and leaves the matter to the CLI underneath.
+        #
+        # There is a threshold either way -- the CLI autocompacts on its own, and
+        # a live session reports it as 967,000 of a 1,000,000 window. That is a
+        # ceiling in the sense that a wall at the end of a runway is: by the time
+        # it is reached every tool round-trip has been re-reading the better part
+        # of a million cached tokens for a long time. 300k is roughly a third of
+        # the way in, which keeps a long session's per-turn cost bounded while
+        # leaving room for the kind of turn this agent actually runs -- the
+        # largest one in the ledger so far read 10.1M cached tokens.
+        #
+        # Compacting is not free and not obviously cheap: the summary costs a
+        # turn, and the session it seeds starts with a cold prompt cache, so the
+        # first turn after a compaction pays cache *writes* (1.25x) where it
+        # would have paid cache *reads* (0.1x). Compacting too eagerly costs more
+        # than not compacting. `python -m tools.quota summary --json` is where
+        # that trade becomes visible, which is why the accounting split landed
+        # before this did.
+        "compact_at_tokens": 300_000,
+        # How many of the most recent turns survive a compaction verbatim, below
+        # the summary. The summary is a model's account of the conversation and
+        # the last exchange is the one it is worst at compressing, because it has
+        # not yet had a consequence.
+        "compact_keep_turns": 2,
     },
     "hosts": {},
 }

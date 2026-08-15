@@ -194,11 +194,26 @@ async def run_session(prompt: str | None, *, once: bool) -> int:
     if env["removed_env"]:
         print(f"[grad] removed from the environment: {', '.join(env['removed_env'])}", file=sys.stderr)
 
-    async with sdk.ClaudeSDKClient(options=build_options(cfg)) as client:
+    # Held in a variable rather than in an `async with`, because compacting
+    # replaces it: the note is written by the outgoing session and the fresh one
+    # is built to hold it. A context manager binds the name for the whole block
+    # and there would be no way to swap what it holds -- which is how the CLI
+    # would have ended up as the surface that cannot compact, and the two
+    # surfaces disagreeing about a rule is the failure `drive_turn`'s docstring
+    # is about.
+    client = await _connect(sdk, cfg)
+    #: The handover note from a compaction, waiting for the next prompt to ride
+    #: in front of. Sending it as a turn of its own would spend a round-trip to
+    #: produce an answer nobody asked for.
+    seed: str | None = None
+    try:
         if prompt:
-            ran = await _turn(client, prompt)
+            ran, seed = await _turn(client, prompt, seed)
             if once:
+                # No compaction on a one-shot: the session ends here, so the only
+                # thing a compaction could buy is a summary nothing will read.
                 return 0 if ran else EXIT_PROJECT_BUDGET
+            client, seed = await _maybe_compact(sdk, cfg, client, seed)
         while True:
             try:
                 # In a worker thread: a bare input() blocks the event loop, and
@@ -213,7 +228,71 @@ async def run_session(prompt: str | None, *, once: bool) -> int:
                 continue
             if line in ("exit", "quit"):
                 return 0
-            await _turn(client, line)
+            _, seed = await _turn(client, line, seed)
+            client, seed = await _maybe_compact(sdk, cfg, client, seed)
+    finally:
+        await _disconnect(client)
+
+
+async def _connect(sdk: Any, cfg: Any, *, resume: str | None = None) -> Any:
+    client = sdk.ClaudeSDKClient(options=build_options(cfg, resume=resume))
+    await client.__aenter__()
+    return client
+
+
+async def _disconnect(client: Any) -> None:
+    """Exit a client's context. Never raises on the way out."""
+    if client is None:
+        return
+    try:
+        await client.__aexit__(None, None, None)
+    except Exception:  # noqa: BLE001 - shutdown must not raise
+        pass
+
+
+async def _maybe_compact(sdk: Any, cfg: Any, client: Any, seed: str | None) -> tuple[Any, str | None]:
+    """Compact between turns when the context has passed the threshold.
+
+    The CLI's half of what `ui/app.py:Session.maybe_compact` does, and the same
+    order for the same reason: the note is written while the outgoing session
+    still remembers everything, and only then is the client replaced.
+
+    A failure here returns the client unchanged. An oversized conversation is a
+    cost; a session taken down between turns by its own housekeeping is a loss.
+    """
+    from core import compaction  # noqa: PLC0415
+
+    if not compaction.threshold(cfg):
+        return client, seed
+    reader = getattr(client, "get_context_usage", None)
+    if reader is None:
+        return client, seed
+    try:
+        usage = await reader()
+    except Exception:  # noqa: BLE001 - no reading is not a reason to compact
+        return client, seed
+    if not compaction.should_compact(usage, cfg):
+        return client, seed
+
+    before = compaction.context_tokens(usage)
+    print(f"\n[grad] compacting at {before:,} tokens…", file=sys.stderr)
+    try:
+        handoff = await compaction.write_handoff(client, drive_turn)
+    except BudgetRefused as exc:
+        # No carve-out: a compaction is a model call and the allocation applies.
+        print(f"[grad] cannot compact: {exc.refusal['message']}", file=sys.stderr)
+        return client, seed
+    except Exception as exc:  # noqa: BLE001 - the conversation survives a failed compaction
+        print(f"[grad] could not compact ({type(exc).__name__}); carrying on", file=sys.stderr)
+        return client, seed
+
+    await _disconnect(client)
+    # `resume` is deliberately not passed. Resuming would restore the very
+    # conversation this just summarised, making the whole operation a cost with
+    # no effect.
+    fresh = await _connect(sdk, cfg)
+    print("[grad] compacted — the agent now knows this session by its handover note", file=sys.stderr)
+    return fresh, compaction.seed_message(handoff["note"], tokens_before=before)
 
 
 def check_turn_budget() -> dict[str, Any] | None:
@@ -288,6 +367,8 @@ async def drive_turn(
     on_chunk: Any = None,
     on_session_id: Any = None,
     session: str | None = None,
+    stage: str = quota_log.STAGE_MAIN,
+    role: str = "research",
 ) -> dict[str, Any]:
     """One turn, for every surface that runs one.
 
@@ -308,6 +389,12 @@ async def drive_turn(
     off the return value learned it only for turns that finished -- and an
     interrupted turn is precisely the one after which the client is rebuilt, so
     that was the case where losing the id cost the whole conversation.
+
+    `stage` and `role` decide where the turn's tokens land in `ledger/quota.jsonl`.
+    They default to the conversation, and the one caller that overrides them is
+    `core/compaction.py`: a compaction is a model call this system makes on its
+    own initiative, and folding its cost into `main` would hide precisely the
+    number that says whether the threshold is set correctly.
     """
     refusal = check_turn_budget()
     if refusal:
@@ -347,26 +434,33 @@ async def drive_turn(
         # exactly the turns most worth accounting for.
         if last_usage is not None:
             recorded = quota_log.from_sdk_usage(
-                quota_log.STAGE_MAIN, last_usage, model=None, role="research", session=session
+                stage, last_usage, model=None, role=role, session=session
             )
     return {"sdk_session_id": sdk_session_id, "quota": recorded}
 
 
-async def _turn(client: Any, prompt: str) -> bool:
-    """Run one turn. Returns False if the budget refused it."""
+async def _turn(client: Any, prompt: str, seed: str | None = None) -> tuple[bool, str | None]:
+    """Run one turn. Returns whether it ran, and the seed still owed.
+
+    `seed` is a handover note from a compaction, prepended to this prompt rather
+    than sent as a turn of its own. It is returned unconsumed when the turn does
+    not run, because a note dropped by a refused turn is the whole memory of
+    everything the compaction discarded.
+    """
     stream = TurnStream()
+    sent = f"{seed}\n\n---\n\n{prompt}" if seed else prompt
     try:
         await drive_turn(
-            client, prompt, stream, on_chunk=lambda c: print(c, end="", flush=True)
+            client, sent, stream, on_chunk=lambda c: print(c, end="", flush=True)
         )
     except BudgetRefused as exc:
         print(
             f"\n[grad] {exc.refusal['message']}\n[grad] fix: {exc.refusal['fix']}",
             file=sys.stderr,
         )
-        return False
+        return False, seed
     print()
-    return True
+    return True, None
 
 
 def _text_of(message: Any) -> str:

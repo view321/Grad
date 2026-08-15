@@ -29,7 +29,7 @@ is a sentence in `prompts/system.md`.
 | Notebooks run clean top-to-bottom | `tools/nb.py verify` on a fresh kernel |
 | No general remote-execution capability | credentials in Windows Credential Manager, read only by `jobs.py` / `gpu.py` |
 | Concurrent ledger writes don't corrupt | one locked `core/jsonl.py:append`; no CLI writes a ledger file directly |
-| Token and credit spend stays bounded, not merely measured | `core/budget.py`, checked at every gateable event |
+| Token and credit spend stays bounded, not merely measured | `core/budget.py`, checked at every gateable event, over all four kinds of token |
 | An evolutionary campaign cannot outspend its allocation | the campaign gate in `tools/evolve.py`, before generation 0 and before each generation after it |
 | A job submitted to an org is collectable from that org | the namespace is persisted on the run handle, not just passed at submit |
 | Every number in a report traces to a run record | `tools/report.py check` refuses on an unresolved claim, on a `claims.tex` that has drifted from `claims.json`, and on a measured-looking number typed into the generated prose |
@@ -55,6 +55,43 @@ A second honesty note: subscription quota is not linear in tokens, and the real
 limits are rolling windows (5-hour and weekly on Max) that the SDK does not
 expose as a remaining balance. **A token ceiling is a proxy you control, not a
 mirror of Anthropic's limit.** The meter says so on screen.
+
+### The ceiling used to count about one per cent of the tokens
+
+Worth recording, because the row above claimed the opposite for two months and
+nothing in the tests caught it. `core/budget.py` charged a project's
+`quota_tokens` ceiling with `input_tokens + output_tokens`. Over the first
+fortnight of real use that came to **149,063 tokens, against 12,520,659 that had
+actually moved**. The missing 98.8% is cache reads: a long conversation is
+re-read from the prompt cache on every tool round-trip, so cache traffic
+dominates everything else by two orders of magnitude. One turn in that ledger
+read 10.1M cached tokens to produce 104k of output.
+
+The counts were being recorded correctly the whole time — `quota_log.record` has
+always stored all four — so this was never a measurement problem. It was one
+line of arithmetic deciding which of the four a ceiling could see.
+
+Now all four are weighted into one number by `core/quota_log.py:billable`, which
+is the only place the four become one, so a change to what a cache read is worth
+lands on the gate, the meters and the summaries together. The weights are
+`[quota]` in `config/grad.toml`, as ratios against one input token:
+
+| kind | weight | why |
+|---|---|---|
+| input | 1.0 | the unit |
+| output | 1.0 | *not* its true multiple — see below |
+| cache read | 0.1 | a tenth of an input token |
+| cache write | 1.25 | a quarter more than one |
+
+Output stays at 1.0 deliberately. Weighting it by its real price would have been
+more accurate and would also have silently reduced every existing ceiling; this
+change is meant to reveal the 98.8% that was invisible, not to reprice the 1.2%
+that was not. On the measured ledger the correction is **12×**. Set
+`weight_cache_read = 0` to get the old arithmetic back.
+
+`python -m tools.quota summary --json` reports the four counts, the weighted
+total and the weights it used, side by side, because a total that is mostly cache
+traffic is unarguable with its components beside it and baffling without them.
 
 ## Install
 
@@ -176,6 +213,59 @@ else. Runs with no stamp at all pass silently: they predate the field, and
 refusing a report because its evidence is old would make the rule a reason to
 avoid updating.
 
+### Where the conversation gets compacted, and who decides
+
+The CLI underneath compacts on its own, and a live session reports the threshold
+as **967,000 of a 1,000,000 window**. That is a ceiling in the sense that a wall
+at the end of a runway is one: by the time it is reached, every tool round-trip
+has spent a long time re-reading most of a million cached tokens — which, with
+the accounting above fixed, is now visible as the dominant cost it always was.
+
+There is no way to ask the SDK to compact, and no way to move its threshold from
+here. The control protocol has ten subtypes — `initialize`, `mcp_status`,
+`get_context_usage`, `interrupt`, `set_permission_mode`, `set_model`,
+`rewind_files`, `mcp_reconnect`, `mcp_toggle`, `stop_task` — and none of them is
+"compact"; the threshold comes from settings, and `agent.py` leaves
+`setting_sources` unset on purpose so a stray `settings.json` cannot add
+permission rules behind the code's back.
+
+So `core/compaction.py` does it, at `[agent] compact_at_tokens` (300k by
+default, 0 to disable). Being ours buys three things the CLI's version cannot:
+
+* **It is visible.** A compaction performed in-band rewrites what the model
+  remembers while the transcript on screen still shows every turn — the user is
+  looking at evidence for a belief the agent no longer holds, and nothing says
+  so. Grad's writes a marker into the transcript where it happened, with the
+  handover note behind a disclosure.
+* **It is metered.** The summary is charged to a `compaction` stage of its own,
+  so "what does compacting cost" is a question the ledger answers rather than a
+  cost folded into the conversation it was compacting.
+* **It happens where you chose.**
+
+The mechanism has no clever part: ask the session, while it still remembers
+everything, to write a note to whoever picks it up next; drop the client; start a
+fresh conversation; hand it the note in front of the next prompt rather than as a
+turn of its own, so it costs nothing extra. The note is asked for in the first
+person and asks for paths, commands, and the ledger state the next turn is
+expected to act on — an expectation registered and not yet judged, a run
+submitted and not yet collected. A generic "summarise the conversation" prompt
+drops those every time, and losing them does not read as a bad summary. It reads
+as an agent that abandoned a run halfway.
+
+**Compacting is not obviously cheap, and the threshold is not a "lower is
+better" dial.** The summary costs a turn, and the session it seeds starts with a
+cold prompt cache — so the turn after a compaction pays cache *writes* at 1.25×
+where it would have paid cache *reads* at 0.1×. There is a threshold below which
+compacting costs more than not compacting. The `compaction` stage is what makes
+that measurable, which is why the accounting split landed before this did.
+
+The chat window's statusline carries a context meter, measured against whichever
+limit will actually be reached first — Grad's threshold when one is set, the
+CLI's otherwise — because a meter reading 40% means quite different things at
+300k and at 967k. It reads `—` rather than `0` before the first reading: an
+unknown context and an empty one look identical at a glance and only one of them
+is worth acting on.
+
 ### Retrieval without an institutional email, and without waiting
 
 Tier 1 defaults to **Papers with Code** (`paperswithcode.co/api/v1`) — the
@@ -253,6 +343,7 @@ that carry the literal next command.
 | `tools/evolve.py` | evolutionary search as a budgeted campaign, over ShinkaEvolve |
 | `tools/report.py` | `draft` / `write` / `cite` / `check` / `build` — the report and its gate |
 | `tools/lab.py` | the embedded JupyterLab server (human editing surface) |
+| `tools/traces.py` | tag stored sessions, and harvest eval candidates from real use — **human-facing only** |
 | `tools/wiki.py` | RepoWiki over `core/` and `tools/` — **human-facing only**, not an agent tool |
 
 ### Exit codes
@@ -313,6 +404,8 @@ prompts/system.md     under 1000 tokens
 core/                 the machinery the CLIs share, so no tool can forget a rule
   cli.py              the §8 CLI contract, implemented once
   jsonl.py            the single locked write path to the ledgers
+  compaction.py       where a conversation is compacted, and what survives it
+  traces.py           a session as tags a later query can slice on  -- pure, tested
   submission.py       the resolved submission and its hash
   gates.py            the submit gates and the smoke carve-out
   budget.py           the project dimension and its three ceilings
@@ -458,6 +551,30 @@ reached for. The eval file here is a schema and a handful of seed rows, not a
 benchmark; authoring it cold would measure the imagination rather than the
 system.
 
+That step had a prerequisite nobody wrote down: the week of use has to leave
+something sliceable behind. A directory of transcripts is a record, but "every
+session where a submitter refused" was a full-text search whose answer depended
+on how the refusal happened to be phrased. `core/traces.py` tags each
+trajectory — `tool:`, `gate:`, `ledger:`, `outcome:`, `turns:`, `cost:` — and
+`python -m tools.traces list --json` reports what a week actually consisted of,
+which is usually not what it felt like it consisted of.
+
+`gate:` is the namespace worth having, and the one ml-intern's equivalent has no
+reason to want. Every row of the table at the top of this file is a claim that
+some gate refuses under some condition; a corpus of real sessions tagged by
+which gate refused is the difference between believing that and knowing it. A
+verb that was only asked about does not count — `ledger expect --help` tags the
+module and not the verb, because on the real corpus four of the five `ledger:`
+tags on the busiest session came from `--help` calls, and a corpus that cannot
+tell reading an interface from using it would answer the question wrongly.
+
+`python -m tools.traces harvest` turns the questions actually put to
+`paper_search` into eval rows. They arrive **ungraded** — `relevant` is empty —
+because which papers were the right answer is the one part of an eval row a
+trace cannot recover, and a harvester that guessed would measure the guess. It
+never rewrites an existing row and never appends a duplicate, so it is meant to
+be re-run as the corpus grows.
+
 ## Tests
 
 ```bash
@@ -467,3 +584,13 @@ python -m pytest -q
 The gate tests run against a real ledger in a temp workspace rather than against
 mocks. A mock of a gate proves nothing about the gate, and these are the checks
 that stand between an agent under deadline pressure and a GPU bill.
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
+
+`pyproject.toml` claimed MIT from the first commit and the repository contained
+no licence file, which is the one combination that is worse than saying nothing:
+the package metadata grants a licence the repository does not. Both now say the
+same thing, and `pyproject.toml` says it as an SPDX expression with
+`license-files` rather than the deprecated free-text form.
