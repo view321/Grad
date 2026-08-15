@@ -174,12 +174,21 @@ def weights(cfg: Any = None) -> dict[str, float]:
 
 
 def counts(row: Any) -> dict[str, int]:
-    """The four raw token counts of one record, defaulting to zero."""
+    """The four raw token counts of one record, defaulting to zero.
+
+    **Clamped at zero**, for the same reason `weights` refuses a negative weight:
+    a negative count would *reduce* the measured total, which is the one error a
+    ceiling cannot survive -- one malformed row and a project has spending power
+    it was never allocated. `tools/quota.py record` already refuses a negative
+    at the CLI, but that is not the only door: `from_sdk_usage` records whatever
+    the SDK reports, and the ledger is a file on disk that can be edited. The
+    guard belongs at the read, where every path passes.
+    """
     get = row.get if isinstance(row, dict) else (lambda k, d=0: getattr(row, k, d))
     out: dict[str, int] = {}
     for field, _ in KINDS:
         try:
-            out[field] = int(get(field, 0) or 0)
+            out[field] = max(0, int(get(field, 0) or 0))
         except (TypeError, ValueError):
             out[field] = 0
     return out
@@ -237,10 +246,18 @@ def summarise(days: int | None = None, *, project: str | None = None) -> dict[st
                  "billable_tokens": 0.0, "credits_usd": 0.0},
             )
             node["calls"] += 1
-            for k, _ in KINDS:
-                node[k] += int(r.get(k, 0) or 0)
+            # Through `counts`, not straight off the record, so the raw figures
+            # and the weighted total are clamped by one rule. Read separately,
+            # a negative row would be excluded from `billable` and included in
+            # the counts printed beside it -- two numbers describing the same
+            # row and disagreeing, which is worse than either being wrong.
+            for k, value in counts(r).items():
+                node[k] += value
             node["billable_tokens"] += billable(r, weight)
             node["credits_usd"] += float(r.get("credits_usd", 0.0) or 0.0)
+        # Rounded here and *not* re-rounded into the grand total below: rounding
+        # each group and then summing accumulates up to half a token of error per
+        # group, which is small but is also entirely avoidable.
         return {
             k: {**v,
                 "billable_tokens": round(v["billable_tokens"]),
@@ -269,7 +286,10 @@ def summarise(days: int | None = None, *, project: str | None = None) -> dict[st
         "totals": {
             field: sum(n[field] for n in by_stage.values()) for field, _ in KINDS
         },
-        "billable_tokens": round(sum(n["billable_tokens"] for n in by_stage.values())),
+        # From the rows, not from the rounded per-stage figures above. Summing
+        # values that have each already been rounded carries every group's
+        # rounding error into the one number a ceiling is compared against.
+        "billable_tokens": round(sum(billable(r, weight) for r in rows)),
         "weights": weight,
         "total_credits_usd": round(sum(n["credits_usd"] for n in by_stage.values()), 4),
         # Anthropic exposes no remaining-quota API and the Max 5x window is

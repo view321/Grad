@@ -287,7 +287,11 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
             continue
         oldest = at if oldest is None or at < oldest else oldest
         credits = float(entry.get("credits_usd", 0.0) or 0.0)
-        entry_tokens = round(quota_log.billable(entry, weight))
+        # Kept fractional and rounded once, at the bottom. Rounding each entry
+        # first costs up to half a token per row, and this window folds every
+        # record in five hours -- an error that grows with how busy the window
+        # was is exactly the wrong shape for a meter about how busy it was.
+        entry_tokens = quota_log.billable(entry, weight)
         tokens += entry_tokens
         if str(entry.get("stage") or "") == quota_log.STAGE_MAIN:
             chat += credits
@@ -321,12 +325,14 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
         "credits_usd": total,
         "chat_usd": chat,
         "tool_usd": tool,
-        "chat_tokens": chat_tokens,
-        "tool_tokens": tool_tokens,
+        # Rounded once, on the way out. The fractions above are computed from the
+        # unrounded figures, so the split does not shift with the rounding.
+        "chat_tokens": round(chat_tokens),
+        "tool_tokens": round(tool_tokens),
         "chat_fraction": chat_fraction,
         "tool_fraction": tool_fraction,
         "split_basis": "credits" if total else ("tokens" if token_total else "empty"),
-        "tokens": tokens,
+        "tokens": round(tokens),
         "resets_in": resets_in,
     }
 
@@ -339,6 +345,25 @@ def _session_window(*, hours: int = 5) -> dict[str, Any]:
 #: happen and the strip should say so before it does rather than after.
 CONTEXT_WARN = 0.75
 CONTEXT_NEAR = 0.92
+
+
+def _reading(source: Any, key: str) -> int | None:
+    """A non-negative integer out of a `get_context_usage` payload, or None.
+
+    None and 0 are kept distinct all the way through this file, which is the
+    whole discipline of the context meter: "I could not read it" and "there is
+    nothing in it" are opposite facts and only one of them means there is room.
+    Every caller here decides for itself which way to fail.
+    """
+    if not isinstance(source, dict):
+        return None
+    value = source.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def context_model(usage: Any, *, compact_at: int = 0) -> dict[str, Any]:
@@ -365,7 +390,14 @@ def context_model(usage: Any, *, compact_at: int = 0) -> dict[str, Any]:
     context of zero and an unknown context look identical at a glance and only
     one of them is worth acting on.
     """
-    if not isinstance(usage, dict):
+    tokens = _reading(usage, "totalTokens") if isinstance(usage, dict) else None
+    if tokens is None:
+        # Not only "no dict yet". A reading whose `totalTokens` is missing or is
+        # not a number is *also* unknown, and it used to land here as a confident
+        # zero -- which is the one reading this function's docstring says must
+        # never happen, drawn by this function. A meter reporting "ctx 0 · 0%"
+        # for a session it cannot measure is worse than one reporting nothing,
+        # because it invites exactly the conclusion that there is plenty of room.
         return {
             "known": False, "tokens": 0, "limit": 0, "fraction": 0.0,
             "label": "ctx —", "tone": "", "limit_source": "unknown",
@@ -373,14 +405,7 @@ def context_model(usage: Any, *, compact_at: int = 0) -> dict[str, Any]:
             "categories": [],
         }
 
-    def _int(key: str) -> int:
-        try:
-            return max(0, int(usage.get(key) or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    tokens = _int("totalTokens")
-    ceiling = _int("maxTokens") or _int("rawMaxTokens")
+    ceiling = _reading(usage, "maxTokens") or _reading(usage, "rawMaxTokens") or 0
     source = "cli"
     if compact_at and (not ceiling or compact_at < ceiling):
         ceiling, source = compact_at, "grad"
@@ -392,16 +417,26 @@ def context_model(usage: Any, *, compact_at: int = 0) -> dict[str, Any]:
     elif fraction >= CONTEXT_WARN:
         tone = "warn"
 
-    categories = [
-        {"name": str(c.get("name") or "?"), "tokens": int(c.get("tokens") or 0)}
-        for c in (usage.get("categories") or [])
-        if isinstance(c, dict) and int(c.get("tokens") or 0) > 0
+    # Built with a loop rather than a comprehension because a bare
+    # `int(c.get("tokens"))` raises on a non-numeric value, and this is drawn
+    # from a timer -- one odd category in one reading would not produce one bad
+    # tooltip, it would raise several times a second for as long as the session
+    # lasted. A category that cannot be read is skipped.
+    categories: list[dict[str, Any]] = []
+    for entry in usage.get("categories") or []:
+        if not isinstance(entry, dict):
+            continue
+        size = _reading(entry, "tokens")
+        if not size:
+            continue
+        name = str(entry.get("name") or "?").strip()
         # `Free space` is a category in the CLI's own breakdown and is the
         # complement of everything else, so listing it in a tooltip about what
         # is *using* the context is worse than noise -- it is always the largest
         # entry and it is not a consumer.
-        and str(c.get("name") or "").strip().lower() != "free space"
-    ]
+        if name.lower() == "free space":
+            continue
+        categories.append({"name": name or "?", "tokens": size})
     categories.sort(key=lambda c: -c["tokens"])
 
     where = "Grad compacts" if source == "grad" else "the CLI compacts"

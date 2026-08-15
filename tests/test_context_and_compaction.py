@@ -101,6 +101,42 @@ def test_a_project_ceiling_is_charged_the_weighted_total(workspace):
     assert state["quota_weights"]["weight_cache_read"] == 0.1
 
 
+def test_a_negative_count_cannot_buy_back_allocation(workspace):
+    """`weights` already refuses a negative weight for this reason; the counts
+    needed the same guard. `tools.quota record` refuses one at the CLI, but that
+    is not the only door -- `from_sdk_usage` records what the SDK reports, and
+    the ledger is a file on disk that can be edited."""
+    budget.create("proj-neg", title="clamping", budget={"quota_tokens": 1_000})
+    budget.set_current("proj-neg")
+    quota_log.record(quota_log.STAGE_MAIN, project="proj-neg", output_tokens=900)
+    quota_log.record(quota_log.STAGE_MAIN, project="proj-neg", output_tokens=-10_000)
+
+    assert quota_log.counts({"output_tokens": -10_000})["output_tokens"] == 0
+    assert budget.status("proj-neg")["resources"]["quota_tokens"]["spent"] == 900
+
+
+def test_the_raw_counts_and_the_weighted_total_clamp_by_one_rule(workspace):
+    """Read separately, a malformed row would be excluded from one and included
+    in the other -- two numbers describing the same row and disagreeing, which is
+    worse than either being wrong."""
+    quota_log.record(quota_log.STAGE_MAIN, input_tokens=5, cache_read_tokens=-1_000)
+    summary = quota_log.summarise()
+    assert summary["totals"]["cache_read_tokens"] == 0
+    assert summary["billable_tokens"] == 5
+
+
+def test_the_weighted_total_is_rounded_once_rather_than_per_group(workspace):
+    """Rounding each stage and then summing carries every group's error into the
+    one number a ceiling is compared against."""
+    # Three stages, each landing on exactly half a token once weighted.
+    for stage in ("main", "funnel.expand", "funnel.triage"):
+        quota_log.record(stage, cache_read_tokens=5)
+    summary = quota_log.summarise()
+    # 3 x 0.5 = 1.5 -> 2. Summing three separately-rounded 0.5s gives 0.
+    assert summary["billable_tokens"] == 2
+    assert sum(n["billable_tokens"] for n in summary["by_stage"].values()) == 0
+
+
 def test_the_summary_reports_the_four_kinds_and_the_weighted_total(workspace):
     quota_log.record(quota_log.STAGE_MAIN, input_tokens=1, output_tokens=2,
                      cache_read_tokens=1_000, cache_write_tokens=100)
@@ -124,6 +160,50 @@ def test_an_unknown_context_reads_as_unknown_rather_than_as_empty():
     assert model["known"] is False
     assert model["label"] == "ctx —"
     assert model["tone"] == ""
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"maxTokens": 1_000_000},                      # a reading with no total in it
+        {"totalTokens": None, "maxTokens": 1_000_000},
+        {"totalTokens": "lots", "maxTokens": 1_000_000},
+    ],
+)
+def test_an_unreadable_total_is_unknown_rather_than_a_confident_zero(usage):
+    """The failure this function's docstring is about, arriving through the
+    function itself. "ctx 0 · 0%" for a session that could not be measured is
+    worse than saying nothing, because it invites exactly the conclusion that
+    there is plenty of room."""
+    model = models.context_model(usage, compact_at=300_000)
+    assert model["known"] is False
+    assert model["label"] == "ctx —"
+
+
+def test_a_category_that_cannot_be_read_is_skipped_rather_than_raising():
+    """This is drawn from a timer, so one odd category would not produce one bad
+    tooltip -- it would raise several times a second for the life of the
+    session."""
+    model = models.context_model(
+        {
+            "totalTokens": 5_000,
+            "maxTokens": 1_000_000,
+            "categories": [
+                {"name": "Tools", "tokens": "unknown"},
+                {"name": "Skills", "tokens": 1_469},
+                "not even a dict",
+            ],
+        }
+    )
+    assert [c["name"] for c in model["categories"]] == ["Skills"]
+
+
+def test_a_genuinely_empty_context_still_reads_as_known():
+    """Zero is a real reading when the payload says so; only a missing or
+    unparseable one is unknown."""
+    model = models.context_model({"totalTokens": 0, "maxTokens": 1_000_000})
+    assert model["known"] is True
+    assert model["fraction"] == 0.0
 
 
 def test_the_meter_measures_against_grads_threshold_when_there_is_one():

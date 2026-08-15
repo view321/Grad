@@ -177,6 +177,94 @@ def test_harvesting_twice_does_not_add_the_question_twice(workspace, monkeypatch
     assert len([l for l in lines if l.strip()]) == 1
 
 
+def test_a_gap_in_the_ids_does_not_produce_a_duplicate(workspace, monkeypatch):
+    """The count-based numbering this started with was wrong the moment the ids
+    were not exactly q001..qN. Delete one graded row from a file of five and the
+    count says the next id is q005, which is already taken -- and a duplicate id
+    in an eval set is two different questions that cannot be told apart in a
+    result table."""
+    evals = workspace / "evals"
+    evals.mkdir(parents=True, exist_ok=True)
+    (evals / "retrieval.jsonl").write_text(
+        "\n".join(
+            json.dumps({"id": i, "question": f"already asked {i}"})
+            for i in ("q001", "q003", "q004", "q005")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _store_session(monkeypatch, "s-1", [
+        asked(),
+        turn(bash('python -m tools.paper_search search "a brand new question" --json')),
+    ])
+    from tools import traces as cli
+
+    out = cli.cmd_harvest(_args(write=True))
+    assert [r["id"] for r in out["candidates"]] == ["q006"]
+    ids = [
+        json.loads(line)["id"]
+        for line in (evals / "retrieval.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(ids) == len(set(ids))
+
+
+def test_ids_that_are_not_qnnn_at_all_do_not_derail_the_numbering(workspace, monkeypatch):
+    evals = workspace / "evals"
+    evals.mkdir(parents=True, exist_ok=True)
+    (evals / "retrieval.jsonl").write_text(
+        json.dumps({"id": "scaling-laws-1", "question": "hand-named"}) + "\n"
+        + json.dumps({"id": "q007", "question": "numbered"}) + "\n",
+        encoding="utf-8",
+    )
+    _store_session(monkeypatch, "s-1", [
+        asked(),
+        turn(bash('python -m tools.paper_search search "something else" --json')),
+    ])
+    from tools import traces as cli
+
+    assert [r["id"] for r in cli.cmd_harvest(_args(write=True))["candidates"]] == ["q008"]
+
+
+def test_an_id_taken_between_deriving_and_writing_is_derived_again(workspace, monkeypatch):
+    """`jsonl.append` serialises the record before it takes the lock, so a
+    precondition cannot renumber the row -- it can only refuse, which makes this
+    a retry. The precondition is where the race is actually decided."""
+    from core import jsonl
+
+    evals = workspace / "evals"
+    evals.mkdir(parents=True, exist_ok=True)
+    path = evals / "retrieval.jsonl"
+    path.write_text(json.dumps({"id": "q001", "question": "there first"}) + "\n", encoding="utf-8")
+
+    real_append = jsonl.append
+    raced = {"done": False}
+
+    def append_but_race_first(target, record, *, precondition=None):
+        # Another writer lands the id this attempt is about to ask for, in the
+        # window between deriving it and the lock closing over the write.
+        if not raced["done"]:
+            raced["done"] = True
+            with open(target, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps({"id": "q002", "question": "raced in"}) + "\n")
+        return real_append(target, record, precondition=precondition)
+
+    monkeypatch.setattr(jsonl, "append", append_but_race_first)
+    _store_session(monkeypatch, "s-1", [
+        asked(),
+        turn(bash('python -m tools.paper_search search "mine" --json')),
+    ])
+    from tools import traces as cli
+
+    out = cli.cmd_harvest(_args(write=True))
+    assert out["candidates"][0]["id"] == "q003"
+    ids = [
+        json.loads(line)["id"]
+        for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert ids == ["q001", "q002", "q003"]
+
+
 def test_harvested_ids_continue_after_the_rows_already_there(workspace, monkeypatch):
     evals = workspace / "evals"
     evals.mkdir(parents=True, exist_ok=True)

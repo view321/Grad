@@ -30,7 +30,7 @@ import json
 import re
 from typing import Any
 
-from core import paths, quota_log, traces
+from core import jsonl, paths, quota_log, traces
 from core.cli import Cli, main
 from core.errors import NotFound, UsageError
 
@@ -235,16 +235,18 @@ def cmd_harvest(args: argparse.Namespace) -> dict[str, Any]:
     path = paths.root() / "evals" / "retrieval.jsonl"
     existing, known = _existing_eval_rows(path)
     fresh = [r for r in rows if r["question"] not in known]
-    for offset, row in enumerate(fresh, start=len(existing) + 1):
-        row["id"] = f"q{offset:03d}"
 
     written = False
     if args.write and fresh:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            for row in fresh:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for row in fresh:
+            _append_numbered(path, row)
         written = True
+    else:
+        # Nothing is being written, so the ids are a proposal. Numbered from the
+        # same rule so a dry run says what a real one would do.
+        index = _next_index(existing)
+        for offset, row in enumerate(fresh, start=index):
+            row["id"] = f"q{offset:03d}"
 
     return {
         "path": str(path),
@@ -259,6 +261,73 @@ def cmd_harvest(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "fix": None if written or not fresh else "re-run with --write to append them",
     }
+
+
+#: An eval row's id, as the schema in `evals/README.md` writes it.
+ID_RE = re.compile(r"q(\d+)\Z")
+
+#: How many times `_append_numbered` will re-derive an id before giving up. Two
+#: would do for the realistic case -- this is a human-run command on one desktop
+#: -- and a handful costs nothing and covers a genuinely contended file.
+ID_ATTEMPTS = 8
+
+
+class _Renumber(Exception):
+    """The id this row was given stopped being free before it landed."""
+
+
+def _next_index(existing: list[dict[str, Any]]) -> int:
+    """One past the highest `qNNN` in the file.
+
+    From the highest id rather than from the row *count*, which is what this did
+    at first and which is wrong the moment the ids are not exactly `q001..qN`.
+    Delete one graded row from a file of five and the count says the next id is
+    `q005`, which is already taken -- and a duplicate id in an eval set is not a
+    cosmetic problem, it is two different questions that cannot be told apart in
+    a result table. Gaps are preserved rather than backfilled, because an id that
+    has been used once has probably been referred to somewhere.
+    """
+    highest = 0
+    for row in existing:
+        match = ID_RE.fullmatch(str(row.get("id") or "").strip())
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return highest + 1
+
+
+def _append_numbered(path: Any, row: dict[str, Any]) -> dict[str, Any]:
+    """Append one row under an id that is still free when it lands.
+
+    Compare-and-set rather than assign-then-write. `core/jsonl.py:append`
+    serialises the record *before* it takes the lock, so a precondition cannot
+    renumber the row in place -- what it can do is refuse, which turns this into
+    an ordinary retry: derive an id, ask for it, and if the file gained that id
+    in the meantime, derive again against what is there now.
+
+    Through `jsonl.append` rather than an `open(..., "a")` for the reason this
+    project states once and applies everywhere: no CLI opens an append-only file
+    for writing directly, because the locked path is the only one that cannot
+    interleave two writers mid-line.
+    """
+    for _ in range(ID_ATTEMPTS):
+        row["id"] = f"q{_next_index(_existing_eval_rows(path)[0]):03d}"
+        wanted = row["id"]
+
+        def _still_free(wanted: str = wanted) -> None:
+            # Bound as a default argument, so the check is against the id this
+            # attempt asked for rather than whatever the loop reaches next.
+            taken = {str(r.get("id") or "").strip() for r in _existing_eval_rows(path)[0]}
+            if wanted in taken:
+                raise _Renumber
+
+        try:
+            return jsonl.append(path, row, precondition=_still_free)
+        except _Renumber:
+            continue
+    raise UsageError(
+        f"could not find a free id in {path} after {ID_ATTEMPTS} attempts",
+        fix="another harvest is writing to the eval file; re-run when it finishes",
+    )
 
 
 def _existing_eval_rows(path: Any) -> tuple[list[dict[str, Any]], set[str]]:

@@ -231,11 +231,6 @@ DEFAULTS: dict[str, Any] = {
         # that trade becomes visible, which is why the accounting split landed
         # before this did.
         "compact_at_tokens": 300_000,
-        # How many of the most recent turns survive a compaction verbatim, below
-        # the summary. The summary is a model's account of the conversation and
-        # the last exchange is the one it is worst at compressing, because it has
-        # not yet had a consequence.
-        "compact_keep_turns": 2,
     },
     "hosts": {},
 }

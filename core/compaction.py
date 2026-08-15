@@ -40,6 +40,16 @@ the client; start a fresh conversation; hand that note to it as the first thing
 it reads. The note is written in the first person and asks for specifics,
 because the failure mode of a summary is that it reads well and contains
 nothing actionable.
+
+**The note is all that crosses.** No turns survive verbatim underneath it, which
+is worth stating because the obvious improvement -- ml-intern's context manager
+keeps the last five messages below its summary, on the sound theory that the most
+recent exchange is the one a summary compresses worst -- has no seam to attach to
+here. The conversation belongs to the SDK, not to this module: the desktop app
+has a transcript in `settled` and the CLI has none at all, so keeping turns would
+mean the two surfaces compacting differently, which is the thing `drive_turn`'s
+docstring exists to prevent. It is worth doing when there is one transcript both
+surfaces share, and not before.
 """
 
 from __future__ import annotations
@@ -100,16 +110,6 @@ def threshold(cfg: Any = None) -> int:
     """
     value = _number(cfg, "compact_at_tokens", 0)
     return int(value) if value > 0 else 0
-
-
-def keep_turns(cfg: Any = None) -> int:
-    """How many recent turns survive verbatim under the summary.
-
-    Clamped to at least 0 and at most 10. The upper bound is not fussiness: the
-    turns kept are kept in full, and this agent's turns carry tool output, so a
-    generous number here is a compaction that does not compact.
-    """
-    return max(0, min(10, int(_number(cfg, "compact_keep_turns", 2))))
 
 
 def _number(cfg: Any, key: str, default: float) -> float:
