@@ -100,6 +100,66 @@ AGENT_ACCENT = {
 }
 
 
+def workspaces_model() -> dict[str, Any]:
+    """What the project menu shows: this folder, the recent ones, the projects.
+
+    Every reader is wrapped, because this is the one panel that has to render
+    when the workspace is *wrong* -- an empty folder, a ledger that will not
+    parse, a drive that is not mounted. A menu that cannot open because the
+    workspace it is meant to let you leave is broken is the one failure mode it
+    must not have.
+    """
+    from core import budget as budget_mod, workspace as workspace_mod
+
+    root, root_error = _safe(lambda: str(paths.root()), "")
+    recent, _ = _safe(lambda: [str(p) for p in workspace_mod.recent()], [])
+    current, _ = _safe(budget_mod.current_project)
+    records, projects_error = _safe(budget_mod.projects, {})
+
+    projects = []
+    for project_id, record in sorted((records or {}).items()):
+        state, _ = _safe(lambda pid=project_id: budget_mod.status(pid), {})
+        projects.append(
+            {
+                "id": project_id,
+                "title": _short(record.get("title") or "", 60),
+                "status": record.get("status") or "open",
+                "current": project_id == current,
+                "spend": _spend_line(state or {}),
+            }
+        )
+    return {
+        "root": root,
+        # The rule that picked it -- "why is it still pointing there?" is
+        # otherwise unanswerable from inside the app.
+        "source": _safe(workspace_mod.source, "default")[0],
+        # The one already open is not offered as somewhere to go.
+        "recent": [p for p in (recent or []) if p != root],
+        "projects": projects,
+        "current_project": current,
+        "error": root_error or projects_error,
+    }
+
+
+def _spend_line(state: dict[str, Any]) -> str:
+    """One line per project: what it has spent against what it may.
+
+    A project with no ceilings is the common case -- they are optional -- and it
+    says so rather than rendering an empty bar, which would read as "nothing
+    spent" when it means "nothing to exceed".
+    """
+    resources = state.get("resources") or {}
+    parts: list[str] = []
+    for name, render in (("gpu_usd", _usd), ("quota_tokens", _tokens), ("credits_usd", _usd)):
+        entry = resources.get(name) or {}
+        ceiling = entry.get("ceiling")
+        if not ceiling:
+            continue
+        spent = render(entry.get("spent", 0))
+        parts.append(f"{name.split('_')[0]} {spent}/{render(ceiling)}")
+    return " · ".join(parts) or "no ceilings"
+
+
 def header_model(*, agent_state: str = "idle", step: int | None = None) -> dict[str, Any]:
     """The workspace title bar: project, agent state, session quota strip.
 

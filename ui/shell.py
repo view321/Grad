@@ -45,11 +45,12 @@ def build(workspace: Workspace) -> None:
         attic = kit.el("div", "", style="display: none")
 
     palette = _command_palette(ui, workspace)
+    projects = _project_menu(ui, workspace)
 
     def draw_appbar() -> None:
         appbar.clear()
         with appbar:
-            _appbar(workspace, palette)
+            _appbar(workspace, palette, projects)
 
     def draw_opener() -> None:
         opener.clear()
@@ -121,7 +122,7 @@ def build(workspace: Workspace) -> None:
 # ---------------------------------------------------------------------------
 # chrome
 # ---------------------------------------------------------------------------
-def _appbar(workspace: Workspace, palette: Any) -> None:
+def _appbar(workspace: Workspace, palette: Any, projects: Any) -> None:
     header = workspace.header()
     session = header["session"]
 
@@ -131,7 +132,13 @@ def _appbar(workspace: Workspace, palette: Any) -> None:
 
     with kit.el("div", "grad-appbar-cell"):
         kit.text("project", "dim")
-        kit.text(header["project"], "", style="font-weight: 700")
+        kit.button(
+            f"{header['project']} ▾",
+            tone="ghost",
+            classes="grad-appbar-btn",
+            title="switch project, or open another workspace folder",
+            on_click=projects.open,
+        )
 
     with kit.el("div", "grad-appbar-cell"):
         state = header["agent_state"]
@@ -201,8 +208,199 @@ def _statusbar(workspace: Workspace) -> None:
     if workspace.notice:
         kit.text(workspace.notice, "", tag="span")
     kit.spacer()
-    kit.text("⌥drag to retile", "dim", tag="span")
+    kit.text("drag a title bar to move · drop on another to swap", "dim", tag="span")
     kit.text(f"{len(workspace.layout.windows)} open", "count", tag="span")
+
+
+class _Menu:
+    """A dialog whose body is rebuilt each time it opens.
+
+    `ui.dialog` builds its contents once. This one lists projects and recent
+    folders, and both change *because of* what the dialog does -- create a
+    project and the list it was read from is already stale. Redrawing on open is
+    cheaper than binding every row to the poll, and it cannot go stale between
+    the click and the dialog appearing.
+    """
+
+    def __init__(self, dialog: Any, draw: Any) -> None:
+        self._dialog = dialog
+        self._draw = draw
+
+    def open(self) -> None:
+        self._draw()
+        self._dialog.open()
+
+    def close(self) -> None:
+        self._dialog.close()
+
+
+def _project_menu(ui: Any, workspace: Workspace) -> _Menu:
+    """The workspace menu: which folder, which project, and how to change both."""
+    with ui.dialog() as dialog, kit.el("div", "grad-app"):
+        body = kit.el(
+            "div", "grad-card", style="background: var(--grad-paper); min-width: 540px"
+        )
+
+    menu = _Menu(dialog, lambda: _draw_project_menu(ui, workspace, body, dialog))
+    return menu
+
+
+def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, dialog: Any) -> None:
+    model = workspace.workspaces()
+    body.clear()
+
+    def act(coro: Any, what: str) -> None:
+        """Close first, then run: `reload` redraws the shell underneath, and a
+        dialog still open over it would be showing the workspace it just left."""
+        dialog.close()
+        workspace.spawn(coro, what)
+
+    with body:
+        kit.text("WORKSPACE", "head ink")
+        with kit.el("div", "body"):
+            kit.error_strip(model.get("error"))
+            kit.kv([("folder", model["root"]), ("chosen by", model["source"])])
+
+            with kit.row("", gap=6).style("margin-top: 10px"):
+                folder = (
+                    ui.input(placeholder="path to another workspace folder")
+                    .props("borderless dense")
+                    .classes("field")
+                    .style("flex: 1 1 auto; padding: 0 8px")
+                )
+                kit.button(
+                    "BROWSE…",
+                    tone="neutral",
+                    title="pick a folder (needs the desktop window)",
+                    on_click=lambda: workspace.spawn(_browse(workspace, folder), "folder picker"),
+                )
+                kit.button(
+                    "OPEN",
+                    tone="primary",
+                    title="switch this app to that folder",
+                    on_click=lambda: act(
+                        workspace.switch_root(folder.value or "", create=True), "workspace switch"
+                    ),
+                )
+            kit.text(
+                "a folder that does not exist yet is created; the agent's tools follow it",
+                "grad-caption",
+            )
+
+            if model["recent"]:
+                kit.text("RECENT", "grad-caption").style("margin-top: 12px")
+                for path in model["recent"]:
+                    with kit.row("grad-row", gap=6):
+                        kit.button(
+                            "OPEN",
+                            tone="neutral",
+                            on_click=lambda _=None, p=path: act(
+                                workspace.switch_root(p), "workspace switch"
+                            ),
+                        )
+                        kit.text(path, "grad-caption")
+
+            # -- projects ---------------------------------------------------
+            kit.text("PROJECTS IN THIS FOLDER", "grad-caption").style("margin-top: 16px")
+            if not model["projects"]:
+                kit.text("none yet — the first one is created below", "grad-empty")
+            for project in model["projects"]:
+                with kit.row("grad-row", gap=6):
+                    kit.button(
+                        "IN USE" if project["current"] else "USE",
+                        tone="active" if project["current"] else "neutral",
+                        disabled=project["current"] or project["status"] == "closed",
+                        on_click=lambda _=None, pid=project["id"]: act(
+                            workspace.use_project(pid), "project switch"
+                        ),
+                    )
+                    kit.text(project["id"], "", style="font-weight: 700")
+                    kit.text(project["title"], "grad-caption")
+                    kit.spacer()
+                    if project["status"] == "closed":
+                        kit.chip("CLOSED", "neutral")
+                    kit.text(project["spend"], "grad-caption")
+
+            # -- a new one --------------------------------------------------
+            kit.text("NEW PROJECT", "grad-caption").style("margin-top: 16px")
+            with kit.row("", gap=6):
+                project_id = (
+                    ui.input(placeholder="id, e.g. proj-scaling-w2")
+                    .props("borderless dense")
+                    .classes("field")
+                    .style("flex: 0 0 220px; padding: 0 8px")
+                )
+                title = (
+                    ui.input(placeholder="what this research is")
+                    .props("borderless dense")
+                    .classes("field")
+                    .style("flex: 1 1 auto; padding: 0 8px")
+                )
+                kit.button(
+                    "CREATE",
+                    tone="primary",
+                    on_click=lambda: act(
+                        workspace.create_project(project_id.value or "", title.value or ""),
+                        "project create",
+                    ),
+                )
+            kit.text(
+                "created with no ceilings — set them with `tools.budget raise`",
+                "grad-caption",
+            )
+
+
+def folder_dialog_type() -> int:
+    """`dialog_type` for "pick a folder", as something that survives pickling.
+
+    Native mode runs pywebview in a **separate process** and marshals this call
+    over a `multiprocessing` queue, so every argument has to pickle. The obvious
+    constant does not: `webview.FOLDER_DIALOG` is a deprecated `proxy_tools.Proxy`
+    whose repr is `20` but whose type is a proxy around a function, and pickling
+    it fails with *"Can't pickle <function FOLDER_DIALOG>: it's not the same
+    object as webview.FOLDER_DIALOG"*.
+
+    That failure is also **uncatchable from here**: it is raised in the queue's
+    own feeder thread, so it prints a traceback and leaves the awaited call
+    hanging rather than raising where `_browse` could handle it. Sending a value
+    that pickles is the only real fix, which is why this returns a plain `int`
+    rather than the `FileDialog.FOLDER` enum member -- `create_file_dialog`
+    declares the parameter as `int` and passes it straight through, so the
+    narrowest thing that can cross a process boundary is the right one to send.
+    """
+    try:
+        import webview  # noqa: PLC0415
+
+        return int(webview.FileDialog.FOLDER)
+    except (ImportError, AttributeError):
+        # Older pywebview, where the constant existed only as the proxy above --
+        # whose value was this same 20.
+        return 20
+
+
+async def _browse(workspace: Workspace, field: Any) -> None:
+    """The native folder picker, when there is a native window to hang it on.
+
+    Only `ui.run(native=True)` has one; the documented browser fallback does
+    not, and neither does a second tab. So this fills the text field rather than
+    switching directly -- the typed path is the mechanism, and the picker is a
+    convenience on top of it that is allowed to be unavailable.
+    """
+    import logging  # noqa: PLC0415
+
+    try:
+        from nicegui import app as nicegui_app  # noqa: PLC0415
+
+        window = getattr(getattr(nicegui_app, "native", None), "main_window", None)
+        if window is None:
+            raise RuntimeError("no native window")
+        chosen = await window.create_file_dialog(dialog_type=folder_dialog_type())
+    except Exception as exc:  # noqa: BLE001 - an unavailable picker is not an error
+        logging.getLogger("grad.ui").debug("folder picker unavailable", exc_info=exc)
+        workspace.say("no folder picker here — type the path instead")
+        return
+    if chosen:
+        field.value = chosen[0] if isinstance(chosen, (list, tuple)) else str(chosen)
 
 
 def _command_palette(ui: Any, workspace: Workspace) -> Any:
@@ -328,8 +526,26 @@ def _bind_client_events(ui: Any, workspace: Workspace) -> None:
     def on_retile(event: Any) -> None:
         data = getattr(event, "args", {}) or {}
         window_id = data.get("window")
-        if isinstance(window_id, str) and window_id in registry.BY_ID:
-            workspace.retile(window_id, int(data.get("column") or 0))
+        if not isinstance(window_id, str) or window_id not in registry.BY_ID:
+            return
+        slot = data.get("slot")
+        workspace.retile(
+            window_id,
+            int(data.get("column") or 0),
+            int(slot) if isinstance(slot, (int, float)) else None,
+            new_column=bool(data.get("new_column")),
+        )
+
+    def on_swap(event: Any) -> None:
+        """Both ids are checked against the registry before either is used: this
+        arrives from the browser, and `swap` writes whatever it is handed
+        straight into a slot."""
+        data = getattr(event, "args", {}) or {}
+        a, b = data.get("a"), data.get("b")
+        if not (isinstance(a, str) and isinstance(b, str)):
+            return
+        if a in registry.BY_ID and b in registry.BY_ID:
+            workspace.swap(a, b)
 
     def on_preset(event: Any) -> None:
         data = getattr(event, "args", {}) or {}
@@ -337,5 +553,6 @@ def _bind_client_events(ui: Any, workspace: Workspace) -> None:
 
     ui.on("grad_resize", on_resize)
     ui.on("grad_retile", on_retile)
+    ui.on("grad_swap", on_swap)
     ui.on("grad_preset", on_preset)
     ui.on("grad_palette", lambda _: None)

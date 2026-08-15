@@ -27,8 +27,6 @@ from typing import Any
 from ui import katex, kit, models
 from ui.state import FLUSH_HZ
 
-MODES = ("ask", "plan", "run")
-
 
 def subtitle(workspace: Any) -> str:
     session = getattr(workspace, "session", None)
@@ -85,7 +83,6 @@ def render(workspace: Any) -> None:
 
 def _composer(ui: Any, workspace: Any, transcript: Any, tail_body: Any, streaming: Any) -> None:
     session = workspace.session
-    mode = {"value": "ask"}
 
     async def settle(text: str) -> None:
         tail_body.content = ""
@@ -104,25 +101,18 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail_body: Any, streamin
         with transcript:
             _message("user", prompt, workspace)
         workspace.set_agent_state("running")
-        # The mode is a prefix rather than a separate code path: `plan` and
-        # `run` are instructions to the agent, not to the UI, and encoding them
-        # here would put behaviour in the window (§10 says it does not live
-        # here).
-        prefixed = prompt if mode["value"] == "ask" else f"[{mode['value']}] {prompt}"
-        await session.ask(prefixed, settle)
+        # The prompt goes to the agent exactly as it was typed. There was once a
+        # mode chip here that prefixed it with `[plan]` or `[run]`, but nothing
+        # downstream ever gave those tokens a meaning -- not the system prompt,
+        # not the gates, not any CLI -- so the control promised a behaviour the
+        # system does not have. Whether to plan first is something you say in
+        # words, and the gates are what actually stop a spend.
+        await session.ask(prompt, settle)
 
     with kit.el("div", "grad-composer"):
-        with kit.row("", gap=6):
-            chips_row = kit.row("", gap=0)
-            with chips_row:
-                buttons: dict[str, Any] = {}
-                for name in MODES:
-                    buttons[name] = kit.button(
-                        name.upper(),
-                        tone="active" if name == "ask" else "neutral",
-                        on_click=lambda _=None, n=name: _set_mode(mode, buttons, n),
-                    )
-            kit.spacer()
+        # Right-aligned by the row rather than by a leading spacer: with the mode
+        # chips gone there is nothing on the left for a spacer to push against.
+        with kit.row("", gap=6).style("justify-content: flex-end"):
             kit.text("@notebook @paper @wiki", "grad-mention")
 
         with kit.row("", gap=6, align="flex-end").style("margin-top: 8px"):
@@ -141,14 +131,6 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail_body: Any, streamin
     ui.keyboard(
         on_key=lambda e: session.interrupt() if (e.key == "Escape" and e.action.keydown) else None
     )
-
-
-def _set_mode(mode: dict[str, str], buttons: dict[str, Any], name: str) -> None:
-    mode["value"] = name
-    for key, element in buttons.items():
-        element.classes(remove="active")
-        if key == name:
-            element.classes(add="active")
 
 
 # ---------------------------------------------------------------------------

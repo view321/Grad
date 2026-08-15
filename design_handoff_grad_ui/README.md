@@ -175,9 +175,12 @@ Standalone reference: `reference/Notebook Paper.dc.html`.
 - **Gate card**: 2px `#A3122F` border, solid `#A3122F` header (`GATE — YOUR CALL`), a
   sentence naming the exact cost and resource, then `✓ APPROVE` (teal), `✎ EDIT PLAN`,
   `✕ DENY` — all 2px ink borders.
-- **Composer**: mode chips (`ASK` active ink / `PLAN` / `RUN`), `@notebook @paper @wiki`
+- **Composer**: ~~mode chips (`ASK` active ink / `PLAN` / `RUN`)~~, `@notebook @paper @wiki`
   mention hint, a 2px-bordered field on `#FFFDF8` with a blinking caret, and a `SEND ⏎`
   button on `#FFD400`.
+  *Not built: the mode chips were dropped. They only prefixed the prompt with
+  `[plan]` / `[run]`, and nothing downstream — system prompt, gates, CLIs — ever
+  gave those tokens a meaning. There is one agent mode.*
 
 ### 3. Wiki + references
 
@@ -257,8 +260,12 @@ border+fill failed, dashed empty when queued. State chips: `RUNNING` teal,
 
 ## Interactions & behaviour
 
-- **Tiling**: panes resize by dragging the 8px handles; `⌥`+drag a title bar to retile;
+- **Tiling**: panes resize by dragging the 8px handles; ~~`⌥`+drag a title bar to retile~~;
   `⌥1/⌥2/⌥3` switch tile/stack/full. Persist layout per project. Minimum pane width 320px.
+  *Changed: the retile drag needs no modifier. Dragging a title bar shows a drop
+  indicator and inserts at the position it marks; dropping onto another window's
+  title bar swaps the two panes; dropping at a column's edge splits a new column,
+  up to the three-column cap.*
 - **Window opener**: clicking a name opens it into the focused pane (or splits if the pane
   already holds one); clicking an open name closes it.
 - **Notebook**: Run/Run-all/Stop/Restart map to Jupyter kernel commands. `VERIFY` runs the

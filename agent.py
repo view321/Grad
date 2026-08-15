@@ -72,6 +72,12 @@ def build_options(cfg: Any, *, permission_mode: str | None = None) -> Any:
         permission_mode=mode,
         cwd=str(paths.root()),
         hooks=hook_matchers,
+        # Off by default in the SDK, and the default is why an answer used to
+        # arrive in one lump: without it `receive_response` yields nothing until
+        # a whole `AssistantMessage` is finished. With it the same turn also
+        # emits `StreamEvent`s carrying token deltas. `TextStream` is what turns
+        # the two into one transcript -- see the warning in its docstring.
+        include_partial_messages=True,
     )
 
 
@@ -188,10 +194,13 @@ async def _turn(client: Any, prompt: str) -> bool:
         return False
 
     await client.query(prompt)
+    stream = TextStream()
     async for message in client.receive_response():
-        text = _text_of(message)
-        if text:
-            print(text, end="", flush=True)
+        # Whatever has not been printed yet -- a token as it arrives, or the
+        # tail of a message that was never streamed. Never both.
+        chunk = stream.feed(message)
+        if chunk:
+            print(chunk, end="", flush=True)
         usage = getattr(message, "usage", None)
         if usage is not None:
             quota_log.from_sdk_usage(
@@ -208,6 +217,76 @@ def _text_of(message: Any) -> str:
     if isinstance(content, list):
         return "".join(getattr(b, "text", "") or "" for b in content)
     return ""
+
+
+def _delta_of(message: Any) -> str:
+    """The visible text a partial-message stream event carries, if any.
+
+    `StreamEvent.event` is the raw Anthropic streaming event, so this is a
+    filter as much as an accessor: only `content_block_delta` carrying a
+    `text_delta` is answer text. Thinking deltas and tool-input deltas are
+    excluded deliberately, because `_text_of` excludes their finished blocks too
+    -- a `ThinkingBlock` has `.thinking`, not `.text`. Letting them through here
+    would make the stream say something the settled message does not.
+    """
+    event = getattr(message, "event", None)
+    if not isinstance(event, dict) or event.get("type") != "content_block_delta":
+        return ""
+    delta = event.get("delta")
+    if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+        return ""
+    text = delta.get("text")
+    return text if isinstance(text, str) else ""
+
+
+class TextStream:
+    """One turn's visible text, assembled from deltas *and* finished messages.
+
+    `include_partial_messages` makes the SDK emit both halves of the same text:
+    a run of `text_delta` events, and then the `AssistantMessage` that contains
+    all of it. **Appending both is the bug this class exists to prevent** -- it
+    is the obvious way to write the loop, and it makes every answer appear
+    twice.
+
+    So a finished message *replaces* the deltas that built it rather than
+    following them. That ordering also makes the finished message authoritative:
+    if the two ever disagree -- a dropped event, a turn resumed from cache, a
+    message the SDK never streamed -- what stays on screen is the message, not
+    the reconstruction. A turn is many messages, so this repeats per message,
+    which is why `_streamed` is reset each time rather than once at the end.
+
+    `feed` returns only the text that has not been shown yet, so a CLI can print
+    its return value directly; `text` is the whole answer so far, for a UI that
+    re-renders from it.
+    """
+
+    def __init__(self) -> None:
+        self.text = ""
+        #: The tail of `text` contributed by deltas since the last finished
+        #: message -- the part a finished message is entitled to overwrite.
+        self._streamed = ""
+
+    def feed(self, message: Any) -> str:
+        delta = _delta_of(message)
+        if delta:
+            self.text += delta
+            self._streamed += delta
+            return delta
+
+        text = _text_of(message)
+        # A message with no text at all -- a tool result, a system message, the
+        # final result -- must leave a half-streamed block alone.
+        if not text:
+            return ""
+
+        if text.startswith(self._streamed):
+            unseen = text[len(self._streamed) :]
+            self.text += unseen
+        else:
+            self.text = self.text[: len(self.text) - len(self._streamed)] + text
+            unseen = ""
+        self._streamed = ""
+        return unseen
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +357,12 @@ def main() -> None:
     parser.add_argument("--once", action="store_true", help="exit after the first response")
     parser.add_argument("--probe", action="store_true", help="run the §9 permission deny probe and exit")
     parser.add_argument("--ui", action="store_true", help="launch the NiceGUI desktop app instead")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="port for --ui; move it when something else already holds 8080",
+    )
     parser.add_argument("--check", action="store_true", help="report environment and auth posture, then exit")
     args = parser.parse_args()
 
@@ -289,7 +374,10 @@ def main() -> None:
     if args.ui:
         from ui.app import run as run_ui  # noqa: PLC0415
 
-        run_ui()
+        # A non-default port also moves the app's origin, and the embedded Lab
+        # scopes its `frame-ancestors` to that origin -- so `tools.lab` needs
+        # `--ui-origin http://127.0.0.1:<port>` to match, or the iframe is blocked.
+        run_ui(port=args.port)
         return
 
     prompt = " ".join(args.prompt) if args.prompt else None

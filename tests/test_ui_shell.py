@@ -276,6 +276,36 @@ def test_the_chat_transcript_survives_a_retile(rendered):
     assert [e.id for e in still] == [identity]
 
 
+def test_a_swap_moves_the_windows_and_keeps_both_roots(rendered):
+    """A swap retiles, so it goes through the same teardown as a drag -- and the
+    set of live windows does not change, so every root has to come back out of
+    the attic. If it did not, dropping the ledger onto the chat would swap the
+    panes and wipe the transcript in the same gesture."""
+    client, space = rendered(["chat", "ledger"])
+    bodies_before = {
+        e.id for e in client.elements.values() if "grad-body" in getattr(e, "classes", [])
+    }
+    assert [c.windows for c in space.layout.columns] == [["chat"], ["ledger"]]
+
+    space.swap("chat", "ledger")
+
+    assert [c.windows for c in space.layout.columns] == [["ledger"], ["chat"]]
+    bodies_after = {
+        e.id for e in client.elements.values() if "grad-body" in getattr(e, "classes", [])
+    }
+    assert bodies_before == bodies_after, "a swap rebuilt a window root"
+
+
+def test_a_drop_at_a_slot_boundary_reorders_within_the_column(rendered):
+    client, space = rendered(["chat", "ledger", "quota"])
+    space.preset("stack")
+    assert space.layout.columns[0].windows == ["chat", "ledger", "quota"]
+    space.retile("quota", 0, 0)
+    assert space.layout.columns[0].windows == ["quota", "chat", "ledger"]
+    windows = [e for e in client.elements.values() if "grad-window" in getattr(e, "classes", [])]
+    assert len(windows) == 3
+
+
 def test_closing_a_window_destroys_its_root(rendered):
     """Otherwise the attic accumulates a detached subtree per window per
     session, each one still bound to the poll."""
@@ -291,6 +321,108 @@ def test_reopening_a_closed_window_builds_a_fresh_root(rendered):
     space.close("ledger")
     space.open("ledger")
     assert "ledger" in _root_ids(client)
+
+
+# ---------------------------------------------------------------------------
+# switching project and folder
+# ---------------------------------------------------------------------------
+def test_the_project_menu_lists_the_folder_and_its_projects(rendered):
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-a", title="Scaling laws", budget={})
+    budget_mod.set_current("proj-a")
+    client, space = rendered(["chat"])
+
+    from ui import shell as shell_mod
+
+    menu = [e for e in client.elements.values() if "grad-card" in getattr(e, "classes", [])]
+    assert menu, "the menu dialog was not built"
+    # Drawn on open, not at build time: creating a project makes the list it was
+    # read from stale, so it is rebuilt each time.
+    with client:
+        shell_mod._draw_project_menu(  # noqa: SLF001 - no public hook
+            __import__("nicegui").ui, space, menu[0], _NullDialog()
+        )
+    markup = html_of(client)
+    assert "proj-a" in markup
+    assert "Scaling laws" in markup
+    assert "WORKSPACE" in markup
+
+
+class _NullDialog:
+    def close(self) -> None:
+        pass
+
+
+def test_the_folder_picker_argument_survives_a_process_boundary():
+    """Native mode marshals `create_file_dialog` to the pywebview process over a
+    multiprocessing queue, so its arguments have to pickle.
+
+    `webview.FOLDER_DIALOG` does not: it is a deprecated `proxy_tools.Proxy`
+    that reprs as `20` while being a proxy around a function, and it fails with
+    "it's not the same object as webview.FOLDER_DIALOG". Worse, the error is
+    raised in the queue's feeder thread, so it prints a traceback and hangs the
+    picker instead of raising anywhere it could be caught -- which is why this
+    is asserted here rather than left to a try/except at the call site.
+    """
+    import pickle
+
+    from ui import shell as shell_mod
+
+    value = shell_mod.folder_dialog_type()
+    assert type(value) is int, f"a plain int, not {type(value).__name__}"
+    assert pickle.loads(pickle.dumps(value)) == value
+
+    webview = pytest.importorskip("webview", reason="pywebview is not installed")
+    # Still the value pywebview means by "folder", however it spells it now.
+    assert value == int(webview.FileDialog.FOLDER)
+
+
+def test_switching_project_reloads_the_layout_for_that_project(rendered):
+    """Layout persists per project, so the panes have to follow the switch --
+    otherwise the new project opens with the old one's arrangement and silently
+    overwrites its layout file on the next drag."""
+    from core import budget as budget_mod
+    from ui import state as state_module
+
+    budget_mod.create("proj-a", title="A", budget={})
+    budget_mod.create("proj-b", title="B", budget={})
+    budget_mod.set_current("proj-a")
+
+    client, space = rendered(["chat", "ledger"])
+    space.project = "proj-a"
+    space.preset("stack")
+    stacked = [c.windows for c in space.layout.columns]
+
+    # proj-b has never been opened, so it gets the default arrangement.
+    budget_mod.set_current("proj-b")
+    space.reload()
+    assert space.project == "proj-b"
+    assert [c.windows for c in space.layout.columns] != stacked
+    assert state_module.layout_path("proj-b").name == "proj-b.json"
+
+
+def test_a_reload_redraws_the_windows_rather_than_leaving_them_stale(rendered):
+    """A retile reuses live roots -- that is what stops a drag wiping the
+    transcript -- so a reload has to redraw the bodies explicitly or the panes
+    would be rearranged for the new workspace while still showing the old one."""
+    from core import ledger_store as ls
+
+    client, space = rendered(["ledger"])
+    ls.append_expectation(
+        {"id": "exp-1", "task": "t", "created_at": ls.now_iso(), "quantity": "val_loss",
+         "claim": "a claim from the first workspace",
+         "predicted": {"low": 1.0, "high": 2.0, "direction": None},
+         "basis": [], "comparability": "same", "confidence": "low"}
+    )
+    space.tick()
+    assert "a claim from the first workspace" in html_of(client)
+
+    space.reload()
+    # Same workspace here, so the claim is still true -- what is being checked
+    # is that the body was re-rendered at all, not that it changed.
+    assert "a claim from the first workspace" in html_of(client)
+    assert space.models == {} or "ledger" in space.models
 
 
 # ---------------------------------------------------------------------------

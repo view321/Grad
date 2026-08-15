@@ -42,6 +42,21 @@ reports/**/*.out
 reports/**/*.fdb_latexmk
 reports/**/claims.tex
 
+# Which folder this checkout's app was last pointed at (core/workspace.py). It
+# sits beside the code rather than in data/ precisely so it survives switching
+# away from a workspace -- which also means it is one machine's choice, not the
+# repository's.
+.grad-workspace.json
+
+# Per-machine UI state. `ui_storage_secret` signs the browser-id cookie each
+# client's transcript is keyed by, so it is a credential in everything but name;
+# the session files are the conversations themselves, and the layouts and kernel
+# pid are one machine's, not the repository's.
+data/ui_storage_secret
+data/ui_session-*.jsonl
+data/layouts/
+data/kernel/
+
 # Credentials never live in the workspace (HANDOFF §9). This is belt and braces.
 .env
 *.pem

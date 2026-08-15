@@ -214,11 +214,34 @@ class Layout:
     def toggle(self, window: str) -> Layout:
         return self.close(window) if self.is_open(window) else self.open(window)
 
-    def move(self, window: str, column_index: int, slot_index: int | None = None) -> Layout:
-        """Retile: pull a window out and drop it into another column.
+    def move(
+        self,
+        window: str,
+        column_index: int,
+        slot_index: int | None = None,
+        *,
+        new_column: bool = False,
+    ) -> Layout:
+        """Retile: pull a window out and drop it at a named position.
 
-        `column_index == len(columns)` appends a new column, which is what a
-        drag past the right edge means.
+        `slot_index` is where in the target column it lands -- `None` appends,
+        which is what a drop with no vertical opinion means. `new_column` splits
+        a fresh column in at `column_index` rather than adding to the one already
+        there; `column_index == len(columns)` means the same thing at the right
+        edge, which is where a drag past the last pane ends up.
+
+        Two corrections that are invisible until they are wrong:
+
+        * **The cap is counted after the pull, not before.** Dragging the only
+          window out of a column empties it, and an empty column is dropped by
+          `normalise` -- so that drag can create a column without ever exceeding
+          `MAX_COLUMNS`. Counting the columns that still hold something is what
+          lets the gesture through while still refusing a genuine fourth.
+        * **Moving down inside one column shifts its own target.** The browser
+          computes `slot_index` against a column that still contains the dragged
+          window; by the time we insert, the pull has shifted everything after it
+          left by one. Without the adjustment, dragging a pane one place down
+          moves it two.
         """
         found = self.locate(window)
         if not found:
@@ -226,14 +249,54 @@ class Layout:
         ci, si = found
         slot = self.columns[ci].slots.pop(si)
         slot.fraction = 1.0
+
         column_index = max(0, min(column_index, len(self.columns)))
-        if column_index == len(self.columns):
-            self.columns.append(Column([slot]))
+        wants_column = new_column or column_index == len(self.columns)
+        # Columns that still hold a window -- see the docstring.
+        live = sum(1 for c in self.columns if c.slots)
+
+        if wants_column and live < MAX_COLUMNS:
+            self.columns.insert(column_index, Column([slot]))
         else:
-            target = self.columns[column_index].slots
-            index = len(target) if slot_index is None else max(0, min(slot_index, len(target)))
-            target.insert(index, slot)
+            # At the cap (or asked for a column we cannot make), the drop lands
+            # in the nearest real column rather than being refused: a gesture
+            # that visibly picked a pane up has to put it down somewhere.
+            if not self.columns:
+                self.columns = [Column([slot])]
+            else:
+                column_index = min(column_index, len(self.columns) - 1)
+                target = self.columns[column_index].slots
+                # Clamped against the column as the *browser* saw it -- one
+                # longer when the window came from this same column, because it
+                # was still in it when the boundary was picked. Clamping to the
+                # shortened list first and then correcting for the pull applies
+                # the same subtraction twice, and a drop past the last pane
+                # lands second-to-last.
+                limit = len(target) + (1 if ci == column_index else 0)
+                index = limit if slot_index is None else max(0, min(slot_index, limit))
+                if ci == column_index and si < index:
+                    index -= 1
+                target.insert(index, slot)
         self.focused = window
+        return self.normalise()
+
+    def swap(self, a: str, b: str) -> Layout:
+        """Exchange two windows, leaving the panes where they are.
+
+        The slots keep their fractions and the windows trade places, rather than
+        each window carrying its size across with it. Dropping the ledger onto
+        the chat should put the ledger where the chat was, at the chat's size --
+        not reflow the whole shell around a pane that just arrived.
+        """
+        if a == b:
+            return self
+        first, second = self.locate(a), self.locate(b)
+        if not first or not second:
+            return self
+        (ac, as_), (bc, bs) = first, second
+        self.columns[ac].slots[as_].window = b
+        self.columns[bc].slots[bs].window = a
+        self.focused = a
         return self.normalise()
 
     def resize_columns(self, fractions: Iterable[float], *, total_px: int | None = None) -> Layout:

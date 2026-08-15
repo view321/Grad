@@ -98,6 +98,17 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
 }
 
 
+def current_project() -> str | None:
+    """The selected project, or None. Never raises: an unreadable project file
+    means an unnamed workspace, not an app that will not open."""
+    from core import budget as budget_mod  # noqa: PLC0415
+
+    try:
+        return budget_mod.current_project()
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+
+
 def _fingerprint(value: Any) -> str:
     """Cheap change detection. Sorted keys so dict order cannot fake a change."""
     try:
@@ -212,8 +223,14 @@ class Workspace:
             return
         self._after_layout_change()
 
-    def retile(self, window_id: str, column: int) -> None:
-        self.layout.move(window_id, column)
+    def retile(
+        self, window_id: str, column: int, slot: int | None = None, *, new_column: bool = False
+    ) -> None:
+        self.layout.move(window_id, column, slot, new_column=new_column)
+        self._after_layout_change()
+
+    def swap(self, a: str, b: str) -> None:
+        self.layout.swap(a, b)
         self._after_layout_change()
 
     def resize(self, axis: str, fractions: list[float], *, column: int | None = None, total_px: int | None = None) -> None:
@@ -233,6 +250,85 @@ class Workspace:
             _guard(self._retile, "retile")
         for redraw in self._chrome:
             _guard(redraw, "chrome")
+
+    # -- the workspace itself -----------------------------------------------
+    def reload(self) -> None:
+        """Re-read everything derived from the root or the current project.
+
+        Both a folder switch and a project switch land here, because the same
+        things are stale either way: the layout is stored per project *under*
+        the root, and every window's model is a read of a file beneath it.
+
+        The windows are redrawn explicitly rather than left to the poll. A
+        retile reuses live roots -- that is what keeps a drag from wiping the
+        transcript -- so without this the panes would be rearranged for the new
+        workspace while still showing the old one's contents until something
+        happened to change a fingerprint.
+        """
+        self.project = current_project()
+        self.layout = load_layout(self.project)
+        self.models.clear()
+        self._fingerprints.clear()
+        self.selection.clear()
+        self.agent_state = "idle"
+        self.step = None
+        if self._retile is not None:
+            _guard(self._retile, "retile")
+        # A copy: `retile` unbinds windows the new layout does not have.
+        for window_id, redraw in list(self._redraw.items()):
+            _guard(redraw, window_id)
+        for redraw in self._chrome:
+            _guard(redraw, "chrome")
+
+    async def switch_root(self, folder: str, *, create: bool = False) -> None:
+        """Point the whole app at another workspace folder.
+
+        Three things have to move together, and missing any one of them leaves
+        the app half-switched in a way that is hard to see:
+
+        * **the paths**, via `GRAD_ROOT` -- which also carries to every CLI the
+          UI and the agent shell out to, since they inherit this environment;
+        * **the config cache**, because `config/grad.toml` moved with the root;
+        * **the session**, because its transcript file is derived from the root
+          and its SDK client's working directory was fixed when it was built.
+          A session left alone would keep the old workspace's conversation on
+          screen and keep running the agent's tools in the old directory.
+        """
+        from core import config as config_mod, workspace as workspace_mod  # noqa: PLC0415
+
+        try:
+            chosen = workspace_mod.select(folder, create=create)
+        except Exception as exc:  # noqa: BLE001 - a bad path is a message, not a crash
+            log.debug("workspace switch refused", exc_info=exc)
+            self.say(getattr(exc, "message", None) or str(exc))
+            return
+
+        paths.ensure_workspace()
+        config_mod._cache.clear()  # noqa: SLF001 - the config path moved with the root
+        rebind = getattr(self.session, "rebind", None)
+        if rebind is not None:
+            await rebind()
+        self.reload()
+        self.say(f"workspace: {chosen}")
+
+    async def create_project(self, project_id: str, title: str) -> None:
+        """Create a project and select it, by running the same command the agent
+        would (§10) -- so it lands in the same ledger and reads back the same."""
+        payload = await run_tool(
+            "tools.budget", "new", "--id", project_id, "--title", title, "--use", "--json"
+        )
+        self.say(envelope_message(payload))
+        if payload.get("ok"):
+            self.reload()
+
+    async def use_project(self, project_id: str) -> None:
+        payload = await run_tool("tools.budget", "use", project_id, "--json")
+        self.say(envelope_message(payload))
+        if payload.get("ok"):
+            self.reload()
+
+    def workspaces(self) -> dict[str, Any]:
+        return models.workspaces_model()
 
     # -- selections ---------------------------------------------------------
     def select(self, key: str, value: Any, *, window: str | None = None) -> None:

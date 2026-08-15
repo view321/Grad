@@ -12,9 +12,12 @@ Two properties this module is responsible for:
   * readers tolerate a torn final line, because a reader may open the file
     between a partial write and its flush.
 
-`portalocker` is used when installed; otherwise we fall back to `msvcrt` on
-Windows and `fcntl` elsewhere. The fallback is real, not decorative -- the
-ledger must not depend on an optional package to stay uncorrupted.
+Windows locks by hand, POSIX through `portalocker` when it is installed and
+`fcntl` when it is not. The reason that split is not a preference is spelled out
+above `_lock`; the short version is that a Windows lock denies reads, so it has
+to be taken somewhere other than over the data. The `fcntl` fallback is real,
+not decorative -- the ledger must not depend on an optional package to stay
+uncorrupted.
 """
 
 from __future__ import annotations
@@ -50,48 +53,62 @@ def _thread_lock(path: Path) -> threading.Lock:
         return lock
 
 
-try:  # pragma: no cover - exercised by whichever branch the machine has
-    import portalocker
+# Which backend locks which platform is decided by one asymmetry: **Windows
+# byte-range locks are mandatory and POSIX ones are advisory.** A locked region
+# on Windows denies reads as well as writes, to every handle including another
+# one in this process; `fcntl.flock` denies nothing and only excludes other
+# lockers. So on Windows *where* the lock is taken is load-bearing, and on POSIX
+# it is not.
+#
+# On Windows all writers therefore contend on one fixed sentinel byte positioned
+# far past any real ledger, never over the data. A lock over live data would make
+# concurrent readers -- and a `precondition` that consults the file it is being
+# appended to -- fail with PermissionError.
+#
+# `portalocker` cannot express that, which is why it is not used here: its
+# `MsvcrtLocker` normalises the file position to 0 and locks 64 KiB from there,
+# which is exactly over the data. Preferring it on Windows is what made
+# `campaign.request_halt` and `ledger_store`'s uniqueness check fail against
+# their own ledgers, and it denied the UI's two-second poll for the length of
+# every append.
+if os.name == "nt":  # pragma: no cover - one branch per platform
+    import msvcrt
 
+    # msvcrt locks a byte range at the *current file position*, and a handle
+    # opened in append mode starts at EOF -- so left alone, every writer would
+    # lock a different byte as the file grows and none would exclude any other.
+    # The position is set with os.lseek on the descriptor, which is what
+    # msvcrt.locking reads; O_APPEND still sends every write to EOF.
     def _lock(fh) -> None:
-        portalocker.lock(fh, portalocker.LOCK_EX)
-
-    def _unlock(fh) -> None:
-        portalocker.unlock(fh)
-
-except ImportError:  # pragma: no cover
-    if os.name == "nt":
-        import msvcrt
-
-        # msvcrt locks a byte range at the *current file position*, and a handle
-        # opened in append mode starts at EOF -- so left alone, every writer
-        # locks a different byte as the file grows and none excludes any other.
-        # All writers therefore contend on one fixed sentinel byte, positioned
-        # far past any real ledger: a Windows lock denies reads as well as
-        # writes, so a lock over live data would make readers (and a
-        # precondition that consults the file) fail with PermissionError.
-        # The position is set with os.lseek on the descriptor, which is what
-        # msvcrt.locking reads; O_APPEND still sends every write to EOF.
-        def _lock(fh) -> None:
-            deadline = time.monotonic() + _LOCK_TIMEOUT_S
-            while True:
-                try:
-                    os.lseek(fh.fileno(), _LOCK_OFFSET, os.SEEK_SET)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    return
-                except OSError:
-                    if time.monotonic() > deadline:
-                        raise
-                    time.sleep(_LOCK_POLL_S)
-
-        def _unlock(fh) -> None:
+        deadline = time.monotonic() + _LOCK_TIMEOUT_S
+        while True:
             try:
                 os.lseek(fh.fileno(), _LOCK_OFFSET, os.SEEK_SET)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
             except OSError:
-                pass
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(_LOCK_POLL_S)
 
-    else:
+    def _unlock(fh) -> None:
+        try:
+            os.lseek(fh.fileno(), _LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
+else:  # pragma: no cover - one branch per platform
+    try:
+        import portalocker
+
+        def _lock(fh) -> None:
+            portalocker.lock(fh, portalocker.LOCK_EX)
+
+        def _unlock(fh) -> None:
+            portalocker.unlock(fh)
+
+    except ImportError:
         import fcntl
 
         def _lock(fh) -> None:

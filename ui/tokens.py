@@ -160,7 +160,21 @@ def _base() -> str:
 
 .grad-app, .grad-app * { box-sizing: border-box; border-radius: 0; }
 body { margin: 0; background: var(--grad-desk); }
+
+/* The page itself must never scroll: the shell is already sized to fill the
+   window exactly (`100vh` less its 14px margins), so any scrollbar here means
+   a wrapper is adding space the layout did not budget for. NiceGUI's
+   `.nicegui-content` adds it twice over -- `padding: 16px` made the document
+   32px taller than the window, and `align-items: flex-start` on the same
+   flex wrapper let `.grad-app` size to its widest pane's max-content rather
+   than to the window, which is what pushed the tiling area ~200px off the
+   right edge. `align-self` answers the second; the width and height pin the
+   app to the viewport so the shell's own arithmetic is the only thing
+   deciding its size. */
+html, body { height: 100%; overflow: hidden; }
+.nicegui-content { padding: 0 !important; gap: 0 !important; width: 100%; }
 .grad-app {
+    width: 100%; height: 100vh; align-self: stretch; overflow: hidden;
     background: var(--grad-desk);
     color: var(--grad-ink);
     font-family: var(--grad-font-sans);
@@ -259,7 +273,14 @@ def _tiling() -> str:
     back at the end of a gesture.
     """
     return """
-.grad-tiles { display: flex; flex: 1 1 auto; min-height: 0; align-items: stretch; }
+/* The one place left that may scroll, and only under duress: three columns
+   hold a `--grad-min-pane` floor each, so under about 1000px of window there
+   is genuinely not enough room for them. Clipping would put a pane out of
+   reach, so the tiling area scrolls sideways instead -- the chrome above and
+   below it stays put. Safe for the Lab overlay because `tiling.js` reflows
+   the flown iframes on capture-phase scroll, not just on resize. */
+.grad-tiles { display: flex; flex: 1 1 auto; min-height: 0; align-items: stretch;
+              overflow-x: auto; overflow-y: hidden; }
 .grad-column {
     display: flex; flex-direction: column; min-width: var(--grad-min-pane);
     flex: var(--grad-fraction, 1) 1 0; min-height: 0;
@@ -286,7 +307,7 @@ def _tiling() -> str:
     display: flex; align-items: center; gap: 10px; padding: 0 10px;
     height: var(--grad-titlebar); flex: 0 0 var(--grad-titlebar);
     background: var(--grad-paper-sunk); border-bottom: var(--grad-border);
-    cursor: default; user-select: none;
+    cursor: grab; user-select: none;
 }
 .grad-titlebar .name {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
@@ -307,6 +328,39 @@ def _tiling() -> str:
    reload JupyterLab -- kernel and all -- on every retile. */
 .grad-iframe-host { position: absolute; border: 0; background: #fff; z-index: 5; }
 .grad-iframe-anchor { flex: 1 1 auto; min-height: 0; }
+
+/* Dragging a title bar to retile. Three pieces of feedback, and none of them
+   animates: the design's "no easing curves, no fades" applies to a gesture the
+   pointer is already driving at frame rate.
+
+   The ghost and the indicator sit above the flown Lab iframe (z-index 5) and
+   are `pointer-events: none`, which is load-bearing rather than tidy --
+   `tiling.js` hit-tests with `elementFromPoint`, and an indicator that could be
+   hit would answer every query with itself. */
+.grad-drop-indicator {
+    position: fixed; z-index: 40; pointer-events: none;
+    background: var(--grad-attention); outline: 1px solid var(--grad-ink);
+}
+.grad-drag-ghost {
+    position: fixed; z-index: 41; pointer-events: none;
+    background: var(--grad-ink); color: var(--grad-paper);
+    font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.14em; padding: 3px 8px;
+}
+/* The pane being dragged stays exactly where it is until the drop lands: the
+   layout is the server's, and moving it here would show an arrangement that
+   does not exist yet. It is marked, not moved. */
+.grad-window .grad-titlebar.grad-drag-source {
+    outline: 2px dashed var(--grad-ink); outline-offset: -2px; opacity: 0.6;
+}
+.grad-window .grad-titlebar.grad-swap-target {
+    background: var(--grad-attention); color: var(--grad-ink);
+}
+.grad-window .grad-titlebar.grad-swap-target .grad-winctl { color: var(--grad-ink); }
+body.grad-dragging { cursor: grabbing; }
+/* Text selection and iframe hit-testing both eat a drag that crosses a pane. */
+body.grad-dragging * { user-select: none !important; }
+body.grad-dragging .grad-iframe-host { pointer-events: none; }
 """
 
 

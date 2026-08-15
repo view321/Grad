@@ -254,3 +254,140 @@ def test_envelope_message_prefers_the_fix():
     )
     assert "gate refused" in message
     assert "run preflight" in message
+
+
+# ---------------------------------------------------------------------------
+# switching the workspace folder
+# ---------------------------------------------------------------------------
+class RebindableSession(FakeSession):
+    """A session that records the two things a folder switch must do to it."""
+
+    def __init__(self) -> None:
+        self.settled = [{"role": "user", "text": "from the old workspace"}]
+        self.rebound = 0
+
+    async def rebind(self) -> None:
+        self.rebound += 1
+        self.settled.clear()
+
+
+@pytest.fixture
+def pointer(tmp_path, monkeypatch):
+    """Redirect the pointer file. The real one lives beside the code, and a test
+    that wrote it would rewrite the developer's own workspace choice."""
+    from core import workspace as workspace_mod
+
+    monkeypatch.setattr(
+        workspace_mod, "pointer_path", lambda: tmp_path / "pointer" / "p.json"
+    )
+    (tmp_path / "pointer").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(workspace_mod, "_cache", None, raising=False)
+    yield
+    workspace_mod._cache = None
+
+
+@pytest.mark.asyncio
+async def test_switching_folder_moves_the_paths_the_config_and_the_session(
+    workspace, tmp_path, pointer
+):
+    """The three things that have to move together. Missing any one leaves the
+    app half-switched in a way that is hard to see from the screen."""
+    from core import config as config_mod, paths
+
+    elsewhere = tmp_path / "another-workspace"
+    space = state_mod.Workspace(RebindableSession(), "proj")
+    config_mod.load()  # populate the cache the switch has to clear
+
+    await space.switch_root(str(elsewhere), create=True)
+
+    assert paths.root() == elsewhere.resolve()          # the paths
+    assert not config_mod._cache                        # the config, which moved with them
+    assert space.session.rebound == 1                   # the session and its agent cwd
+    assert space.session.settled == []
+    # The new folder is a workspace, not just a directory.
+    assert paths.ledger_dir().is_dir()
+    assert str(elsewhere.resolve()) in (space.notice or "")
+
+
+@pytest.mark.asyncio
+async def test_switching_folder_reloads_the_project_and_its_layout(workspace, tmp_path, pointer):
+    from core import budget as budget_mod, paths
+
+    space = state_mod.Workspace(RebindableSession(), None)
+    space.preset("stack")
+    stacked = [c.windows for c in space.layout.columns]
+
+    elsewhere = tmp_path / "another-workspace"
+    await space.switch_root(str(elsewhere), create=True)
+
+    # A fresh folder has no project selected and no saved layout, so both come
+    # back to their defaults rather than carrying over from the old workspace.
+    assert budget_mod.current_project() is None
+    assert space.project is None
+    assert [c.windows for c in space.layout.columns] != stacked
+    assert state_mod.layout_dir() == paths.data_dir() / "layouts"
+
+
+@pytest.mark.asyncio
+async def test_a_folder_that_cannot_be_used_is_a_notice_not_a_crash(workspace, tmp_path, pointer):
+    """The path comes from a text field, so a bad one is an everyday event. The
+    app must stay where it is and say why."""
+    from core import paths
+
+    before = paths.root()
+    space = state_mod.Workspace(RebindableSession(), "proj")
+
+    a_file = tmp_path / "notes.txt"
+    a_file.write_text("hi", encoding="utf-8")
+    await space.switch_root(str(a_file))
+
+    assert paths.root() == before
+    assert space.session.rebound == 0        # nothing was torn down
+    assert "not a folder" in (space.notice or "")
+
+
+@pytest.mark.asyncio
+async def test_a_blank_folder_does_not_move_the_workspace(workspace, pointer):
+    from core import paths
+
+    before = paths.root()
+    space = state_mod.Workspace(RebindableSession(), "proj")
+    await space.switch_root("   ")
+    assert paths.root() == before
+    assert space.notice
+
+
+@pytest.mark.asyncio
+async def test_creating_a_project_selects_it_and_reloads(workspace, pointer):
+    """Through the CLI, like every other button that does something -- so it
+    lands in the same ledger the agent's own `tools.budget new` would write."""
+    from core import budget as budget_mod
+
+    space = state_mod.Workspace(RebindableSession(), None)
+    await space.create_project("proj-new", "A new piece of research")
+
+    assert budget_mod.current_project() == "proj-new"
+    assert budget_mod.projects()["proj-new"]["title"] == "A new piece of research"
+    assert space.project == "proj-new"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_project_id_reports_the_clis_own_message(workspace, pointer):
+    space = state_mod.Workspace(RebindableSession(), None)
+    await space.create_project("not a valid slug!", "whatever")
+    assert space.notice and "slug" in space.notice.lower()
+    assert space.project is None
+
+
+@pytest.mark.asyncio
+async def test_using_a_project_switches_the_selection(workspace, pointer):
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-a", title="A", budget={})
+    budget_mod.create("proj-b", title="B", budget={})
+    budget_mod.set_current("proj-a")
+
+    space = state_mod.Workspace(RebindableSession(), "proj-a")
+    await space.use_project("proj-b")
+    assert budget_mod.current_project() == "proj-b"
+    assert space.project == "proj-b"
