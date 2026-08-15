@@ -160,7 +160,21 @@ def _base() -> str:
 
 .grad-app, .grad-app * { box-sizing: border-box; border-radius: 0; }
 body { margin: 0; background: var(--grad-desk); }
+
+/* The page itself must never scroll: the shell is already sized to fill the
+   window exactly (`100vh` less its 14px margins), so any scrollbar here means
+   a wrapper is adding space the layout did not budget for. NiceGUI's
+   `.nicegui-content` adds it twice over -- `padding: 16px` made the document
+   32px taller than the window, and `align-items: flex-start` on the same
+   flex wrapper let `.grad-app` size to its widest pane's max-content rather
+   than to the window, which is what pushed the tiling area ~200px off the
+   right edge. `align-self` answers the second; the width and height pin the
+   app to the viewport so the shell's own arithmetic is the only thing
+   deciding its size. */
+html, body { height: 100%; overflow: hidden; }
+.nicegui-content { padding: 0 !important; gap: 0 !important; width: 100%; }
 .grad-app {
+    width: 100%; height: 100vh; align-self: stretch; overflow: hidden;
     background: var(--grad-desk);
     color: var(--grad-ink);
     font-family: var(--grad-font-sans);
@@ -220,22 +234,34 @@ def _shell() -> str:
 }
 .grad-appbar-btn:hover { background: var(--grad-paper); color: var(--grad-ink); }
 
-.grad-opener {
-    display: flex; align-items: stretch; background: var(--grad-paper-sunk);
-    border-bottom: var(--grad-border); font-family: var(--grad-font-mono);
-    font-size: 11px; font-weight: 700; letter-spacing: 0.08em; flex: 0 0 auto;
-    overflow-x: auto;
+/* The `⋯` button carries a menu, so it gets the caret's job: a little wider
+   than a word button, and legible as a target rather than as punctuation. */
+.grad-dots { font-size: 15px; line-height: 1; padding: 1px 9px 4px; letter-spacing: 0.1em; }
+
+/* One row of the `⋯` menu: a mark, a name, and what the window is for. Rows are
+   buttons so the keyboard reaches them, which means resetting the four
+   properties a `<button>` brings with it. */
+.grad-menu-row {
+    display: flex; align-items: baseline; gap: 9px; width: 100%;
+    padding: 6px 8px; cursor: pointer; text-align: left;
+    background: transparent; color: var(--grad-ink); border: 0;
+    font: inherit; font-family: var(--grad-font-mono); font-size: 12px;
 }
-.grad-opener-cell {
-    padding: 7px 11px; border-right: 1px solid var(--grad-rule-mid);
-    cursor: pointer; white-space: nowrap; text-transform: uppercase;
-    background: transparent; color: var(--grad-ink); border-top: 0; border-bottom: 0;
-    border-left: 0; font: inherit; letter-spacing: inherit;
+.grad-menu-row:hover { background: var(--grad-paper-sunk); }
+.grad-menu-row .mark { flex: 0 0 22px; opacity: 0.55; }
+.grad-menu-row .name {
+    flex: 0 0 96px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em;
 }
-.grad-opener-cell:hover { background: var(--grad-paper); }
-.grad-opener-cell.open { background: var(--grad-ink); color: var(--grad-paper); }
-.grad-opener-cell.open:hover { background: var(--grad-broken); color: #fff; }
-.grad-opener-hint { padding: 7px 11px; opacity: 0.45; white-space: nowrap; }
+.grad-menu-row .hint {
+    flex: 1 1 auto; min-width: 0; opacity: 0.55;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+/* Open is the state worth reading off the list at a glance, so it is the one
+   that gets ink -- the mark alone is too quiet at eleven rows. */
+.grad-menu-row.open { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-menu-row.open .mark, .grad-menu-row.open .hint { opacity: 0.7; }
+.grad-menu-row.open:hover { background: var(--grad-broken); color: #fff; }
 
 .grad-statusbar {
     display: flex; align-items: center; gap: 14px; padding: 0 12px;
@@ -259,7 +285,14 @@ def _tiling() -> str:
     back at the end of a gesture.
     """
     return """
-.grad-tiles { display: flex; flex: 1 1 auto; min-height: 0; align-items: stretch; }
+/* The one place left that may scroll, and only under duress: three columns
+   hold a `--grad-min-pane` floor each, so under about 1000px of window there
+   is genuinely not enough room for them. Clipping would put a pane out of
+   reach, so the tiling area scrolls sideways instead -- the chrome above and
+   below it stays put. Safe for the Lab overlay because `tiling.js` reflows
+   the flown iframes on capture-phase scroll, not just on resize. */
+.grad-tiles { display: flex; flex: 1 1 auto; min-height: 0; align-items: stretch;
+              overflow-x: auto; overflow-y: hidden; }
 .grad-column {
     display: flex; flex-direction: column; min-width: var(--grad-min-pane);
     flex: var(--grad-fraction, 1) 1 0; min-height: 0;
@@ -286,7 +319,7 @@ def _tiling() -> str:
     display: flex; align-items: center; gap: 10px; padding: 0 10px;
     height: var(--grad-titlebar); flex: 0 0 var(--grad-titlebar);
     background: var(--grad-paper-sunk); border-bottom: var(--grad-border);
-    cursor: default; user-select: none;
+    cursor: grab; user-select: none;
 }
 .grad-titlebar .name {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
@@ -307,6 +340,39 @@ def _tiling() -> str:
    reload JupyterLab -- kernel and all -- on every retile. */
 .grad-iframe-host { position: absolute; border: 0; background: #fff; z-index: 5; }
 .grad-iframe-anchor { flex: 1 1 auto; min-height: 0; }
+
+/* Dragging a title bar to retile. Three pieces of feedback, and none of them
+   animates: the design's "no easing curves, no fades" applies to a gesture the
+   pointer is already driving at frame rate.
+
+   The ghost and the indicator sit above the flown Lab iframe (z-index 5) and
+   are `pointer-events: none`, which is load-bearing rather than tidy --
+   `tiling.js` hit-tests with `elementFromPoint`, and an indicator that could be
+   hit would answer every query with itself. */
+.grad-drop-indicator {
+    position: fixed; z-index: 40; pointer-events: none;
+    background: var(--grad-attention); outline: 1px solid var(--grad-ink);
+}
+.grad-drag-ghost {
+    position: fixed; z-index: 41; pointer-events: none;
+    background: var(--grad-ink); color: var(--grad-paper);
+    font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.14em; padding: 3px 8px;
+}
+/* The pane being dragged stays exactly where it is until the drop lands: the
+   layout is the server's, and moving it here would show an arrangement that
+   does not exist yet. It is marked, not moved. */
+.grad-window .grad-titlebar.grad-drag-source {
+    outline: 2px dashed var(--grad-ink); outline-offset: -2px; opacity: 0.6;
+}
+.grad-window .grad-titlebar.grad-swap-target {
+    background: var(--grad-attention); color: var(--grad-ink);
+}
+.grad-window .grad-titlebar.grad-swap-target .grad-winctl { color: var(--grad-ink); }
+body.grad-dragging { cursor: grabbing; }
+/* Text selection and iframe hit-testing both eat a drag that crosses a pane. */
+body.grad-dragging * { user-select: none !important; }
+body.grad-dragging .grad-iframe-host { pointer-events: none; }
 """
 
 
@@ -502,6 +568,19 @@ def _chat() -> str:
 .grad-card > .head.broken { background: var(--grad-broken); color: #fff; }
 .grad-card > .body { padding: 11px; background: var(--grad-paper-raised); }
 .grad-card.gate { border-color: var(--grad-broken); }
+
+/* A tool card's head is TOOL · name · what it was on, and the subject is the
+   one part of it that is not a label: a path or a command, in its own case,
+   ellipsised rather than allowed to push the chip off the end. */
+.grad-card.tool > .head .subject { font-weight: 400; text-transform: none; letter-spacing: 0;
+                                   opacity: 0.72; min-width: 0; overflow: hidden;
+                                   white-space: nowrap; text-overflow: ellipsis; }
+.grad-card.tool > .head .state { flex: 0 0 auto; }
+/* Output is clipped by `agent.clip` at capture, but a 40-line result is still
+   taller than the card should be in a transcript you are scrolling. */
+.grad-card.tool > .body .grad-pre { max-height: 240px; overflow: auto; }
+.grad-card.tool > .body .out { margin-top: 9px; }
+.grad-card.tool > .body .out .grad-label { opacity: 0.5; margin-bottom: 4px; }
 
 .grad-streaming { display: flex; align-items: center; gap: 9px; margin: 9px 14px;
                   border: var(--grad-pending); padding: 9px 11px;

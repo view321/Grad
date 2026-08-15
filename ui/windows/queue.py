@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
-from ui.state import envelope_message, run_tool
+from ui.tasks import envelope_message, run_tool
 
 COLUMNS = ("job", "what", "device", "progress", "eta", "cost", "state")
 

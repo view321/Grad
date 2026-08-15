@@ -49,10 +49,15 @@ COMMENT_RE = re.compile(r"(?<!\\)%.*?$", re.MULTILINE)
 # arXiv
 # ---------------------------------------------------------------------------
 def _fetch(url: str, *, timeout: float) -> bytes:
-    try:
-        import httpx  # noqa: PLC0415
-    except ImportError as exc:
-        raise ConfigError("httpx is not installed", fix="pip install httpx") from exc
+    """arXiv's e-print endpoint, through `core/http.py`'s accessor.
+
+    Not a bare `import httpx`. Every other outbound request in this project goes
+    through `http._httpx()`, and the suite's "no network" guarantee is
+    implemented by replacing exactly that function -- so a second import site is
+    a hole in it, and a test that reached this one would hang rather than fail.
+    It also gets the same ImportError message for free.
+    """
+    httpx = http._httpx()  # noqa: SLF001 - the module's own accessor, see above
     try:
         resp = httpx.get(url, timeout=timeout, follow_redirects=True)
     except Exception as exc:  # noqa: BLE001

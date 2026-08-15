@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 
 import pytest
 
@@ -24,13 +25,27 @@ from ui import models
 def test_the_model_layer_does_not_drag_in_nicegui():
     """`ui/models.py` and `ui/layout.py` are the tested half of the UI. If either
     grows a NiceGUI import the tests stop being runnable without the extra, and
-    the layering claim in `ui/__init__.py` stops being true."""
+    the layering claim in `ui/__init__.py` stops being true.
+
+    The rule is about *importing* NiceGUI, not about naming it. `ui/tokens.py`
+    has to write `.nicegui-content` into the stylesheet -- that wrapper is what
+    the shell is nested inside, and its padding has to be zeroed out from CSS --
+    and a selector for someone else's class name costs nothing at import time.
+    So this matches import statements rather than the bare substring.
+    """
+    imports = re.compile(
+        r"""^\s*(?:from|import)\s+nicegui\b"""      # from nicegui import ... / import nicegui
+        r"""|__import__\(\s*['"]nicegui"""          # the dynamic spellings
+        r"""|import_module\(\s*['"]nicegui""",
+        re.MULTILINE,
+    )
     for module in ("ui.models", "ui.layout", "ui.registry", "ui.tokens", "ui.fonts"):
         source = __import__(module, fromlist=["__file__"]).__file__
         assert source
         with open(source, encoding="utf-8") as fh:
             text = fh.read()
-        assert "nicegui" not in text, f"{module} must not reference nicegui"
+        found = imports.search(text)
+        assert not found, f"{module} must not import nicegui: {found.group(0).strip()!r}"
 
 
 # ---------------------------------------------------------------------------

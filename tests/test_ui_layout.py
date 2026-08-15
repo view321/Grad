@@ -224,6 +224,110 @@ def test_move_of_an_unopened_window_is_a_no_op():
     assert layout.windows == ["chat"]
 
 
+def test_a_drag_cannot_create_a_fourth_column():
+    """`open` has always stopped at the cap; dropping a title bar past the right
+    edge used to walk straight past it, which is how you ended up with 240px
+    panes the opener strip could never have produced."""
+    layout = L.Layout()
+    for window in ("chat", "notebook", "ledger", "quota"):
+        layout.open(window)
+    layout.move("quota", 9)
+    layout.move("ledger", 9)
+    assert len(layout.columns) <= L.MAX_COLUMNS
+    assert sorted(layout.windows) == ["chat", "ledger", "notebook", "quota"]
+
+
+def test_a_window_alone_in_its_column_can_still_be_dragged_out_at_the_cap():
+    """It takes its column with it, so the count never actually rises. Counting
+    the cap before the pull would refuse a move that is plainly legal."""
+    layout = L.Layout().open("chat").open("ledger").open("quota")
+    assert len(layout.columns) == L.MAX_COLUMNS
+    layout.move("quota", 0, new_column=True)
+    assert [c.windows for c in layout.columns] == [["quota"], ["chat"], ["ledger"]]
+
+
+def test_a_drop_names_a_position_in_the_column_not_just_the_column():
+    layout = L.Layout().open("chat").open("ledger").open("quota").apply_preset("stack")
+    assert layout.columns[0].windows == ["chat", "ledger", "quota"]
+    layout.move("quota", 0, 0)
+    assert layout.columns[0].windows == ["quota", "chat", "ledger"]
+
+
+def test_moving_down_inside_one_column_lands_where_the_indicator_was():
+    """`slot_index` is a boundary in the column as the browser sees it -- with
+    the dragged window still in it. Insert without correcting for the pull and
+    a pane dragged one place down moves two."""
+    layout = L.Layout().open("chat").open("ledger").open("quota").apply_preset("stack")
+    layout.move("chat", 0, 2)  # the boundary between ledger and quota
+    assert layout.columns[0].windows == ["ledger", "chat", "quota"]
+
+
+def test_a_slot_index_past_the_end_appends():
+    layout = L.Layout().open("chat").open("ledger").apply_preset("stack")
+    layout.move("chat", 0, 99)
+    assert layout.columns[0].windows == ["ledger", "chat"]
+
+
+def test_a_new_column_can_be_split_in_before_an_existing_one():
+    layout = L.Layout().open("chat").open("ledger")
+    layout.move("ledger", 0, new_column=True)
+    assert [c.windows for c in layout.columns] == [["ledger"], ["chat"]]
+
+
+# ---------------------------------------------------------------------------
+# swapping
+# ---------------------------------------------------------------------------
+def test_swap_exchanges_two_windows():
+    layout = L.Layout().open("chat").open("ledger").open("quota")
+    layout.swap("chat", "quota")
+    assert [c.windows for c in layout.columns] == [["quota"], ["ledger"], ["chat"]]
+
+
+def test_swap_leaves_the_panes_their_own_sizes():
+    """The windows trade places; the geometry does not travel with them. Dropping
+    the ledger onto the chat puts it where the chat was, at the chat's size."""
+    layout = L.Layout().open("chat").open("ledger")
+    layout.resize_columns([0.7, 0.3])
+    before = fractions(layout)
+    layout.swap("chat", "ledger")
+    assert layout.columns[0].windows == ["ledger"]
+    for a, b in zip(before, fractions(layout)):
+        assert math.isclose(a, b, abs_tol=1e-9)
+
+
+def test_swap_works_across_a_stack():
+    layout = L.Layout()
+    for window in ("chat", "notebook", "ledger", "quota"):
+        layout.open(window)
+    layout.swap("chat", "quota")
+    assert [c.windows for c in layout.columns] == [["quota"], ["notebook"], ["ledger", "chat"]]
+
+
+def test_swapping_a_window_with_itself_changes_nothing():
+    layout = L.Layout().open("chat").open("ledger")
+    layout.swap("chat", "chat")
+    assert [c.windows for c in layout.columns] == [["chat"], ["ledger"]]
+
+
+def test_swapping_with_a_window_that_is_not_open_is_a_no_op():
+    """The ids come from the browser. A closed one must not blank a live pane."""
+    layout = L.Layout().open("chat").open("ledger")
+    layout.swap("chat", "evolve")
+    assert layout.windows == ["chat", "ledger"]
+    layout.swap("evolve", "chat")
+    assert layout.windows == ["chat", "ledger"]
+
+
+def test_swap_never_duplicates_or_drops_a_window():
+    layout = L.Layout()
+    for window in ("chat", "notebook", "ledger", "quota", "wiki"):
+        layout.open(window)
+    before = sorted(layout.windows)
+    for a, b in (("chat", "wiki"), ("ledger", "chat"), ("quota", "notebook")):
+        layout.swap(a, b)
+        assert sorted(layout.windows) == before
+
+
 # ---------------------------------------------------------------------------
 # presets
 # ---------------------------------------------------------------------------

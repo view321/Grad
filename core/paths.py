@@ -11,10 +11,24 @@ from pathlib import Path
 
 
 def root() -> Path:
-    """Workspace root. GRAD_ROOT overrides, otherwise the repo directory."""
+    """Workspace root: GRAD_ROOT, then the remembered choice, then the repo.
+
+    The middle rule is what makes the app's folder chooser survive a restart;
+    `core/workspace.py` holds the pointer and explains why it is stored beside
+    the code rather than inside the workspace it names. GRAD_ROOT still wins, so
+    an explicit override -- the test suite's, or one typed on a command line --
+    is never quietly beaten by a remembered one.
+    """
     env = os.environ.get("GRAD_ROOT")
     if env:
         return Path(env).resolve()
+    # Imported here rather than at module scope: `workspace` raises the CLI's
+    # error type, and this module is imported by almost everything.
+    from core import workspace  # noqa: PLC0415
+
+    chosen = workspace.remembered()
+    if chosen is not None:
+        return chosen
     return Path(__file__).resolve().parent.parent
 
 

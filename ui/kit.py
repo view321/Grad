@@ -66,7 +66,25 @@ def _tone_class(tone: str | None) -> str:
 
 
 def escape(value: Any) -> str:
+    """HTML-escape, for text going into an element's content."""
     return _html.escape("" if value is None else str(value), quote=False)
+
+
+def attr(value: Any) -> str:
+    """A value safe to interpolate into a `props('name="…"')` string.
+
+    Deliberately *not* `escape`. Props are parsed by NiceGUI and then bound as
+    attributes client-side, so nothing decodes entities on the way: an escaped
+    apostrophe would reach the screen as a literal `&#x27;` in the tooltip.
+
+    What actually has to go is the double quote, which closes the value early
+    and takes every attribute after it with it -- silently, because the parser
+    has no reason to complain. That matters because these values are not all
+    constants: a preflight remedy and a lineage bar's candidate id are ledger
+    text, and ledger text can hold a quote. Newlines go for the same reason.
+    """
+    collapsed = " ".join(str("" if value is None else value).split())
+    return collapsed.replace('"', "'")
 
 
 def el(tag: str, classes: str = "", *, style: str = "") -> Any:
@@ -127,7 +145,7 @@ def button(
     """A 2px-bordered square button. `tone` picks the fill, never a gradient."""
     element = text(value, f"grad-btn {BUTTON_TONES.get(tone, '')} {classes}".strip(), tag="button")
     if title:
-        element.props(f'title="{escape(title)}"')
+        element.props(f'title="{attr(title)}"')
     if disabled:
         element.props("disabled").classes("disabled")
     elif on_click is not None:

@@ -24,6 +24,61 @@ from core.errors import ConfigError, UpstreamError
 _last_request: dict[str, float] = {}
 
 
+#: Where a paper's identity is read from, **in this order, everywhere**.
+#:
+#: The order is the point. `/snippet/search` returns `corpusId` and `paperId`;
+#: `/paper/search` is asked for fields that include neither corpus id nor
+#: anything but `paperId`; Asta returns whichever its own shape carries. Reading
+#: them in different orders in different methods -- corpus id first in one, SHA
+#: only in another -- gave the *same paper* two ids, and `corpus.rrf` fuses by
+#: id, so it ranked twice and took a slot from something else. `cmd_search`
+#: calls both endpoints for every expanded query, so that was the ordinary path
+#: and not a corner of it.
+#:
+#: `paperId` leads because it is the one field every endpoint returns, and
+#: because `paper_id` -- the seed `neighbours` expands from -- is read from it
+#: too. One field decides both, so a candidate and its citation expansion cannot
+#: disagree about which paper they are.
+IDENTITY_KEYS = ("paperId", "paper_id", "corpusId", "corpus_id", "id")
+
+
+def identifier_of(paper: dict[str, Any]) -> Any:
+    """A paper's identity, by `IDENTITY_KEYS`. None when it carries none."""
+    for key in IDENTITY_KEYS:
+        value = paper.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def candidate_id(identifier: Any, title: Any = "", text: Any = "") -> str | None:
+    """The key the funnel fuses candidates on, or None when there is not one.
+
+    Both tier-1 clients mint ids in one `s2:` namespace, deliberately: it is one
+    corpus, so a paper found through both has to fuse to a single candidate
+    rather than rank twice under two names.
+
+    That sharing is also why an id-less hit cannot be given a shared literal.
+    Formatting a missing identifier produced `"s2:None"`, and since `corpus.rrf`
+    fuses by id, *every* hit without one -- from either client, across every
+    query in the run -- collapsed into a single phantom candidate. Distinct
+    papers vanished into each other with nothing on screen to say so, which is
+    the same class of failure as an empty result that reads as "the literature
+    has nothing on this".
+
+    So: the real id when there is one; a digest of what the reranker would read
+    when there is not, which fuses genuine duplicates and separates genuine
+    distinctions; and None when there is neither, because a hit with no id, no
+    title and no text has nothing to rank and nothing to cite.
+    """
+    if identifier not in (None, ""):
+        return f"s2:{identifier}"
+    material = f"{title or ''}\n{str(text or '')[:400]}".strip()
+    if not material:
+        return None
+    return "s2:t-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 def _httpx() -> Any:
     try:
         import httpx  # noqa: PLC0415
@@ -111,9 +166,14 @@ class SemanticScholar:
         for item in data.get("data", []):
             snippet = item.get("snippet", {})
             paper = item.get("paper", {})
+            key = candidate_id(
+                identifier_of(paper), paper.get("title"), snippet.get("text", "")
+            )
+            if key is None:
+                continue
             out.append(
                 {
-                    "id": f"s2:{paper.get('corpusId') or paper.get('paperId')}",
+                    "id": key,
                     "paper_id": paper.get("paperId"),
                     "title": paper.get("title"),
                     "year": (paper.get("publicationDate") or "")[:4] or None,
@@ -128,19 +188,24 @@ class SemanticScholar:
     def paper_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         fields = "title,abstract,year,externalIds,citationCount,authors"
         data = self._get("/paper/search", {"query": query, "limit": limit, "fields": fields})
-        return [
-            {
-                "id": f"s2:{p.get('paperId')}",
-                "paper_id": p.get("paperId"),
-                "title": p.get("title"),
-                "year": p.get("year"),
-                "abstract": p.get("abstract") or "",
-                "citations": p.get("citationCount"),
-                "source": "s2.paper",
-                "external": p.get("externalIds", {}),
-            }
-            for p in data.get("data", [])
-        ]
+        out = []
+        for p in data.get("data", []):
+            key = candidate_id(identifier_of(p), p.get("title"), p.get("abstract"))
+            if key is None:
+                continue
+            out.append(
+                {
+                    "id": key,
+                    "paper_id": p.get("paperId"),
+                    "title": p.get("title"),
+                    "year": p.get("year"),
+                    "abstract": p.get("abstract") or "",
+                    "citations": p.get("citationCount"),
+                    "source": "s2.paper",
+                    "external": p.get("externalIds", {}),
+                }
+            )
+        return out
 
     def neighbours(self, paper_id: str, *, direction: str = "citations", limit: int = 20) -> list[dict[str, Any]]:
         """Citation-graph expansion.
@@ -169,6 +234,380 @@ class SemanticScholar:
                 }
             )
         return out
+
+
+# ---------------------------------------------------------------------------
+# Asta -- the same corpus, through a door that opens
+# ---------------------------------------------------------------------------
+#: The MCP protocol version this client speaks. Sent on `initialize` and echoed
+#: on every request after it; a server that wants another version says so in its
+#: `initialize` result and this follows it.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+class Asta:
+    """Ai2's scientific corpus over MCP, at `asta-tools.allen.ai`.
+
+    **Why this exists.** `SemanticScholar` above is the better-documented client
+    and it is not reachable: Ai2 stopped accepting API key requests from
+    free-domain email addresses, so a personal account cannot get one, and the
+    anonymous pool is shared with every other unauthenticated caller and is
+    near-permanently rate limited. Asta is the *same index* -- Ai2 describe the
+    MCP tool as an extension of the Semantic Scholar API -- and it exposes
+    `snippet_search`, which is the endpoint §5's funnel is actually built around:
+    ~500-word excerpts from full text are what make triage possible without
+    downloading anything. A key is optional here and raises limits rather than
+    unlocking anything.
+
+    **Why it is not an MCP integration.** §5 already settles this: Asta's
+    endpoint is reached "over streamable HTTP without adopting MCP as an
+    architecture". Streamable HTTP is a POST with a JSON-RPC body; the parts of
+    MCP that would be an architecture -- a client runtime, a tool registry, a
+    server lifecycle -- buy nothing when the whole surface is three calls. So
+    this is `httpx` and the same disk cache, rate limiter and usage log as
+    everything else in this module.
+
+    **What is unverified.** The endpoint, the transport and the tool names are
+    from Ai2's published documentation. The *shape of each tool's result* is
+    not, because that needs a live call. So `_rows` reads both the shape S2's
+    REST API uses (`{"data": [{"snippet": …, "paper": …}]}`) and a flattened
+    one, and an unrecognised payload becomes an `UpstreamError` naming what came
+    back rather than an empty list that reads as "the literature has nothing".
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.base = str(cfg.get("retrieval", "asta_base")).rstrip("/")
+        self.timeout = float(cfg.get("retrieval", "request_timeout_s", 60))
+        self.ttl = float(cfg.get("retrieval", "cache_ttl_s", 604800))
+        self.interval = float(cfg.get("retrieval", "min_request_interval_s", 1.1))
+        try:
+            self.key = credentials.get(credentials.ASTA_KEY, required=False)
+        except ConfigError:
+            # Same reasoning as Context7: an optional credential whose *store* is
+            # unreachable must not make an anonymous call impossible.
+            self.key = None
+        self._session: str | None = None
+        self._protocol = MCP_PROTOCOL_VERSION
+        self._id = 0
+        #: Set only once `initialize` *and* the notification after it have
+        #: succeeded. See `_handshake` for why this is not inferred.
+        self._ready = False
+
+    @property
+    def authenticated(self) -> bool:
+        return bool(self.key)
+
+    # -- transport ----------------------------------------------------------
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            # Both, because streamable HTTP lets the server answer either way
+            # for the same request and does not tell you which in advance.
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": self._protocol,
+        }
+        if self.key:
+            headers["x-api-key"] = self.key
+        if self._session:
+            headers["Mcp-Session-Id"] = self._session
+        return headers
+
+    def _post(self, body: dict[str, Any]) -> Any:
+        _throttle("asta", self.interval)
+        httpx = _httpx()
+        try:
+            resp = httpx.post(self.base, json=body, headers=self._headers(), timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise UpstreamError(
+                f"Asta request failed: {exc}",
+                fix="retry, or run with --local-only to search papers already ingested",
+            ) from exc
+
+        # Assigned on `initialize` and echoed from then on. A server that does
+        # not use sessions simply never sends it.
+        session = resp.headers.get("mcp-session-id")
+        if session:
+            self._session = session
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise UpstreamError(
+                f"Asta rejected the request ({resp.status_code})",
+                fix=(
+                    "the corpus tool is usable anonymously; if a key is stored it may be "
+                    f"wrong: python -m tools.jobs credential set {credentials.ASTA_KEY}"
+                ),
+            )
+        if resp.status_code == 429:
+            raise UpstreamError(
+                "Asta rate-limited the request",
+                fix=(
+                    "wait, or store a key to raise the limit -- it is requested from a form "
+                    "rather than reviewed, so a personal address is fine: "
+                    f"python -m tools.jobs credential set {credentials.ASTA_KEY}"
+                ),
+            )
+        if resp.status_code >= 400:
+            raise UpstreamError(
+                f"Asta returned {resp.status_code}: {resp.text[:200]}",
+                fix=(
+                    "the endpoint may have moved: check allenai.org/asta/resources/mcp and "
+                    "set [retrieval] asta_base in config/grad.toml"
+                ),
+            )
+        # A notification gets 202 Accepted and an empty body; there is nothing
+        # to parse and nothing to wait for.
+        if resp.status_code == 202 or not (resp.content or b"").strip():
+            return None
+        return _mcp_payload(resp)
+
+    def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        self._id += 1
+        payload = self._post(
+            {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}}
+        )
+        if payload is None:
+            raise UpstreamError(
+                f"Asta returned no body for {method}",
+                fix="retry; if it persists the endpoint may have changed transport",
+            )
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if error:
+            raise UpstreamError(
+                f"Asta refused {method}: {error.get('message') or error}",
+                fix="check the tool name and its arguments against allenai.org/asta/resources/mcp",
+            )
+        return (payload or {}).get("result")
+
+    def _handshake(self) -> None:
+        """`initialize`, then the notification that says the client is ready.
+
+        Once per client, and `_ready` is an explicit flag rather than something
+        inferred from `_session` or `_id`. Inferring it from the request counter
+        was wrong in the case that matters: `_call` increments the counter before
+        it sends, so an `initialize` that *failed* -- a timeout, a 429 on the
+        very first call -- left the counter non-zero and every later request
+        skipped the handshake and went straight to `tools/call` on a connection
+        that was never initialised. One transient failure poisoned the client for
+        the life of the process.
+        """
+        if self._ready:
+            return
+        result = self._call(
+            "initialize",
+            {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "grad", "version": "1"},
+            },
+        )
+        negotiated = (result or {}).get("protocolVersion")
+        if isinstance(negotiated, str) and negotiated:
+            self._protocol = negotiated
+        # A notification: no id, so no reply is expected and none is waited for.
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        self._ready = True
+
+    def tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Call one MCP tool, through the disk cache.
+
+        The cache key deliberately excludes the session: a session is a
+        transport detail and two of them asking the same question of the same
+        corpus should not cost two requests.
+        """
+        key = f"asta:{self.base}:{name}:{json.dumps(arguments, sort_keys=True)}"
+        hit = _cached(key, self.ttl)
+        if hit is not None:
+            return hit
+        self._handshake()
+        result = self._call("tools/call", {"name": name, "arguments": arguments})
+        if isinstance(result, dict) and result.get("isError"):
+            raise UpstreamError(
+                f"Asta's {name} failed: {_mcp_text(result)[:200]}",
+                fix="check the arguments; the tool ran and reported an error",
+            )
+        data = _mcp_result(result)
+        _store(key, data)
+        return data
+
+    # -- the three calls the funnel makes ------------------------------------
+    def snippet_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Full-text excerpts. The reason to prefer this over a metadata search:
+        ~500 words of the paper itself is what stage 3 triages on."""
+        data = self.tool("snippet_search", {"query": query, "limit": limit})
+        return _normalise(_rows(data, "snippet_search"), "asta.snippet")
+
+    def paper_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        data = self.tool("search_papers_by_relevance", {"query": query, "limit": limit})
+        return _normalise(_rows(data, "search_papers_by_relevance"), "asta.paper")
+
+    def neighbours(
+        self, paper_id: str, *, direction: str = "citations", limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Citation-graph expansion.
+
+        §5: worth more for recall than any reranker upgrade, because the
+        retriever sets the ceiling and the graph reaches papers no query string
+        does. Asta publishes `get_citations` and no references counterpart, so
+        the backward direction is refused here rather than silently answered
+        with the forward one -- which would quietly double-count one direction.
+        """
+        if direction != "citations":
+            return []
+        data = self.tool("get_citations", {"paper_id": paper_id, "limit": limit})
+        return _normalise(_rows(data, "get_citations"), "asta.citations")
+
+
+def _mcp_payload(resp: Any) -> Any:
+    """One JSON-RPC message out of a streamable-HTTP response.
+
+    The same request may be answered with `application/json` or with an SSE
+    stream, at the server's discretion, so both are handled. For a stream the
+    *last* `data:` frame carrying a result is taken: progress notifications
+    share the channel with the answer.
+    """
+    content_type = (resp.headers.get("content-type") or "").lower()
+    if "text/event-stream" not in content_type:
+        try:
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise UpstreamError(
+                f"Asta returned a body that is not JSON: {resp.text[:200]}",
+                fix="retry; if it persists the endpoint may no longer speak streamable HTTP",
+            ) from exc
+
+    answer: Any = None
+    for line in resp.text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            frame = json.loads(line[5:].strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(frame, dict) and ("result" in frame or "error" in frame):
+            answer = frame
+    if answer is None:
+        raise UpstreamError(
+            "Asta's event stream carried no result",
+            fix="retry; the stream held only notifications",
+        )
+    return answer
+
+
+def _mcp_text(result: Any) -> str:
+    """The text content blocks of a `tools/call` result, joined."""
+    if not isinstance(result, dict):
+        return ""
+    parts = []
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(parts)
+
+
+def _mcp_result(result: Any) -> Any:
+    """The data a tool returned, whichever way it chose to return it.
+
+    `structuredContent` is the typed channel and is preferred. Failing that the
+    text block is usually JSON; failing *that* it is prose, and it is handed back
+    as-is rather than discarded -- `_rows` is where an unusable shape becomes an
+    error that says what arrived.
+    """
+    if isinstance(result, dict) and result.get("structuredContent") is not None:
+        return result["structuredContent"]
+    text = _mcp_text(result)
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+
+
+def _rows(data: Any, tool_name: str) -> list[dict[str, Any]]:
+    """The list of hits inside a tool's payload, whatever it is wrapped in.
+
+    Unverified against the live service, so this reads the S2 REST shape and the
+    obvious flattenings of it. An unrecognised payload raises: a search that
+    quietly returns nothing reads as "the literature has nothing on this", and
+    that is a conclusion nobody should draw from a schema change.
+    """
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("data", "results", "snippets", "papers", "citations", "items"):
+            if isinstance(data.get(key), list):
+                candidates = data[key]
+                break
+        else:
+            raise UpstreamError(
+                f"Asta's {tool_name} returned no recognisable list of hits: "
+                f"keys were {sorted(data)[:8]}",
+                fix=(
+                    "the tool's result shape has changed -- compare it against "
+                    "allenai.org/asta/resources/mcp and update core/http.py:_rows"
+                ),
+            )
+    else:
+        raise UpstreamError(
+            f"Asta's {tool_name} returned {type(data).__name__}, not a result set: "
+            f"{str(data)[:200]}",
+            fix="retry; if it persists the tool name or its arguments have changed",
+        )
+    return [c for c in candidates if isinstance(c, dict)]
+
+
+def _normalise(items: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    """Hits in the funnel's vocabulary, dropping any that cannot be fused.
+
+    A hit with no identifier, no title and no text has nothing for the reranker
+    to read and nothing to cite. Dropping it costs no recall; keeping it under a
+    shared placeholder id cost real recall, because fusion is by id -- see
+    `candidate_id`.
+    """
+    out = []
+    for item in items:
+        row = _row(item, source=source)
+        if row is not None:
+            out.append(row)
+    return out
+
+
+def _row(item: dict[str, Any], *, source: str) -> dict[str, Any] | None:
+    """One hit, in the shape the funnel already fuses and reranks.
+
+    `paper_search.py` does not know which tier a candidate came from, and it
+    must not have to: RRF fuses rankings by id, and the reranker reads title and
+    snippet. So the two clients in this module answer in one vocabulary.
+    """
+    # The `s2:` prefix is shared with `SemanticScholar` on purpose, not by
+    # accident of copying: it is the same corpus and the same corpus ids, so a
+    # paper found through both tiers has to fuse to one candidate rather than
+    # rank twice under two names.
+    #
+    # The S2 shape nests the paper under the snippet; the flat one does not.
+    paper = item.get("paper") if isinstance(item.get("paper"), dict) else item
+    snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else item
+
+    text = snippet.get("text") or item.get("text") or ""
+    key = candidate_id(identifier_of(paper), paper.get("title"), text)
+    if key is None:
+        return None
+    year = paper.get("year")
+    if year is None:
+        year = (str(paper.get("publicationDate") or "")[:4]) or None
+    external = paper.get("externalIds") or paper.get("external_ids") or {}
+    return {
+        "id": key,
+        # The same field the id came from, by the same order -- so the seed
+        # `neighbours` expands from cannot name a different paper than the
+        # candidate it was taken from.
+        "paper_id": paper.get("paperId") or paper.get("paper_id") or paper.get("id"),
+        "title": paper.get("title"),
+        "year": year,
+        "snippet": text,
+        "abstract": paper.get("abstract") or "",
+        "section": snippet.get("snippetKind") or snippet.get("section") or "",
+        "source": source,
+        "external": external if isinstance(external, dict) else {},
+    }
 
 
 # ---------------------------------------------------------------------------

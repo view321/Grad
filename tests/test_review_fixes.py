@@ -348,6 +348,27 @@ def test_scrub_removes_the_env_credential_fallbacks(workspace, monkeypatch):
     assert "GRAD_HF_TOKEN" not in os.environ
 
 
+def test_every_credential_the_store_knows_is_scrubbed_from_the_environment(monkeypatch):
+    """The list used to be written out by hand, and it drifted: `credentials.get`
+    reads `GRAD_<NAME>` for every credential, but two were added to that lookup
+    and not to the scrub -- so the agent inherited them. `GRAD_CLAUDE_OAUTH_TOKEN`
+    is the one that matters most, because the scrub is what bounds who can read
+    the token `core/haiku.py` hands to its subprocesses on purpose."""
+    import os
+
+    from core import credentials
+
+    for name in credentials.ALL:
+        monkeypatch.setenv(f"GRAD_{name.upper()}", "secret")
+
+    removed = set(credentials.scrub_environment())
+
+    for name in credentials.ALL:
+        var = f"GRAD_{name.upper()}"
+        assert var in removed, var
+        assert var not in os.environ, var
+
+
 # ---------------------------------------------------------------------------
 # the deny probe does not read tea leaves
 # ---------------------------------------------------------------------------

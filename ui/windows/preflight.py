@@ -11,10 +11,11 @@ teaches you to ignore it.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ui import kit
-from ui.state import envelope_message, run_tool
+from ui.tasks import start, task_message
 
 
 def subtitle(workspace: Any) -> str:
@@ -79,15 +80,26 @@ def _row(workspace: Any, row: dict[str, Any]) -> None:
 
 
 def _footer(workspace: Any, model: dict[str, Any]) -> None:
-    async def rerun() -> None:
+    def rerun() -> None:
+        """In the background: `tests` and `dry_run` are 900 seconds each, so the
+        gate that has to pass before money is spent could outlast any wall clock
+        the UI put on it."""
         current = model.get("current") or {}
         spec = current.get("spec")
         if not spec:
             workspace.say("this record does not name the spec it came from")
             return
-        workspace.say("re-running preflight …")
-        payload = await run_tool("tools.preflight", "run", "--spec", str(spec), "--json")
-        workspace.say(envelope_message(payload))
+        start(
+            f"preflight {Path(str(spec)).name}",
+            "tools.preflight", "run", "--spec", str(spec), "--json",
+            on_done=lambda task: _settled(workspace, task),
+        )
+        workspace.say("re-running preflight — see the tasks window")
+        workspace.invalidate("tasks")
+        workspace.tick()
+
+    def _settled(workspace: Any, task: Any) -> None:
+        workspace.say(task_message(task))
         workspace.invalidate("preflight")
         workspace.tick()
 

@@ -1,8 +1,8 @@
 """The window registry, and the contract every window module signs.
 
-The registry is the one list the opener strip, the layout presets, the command
-palette, the persisted layout's validation and the status bar's count are all
-derived from. If it is ever more than one list, two of those will drift.
+The registry is the one list the `⋯` menu, the persisted layout's validation and
+the status bar's count are all derived from. If it is ever more than one list,
+two of those will drift.
 
 These tests import the window modules, which imports `ui/kit.py` -- but not
 NiceGUI, because `kit` imports it inside its functions. That is deliberate: it
@@ -24,10 +24,13 @@ def test_ids_are_unique():
     assert len(registry.ids()) == len(set(registry.ids()))
 
 
-def test_the_eleven_windows_the_handoff_lists_are_all_here():
+def test_the_windows_the_handoff_lists_are_all_here():
+    """The handoff's eleven, and `tasks` -- which is not one of them because the
+    handoff had nowhere to put a local command that runs for twenty minutes.
+    Everything long was awaited under a wall clock until it was."""
     assert set(registry.ids()) == {
         "chat", "notebook", "wiki", "papers", "evolve", "editor",
-        "ledger", "preflight", "quota", "funnel", "queue",
+        "ledger", "preflight", "quota", "funnel", "queue", "tasks",
     }
 
 

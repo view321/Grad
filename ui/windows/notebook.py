@@ -25,10 +25,30 @@ from __future__ import annotations
 
 from typing import Any
 
+from pathlib import Path
+
 from ui import kit, models
-from ui.state import run_tool
+from ui.tasks import CANCELLED, envelope_message, run_tool, start, task_message
 
 ANCHOR_ID = "grad-anchor-notebook"
+
+
+def _record(workspace: Any, name: str, task: Any) -> None:
+    """Fold a finished verify task into the notebook's citable state.
+
+    A verify that was *stopped* proves nothing, and writing it as a failure
+    would be a claim about the notebook rather than about the interruption. The
+    banner already has the right state for "we do not know" -- unverified since
+    the last edit -- so a cancelled task is kept out of the store entirely.
+    """
+    if task.state == CANCELLED:
+        workspace.say(f"{name}: verification stopped — it is still unverified")
+    else:
+        payload = task.envelope or {"ok": False, "error": {"message": task_message(task)}}
+        models.record_verify(name, payload)
+        workspace.say(f"{name}: {_verify_line(payload)}")
+    workspace.invalidate("notebook")
+    workspace.tick()
 
 
 def _current(workspace: Any) -> str | None:
@@ -86,18 +106,31 @@ def render(workspace: Any) -> None:
 def _toolbar(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) -> None:
     name = entry["name"]
 
-    async def verify() -> None:
-        workspace.say(f"verifying {name} on a fresh kernel …")
-        payload = await run_tool("tools.nb", "verify", f"notebooks/{name}", "--json")
-        models.record_verify(name, payload)
-        workspace.invalidate("notebook")
+    def verify() -> None:
+        """In the background, and with a way to stop it that the kernel survives.
+
+        This used to be awaited under `run_tool`'s wall clock, which killed it
+        at 900 seconds -- below `verify_timeout_s`, which allows 1800 *per cell*.
+        A notebook slow enough to need the allowance was the one the UI refused
+        to finish.
+
+        `nb stop` rather than a signal, for the reason `_shutdown` exists: the
+        verify kernel is spawned detached so it outlives the CLI, so terminating
+        the CLI would leave it holding the VRAM the verify was meant to free.
+        """
+        session = f"verify-{Path(name).stem}"
+        start(
+            f"verify {name}",
+            "tools.nb", "verify", f"notebooks/{name}", "--json",
+            halt=("tools.nb", "stop", "--kernel", session, "--json"),
+            on_done=lambda task: _record(workspace, name, task),
+        )
+        workspace.say(f"verifying {name} on a fresh kernel — see the tasks window")
+        workspace.invalidate("tasks")
         workspace.tick()
-        workspace.say(f"{name}: " + _verify_line(payload))
 
     async def kernel(command: str) -> None:
         payload = await run_tool("tools.nb", command, "--json")
-        from ui.state import envelope_message
-
         workspace.say(f"kernel {command}: {envelope_message(payload)}")
 
     with kit.row("grad-pad", gap=9).style("border-bottom: var(--grad-border); flex: 0 0 auto"):
@@ -172,18 +205,19 @@ def _lab(ui: Any, workspace: Any, model: dict[str, Any], entry: dict[str, Any]) 
     if not model.get("lab_running"):
         kit.run_js(f"window.gradDropFrame && window.gradDropFrame('{ANCHOR_ID}')")
 
-        async def start() -> None:
+        # Awaited rather than backgrounded, and named apart from `tasks.start`:
+        # the window needs the port back before it can draw the iframe, so there
+        # is nothing useful to do while this runs.
+        async def start_lab() -> None:
             workspace.say("starting JupyterLab …")
             payload = await run_tool("tools.lab", "start", "--json", timeout=90)
-            from ui.state import envelope_message
-
             workspace.say(envelope_message(payload))
             workspace.invalidate("notebook")
             workspace.tick()
 
         with kit.pad():
             kit.text("JupyterLab is not running.", "grad-empty")
-            kit.button("▶ START LAB", tone="primary", on_click=start)
+            kit.button("▶ START LAB", tone="primary", on_click=start_lab)
             kit.note(
                 "Anything edited in Lab must pass VERIFY before it is cited in notes/ or "
                 "referenced from a ledger entry — Lab and tools/nb.py are two kernel owners "

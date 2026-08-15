@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
-from ui.state import envelope_message, run_tool
+from ui.tasks import envelope_message, run_tool, start, task_message
 
 
 def subtitle(workspace: Any) -> str:
@@ -51,13 +51,20 @@ def render(workspace: Any) -> None:
         )
         return
 
-    async def build() -> None:
-        workspace.say("building the PDF …")
-        payload = await run_tool(
-            "tools.report", "build", "--project", str(model["project"]), "--json", timeout=600
-        )
-        workspace.say(envelope_message(payload))
+    def settled(task: Any) -> None:
+        workspace.say(task_message(task))
         workspace.invalidate("editor")
+        workspace.tick()
+
+    def build() -> None:
+        """LaTeX runs more than once and can pull fonts, so this is minutes."""
+        start(
+            f"build {model['project']}",
+            "tools.report", "build", "--project", str(model["project"]), "--json",
+            on_done=settled,
+        )
+        workspace.say("building the PDF — see the tasks window")
+        workspace.invalidate("tasks")
         workspace.tick()
 
     async def check() -> None:

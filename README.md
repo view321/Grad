@@ -81,8 +81,39 @@ Store credentials once; they never enter the agent's environment:
 python -m tools.jobs credential set hf_token
 python -m tools.jobs credential set openrouter_key
 python -m tools.jobs credential set voyage_key
-python -m tools.jobs credential set context7_key   # optional; raises rate limits
+python -m tools.jobs credential set claude_oauth_token
+python -m tools.jobs credential set asta_api_key    # optional; raises rate limits
+python -m tools.jobs credential set context7_key    # optional; raises rate limits
 ```
+
+Or store them from the app: the workspace menu (`project ▾`) has a credentials
+panel, which is the same command with `--stdin` instead of the `getpass` prompt.
+That exists because the prompt needs a terminal, and needing one for this was
+the only thing that forced a shell open beside the app on a fresh machine. The
+value goes down a pipe rather than in an argument — an argv is visible to
+anything that can list processes.
+
+### Retrieval without an institutional email
+
+Tier 1 defaults to **Ai2's Asta** (`asta-tools.allen.ai`) rather than to the
+Semantic Scholar REST API. It is the same corpus and it exposes the same
+`snippet_search` the funnel is built around, but Semantic Scholar
+[no longer issues API keys to free-domain email addresses][s2-keys], which
+leaves a personal account on a shared anonymous pool that is rate limited often
+enough that "no results" and "no key" are hard to tell apart.
+
+Asta is reached over streamable HTTP without adopting MCP as an architecture,
+which is what §5 already said about that endpoint. Its key is optional and
+raises limits rather than unlocking anything. Set `[retrieval] tier1` to `s2`
+or `both` to change it, or pass `--tier1` per search.
+
+**The endpoint, the transport and the tool names are from Ai2's documentation;
+the shape of each tool's result is not verified against the live service.**
+`core/http.py:_rows` reads both plausible shapes and raises on anything else,
+because a search that quietly returns nothing reads as "the literature has
+nothing on this".
+
+[s2-keys]: https://www.semanticscholar.org/product/api
 
 ## Run
 
@@ -189,13 +220,15 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   haiku.py            funnel stages 0 and 3, via forced SDK tools
   http.py             Semantic Scholar, rerank, embeddings, Context7
 tools/                the CLIs
-ui/                   the NiceGUI workspace: a tiling shell over eleven windows
+ui/                   the NiceGUI workspace: a tiling shell over twelve windows
   tokens.py           the design tokens; the stylesheet is generated from them
   layout.py           the pane tree and the moves over it   -- pure, tested
   models.py           what each window shows, as plain data -- pure, tested
   registry.py         the one list of windows the shell is derived from
   shell.py            the chrome, and how a window survives a retile
-  windows/            eleven renderers, none of which read a ledger directly
+  tasks.py            local commands run in the background, and how to stop one
+  sessions.py         named chat sessions: a file each, listed by a glob
+  windows/            twelve renderers, none of which read a ledger directly
   jupyter_theme.py    the same tokens, emitted as JupyterLab's custom.css
 config/jupyter/       the Lab server config: framing headers, overrides, theme
 skills/               loaded on demand, not into the default context
@@ -211,14 +244,17 @@ Implemented and tested: the ledger, the submission hash, every gate, the smoke
 caps, the CLI contract, the hook, the persistent kernel, notebook verification,
 the project dimension and its three ceilings, HF organization namespaces,
 library-currency checking, the campaign loop and its budget gate, and the report
-generator with all four of its rules. `pytest` covers these — 295 tests, no
-network, no SDK required.
+generator with all four of its rules, the background task runner and its stop
+path, and named chat sessions. `pytest` covers these — no network, no SDK
+required, and the "no network" half is now enforced rather than intended: an
+autouse fixture in `tests/conftest.py` replaces `core.http._httpx`, because a
+suite that reaches the network does not fail, it *hangs*.
 
 Implemented but not exercised against a live service: the HF Jobs backend, the
-SSH backend, Semantic Scholar, the OpenRouter reranker, Voyage embeddings, the
-two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are written
-against the documented interfaces and fail with actionable errors rather than
-tracebacks, but a real credential and a real run are what will find the
+SSH backend, Asta, Semantic Scholar, the OpenRouter reranker, Voyage embeddings,
+the two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are
+written against the documented interfaces and fail with actionable errors rather
+than tracebacks, but a real credential and a real run are what will find the
 mismatches.
 
 **Two of [HANDOFF-2 §23](HANDOFF-2.md)'s open questions are now closed:**

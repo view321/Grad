@@ -1,7 +1,7 @@
 """grad-paper-search -- the five-stage retrieval funnel (HANDOFF §5).
 
     | 0 | Query expansion | Haiku: 1 question -> ~5 keyword queries + 1 HyDE abstract | quota  |
-    | 1 | Retrieve        | S2 snippets + local index (RRF) + citation expansion      | free   |
+    | 1 | Retrieve        | Asta snippets + local index (RRF) + citation expansion    | free   |
     | 2 | Rerank          | voyageai/rerank-2.5 -> top ~50                            | credits|
     | 3 | Triage          | Haiku reads all 50 in one call, returns ~15 with a reason | quota  |
     | 4 | Select          | The main agent reads the 15                               | quota  |
@@ -19,26 +19,60 @@ import json
 import re
 from typing import Any
 
-from core import config as config_mod, corpus, haiku, http, paths, quota_log
+from core import config as config_mod, corpus, credentials, haiku, http, paths, quota_log
 from core.cli import Cli, main
-from core.errors import GradError, UsageError
+from core.errors import GradError, UpstreamError, UsageError
 from core.ledger_store import now_iso
 
 cli = Cli(
     "grad-paper-search",
-    "Search the literature (Semantic Scholar) and the local index, rerank, and triage.",
+    "Search the literature (Ai2 Asta / Semantic Scholar) and the local index, rerank, triage.",
     epilog=(
-        "Discovery and recall are different problems. Tier 1 (S2) finds papers you have\n"
-        "not read; tier 2 (the local index) answers 'where did I see that lemma'.\n"
+        "Discovery and recall are different problems. Tier 1 finds papers you have not\n"
+        "read; tier 2 (the local index) answers 'where did I see that lemma'.\n"
         "A local index cannot do discovery by construction, which is why both exist.\n\n"
+        "Tier 1 defaults to Asta, which serves the same Semantic Scholar corpus over MCP\n"
+        "without an institutional email. --tier1 s2 uses the REST API directly.\n\n"
         "The retriever sets the ceiling: expansion and citation expansion buy more than\n"
         "reranker shopping does."
     ),
 )
 
 
+#: `tier1` value -> the clients it selects, in the order they are queried.
+TIER1_SOURCES = ("asta", "s2", "both", "none")
+
+
+def tier1_clients(cfg: Any, override: str | None = None) -> list[tuple[str, Any]]:
+    """The discovery clients for this run, named so a trace can say which spoke.
+
+    Both reach the same Semantic Scholar corpus and both answer in the same
+    vocabulary (`core/http.py:_row`), so a candidate found by either fuses to
+    one entry. What differs is whether the door opens: S2's own API no longer
+    issues keys to free-domain addresses, so a personal account falls back to
+    the shared anonymous pool.
+    """
+    chosen = str(override or cfg.get("retrieval", "tier1", "asta")).lower()
+    if chosen not in TIER1_SOURCES:
+        raise UsageError(
+            f"unknown tier-1 source {chosen!r}",
+            fix=f"one of: {', '.join(TIER1_SOURCES)}",
+        )
+    out: list[tuple[str, Any]] = []
+    if chosen in ("asta", "both"):
+        out.append(("asta", http.Asta(cfg)))
+    if chosen in ("s2", "both"):
+        out.append(("s2", http.SemanticScholar(cfg)))
+    return out
+
+
 def _search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("question", help="the research question, in words")
+    p.add_argument(
+        "--tier1",
+        choices=list(TIER1_SOURCES),
+        help="which discovery client to use (default from config; asta unless changed)",
+    )
     p.add_argument("--top", type=int, help="how many to return (default from config)")
     p.add_argument("--candidates", type=int, help="stage-1 candidate ceiling")
     p.add_argument("--no-expand", action="store_true", help="skip stage 0 (Haiku query expansion)")
@@ -77,31 +111,41 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     # -- stage 1: retrieve ---------------------------------------------------
     candidates: dict[str, dict[str, Any]] = {}
     rankings: list[list[dict[str, Any]]] = []
+    #: Search calls that *failed*, kept apart from the trace's other warnings.
+    #: An empty local index is not a failure and must not be reported as one.
+    upstream_failures: list[str] = []
 
-    if not args.local_only:
-        s2 = http.SemanticScholar(cfg)
-        per_query = max(5, ceiling // max(1, len(queries) * 2))
+    tier1 = tier1_clients(cfg, args.tier1) if not args.local_only else []
+    trace["stages"]["1_sources"] = [name for name, _ in tier1]
+
+    if tier1:
+        per_query = max(5, ceiling // max(1, len(queries) * 2 * len(tier1)))
         for query in queries:
-            for fn in (s2.snippet_search, s2.paper_search):
-                try:
-                    hits = fn(query, limit=per_query)
-                except GradError as exc:
-                    trace.setdefault("warnings", []).append(str(exc))
-                    continue
-                rankings.append(hits)
-                for hit in hits:
-                    candidates.setdefault(hit["id"], hit)
-        if not args.no_citations:
-            seeds = [c for c in list(candidates.values())[:5] if c.get("paper_id")]
-            for seed in seeds:
-                for direction in ("citations", "references"):
+            for name, client in tier1:
+                for verb in ("snippet_search", "paper_search"):
                     try:
-                        hits = s2.neighbours(seed["paper_id"], direction=direction, limit=10)
-                    except GradError:
+                        hits = getattr(client, verb)(query, limit=per_query)
+                    except GradError as exc:
+                        trace.setdefault("warnings", []).append(f"{name}.{verb}: {exc}")
+                        upstream_failures.append(f"{name}.{verb}: {exc}")
                         continue
                     rankings.append(hits)
                     for hit in hits:
                         candidates.setdefault(hit["id"], hit)
+        if not args.no_citations:
+            seeds = [c for c in list(candidates.values())[:5] if c.get("paper_id")]
+            for seed in seeds:
+                for name, client in tier1:
+                    for direction in ("citations", "references"):
+                        try:
+                            hits = client.neighbours(
+                                seed["paper_id"], direction=direction, limit=10
+                            )
+                        except GradError:
+                            continue
+                        rankings.append(hits)
+                        for hit in hits:
+                            candidates.setdefault(hit["id"], hit)
 
     if not args.no_local:
         local = _local_ranked(args.question, hyde, cfg, trace)
@@ -118,8 +162,33 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     trace["stages"]["1_retrieve"] = {"rankings": len(rankings), "candidates": len(pool)}
 
     if not pool:
-        return {"question": args.question, "results": [], "trace": trace,
-                "note": "no candidates; try --no-expand to see the raw query, or widen --candidates"}
+        # A run that found nothing is the run the funnel view exists to explain
+        # -- "why is the obviously relevant paper not in here" -- so it gets a
+        # trace like any other. Returning before writing one left exactly the
+        # interesting failures invisible.
+        _write_trace(log_name, trace, [])
+        warnings = list(dict.fromkeys(trace.get("warnings") or []))
+        if upstream_failures and not rankings:
+            # Every retrieval call failed. That is an upstream failure, not an
+            # empty result set, and the difference matters more here than
+            # anywhere else in this tool: `ok: true` with no results reads as
+            # "the literature has nothing on this", which is a conclusion nobody
+            # should draw from a rate limit.
+            raise UpstreamError(
+                "every retrieval call failed, so the search returned nothing: "
+                + "; ".join(dict.fromkeys(upstream_failures)),
+                fix=_tier1_fix(trace["stages"]["1_sources"]),
+            )
+        return {
+            "question": args.question,
+            "results": [],
+            "trace": trace,
+            "trace_log": str(paths.notes_dir() / "funnel" / f"{log_name}.json"),
+            # The old note here recommended `--no-expand`, which is advice for a
+            # cause this branch cannot distinguish and sent anyone following it
+            # to a second empty run.
+            "note": "; ".join(warnings) or "no candidates; widen --candidates or rephrase",
+        }
 
     # -- stage 2: rerank -----------------------------------------------------
     ranked = pool
@@ -185,6 +254,31 @@ def apply_rerank(pool: list[dict[str, Any]], scored: list[dict[str, Any]]) -> li
         and not isinstance(i, bool)
         and 0 <= i < len(pool)
     ]
+
+
+def _tier1_fix(sources: list[str]) -> str:
+    """What to actually do when discovery is down, per source.
+
+    This used to say "store a Semantic Scholar API key -- it is free", which
+    stopped being true: Ai2 no longer accept key requests from free-domain email
+    addresses, so for a personal account that instruction has no ending. Advice
+    that cannot be followed is worse than no advice, because it is followed
+    first and the real fix is found second.
+    """
+    if sources == ["s2"]:
+        return (
+            "Semantic Scholar's own API only issues keys to institutional addresses, so "
+            "this is the shared anonymous pool. Switch to Ai2's Asta, which serves the "
+            "same corpus and does not require one: "
+            "python -m tools.paper_search search '<question>' --tier1 asta --json   "
+            "(or set [retrieval] tier1 = \"asta\" in config/grad.toml)"
+        )
+    return (
+        "retry -- discovery is rate limited, not broken. A key raises Asta's limits and "
+        "is requested from a form rather than reviewed: "
+        f"python -m tools.jobs credential set {credentials.ASTA_KEY}. "
+        "Meanwhile --local-only searches what is already ingested."
+    )
 
 
 def _local_ranked(question: str, hyde: str | None, cfg: Any, trace: dict[str, Any]) -> list[dict[str, Any]]:

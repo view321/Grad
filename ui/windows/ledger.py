@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any
 
 from ui import kit
+from ui.tasks import envelope_message, run_tool
 
 FILTERS = (("open", "OPEN"), ("met", "MET"), ("broken", "BROKEN"))
 
@@ -60,10 +61,10 @@ def render(workspace: Any) -> None:
         return
 
     for entry in visible:
-        _entry(entry)
+        _entry(workspace, entry)
 
 
-def _entry(entry: dict[str, Any]) -> None:
+def _entry(workspace: Any, entry: dict[str, Any]) -> None:
     with kit.column(f"grad-row striped {entry['accent']}", gap=0):
         with kit.row("", gap=9):
             kit.text(entry["id"], "grad-mono", tag="span")
@@ -95,10 +96,78 @@ def _entry(entry: dict[str, Any]) -> None:
                     kit.chip(run_id, "outline")
 
         if entry.get("unjudged"):
-            # The verdict is a ledger write, so it belongs to the CLI. The UI's
-            # job is to make sure nobody has to go looking for the command.
-            kit.pre(
-                f"python -m tools.ledger verdict {(entry.get('runs') or ['<run>'])[-1]} "
-                f"--quantity {entry.get('quantity') or '<quantity>'} "
-                "--verdict bug|real|inconclusive --note '...' --json"
+            _verdict(workspace, entry)
+
+
+#: The three verdicts `tools.ledger verdict` accepts, and what each one claims.
+#: Kept in the same order as the CLI's `choices` so the two cannot drift apart
+#: into a UI that offers a judgement the ledger will not take.
+VERDICTS = (
+    ("bug", "✎ BUG", "ok", "the deviation is ours — the code was wrong"),
+    ("real", "⚠ REAL", "danger", "the deviation is the world's — the prediction was wrong"),
+    ("inconclusive", "? INCONCLUSIVE", "neutral", "neither, yet — say why in the note"),
+)
+
+
+def _verdict(workspace: Any, entry: dict[str, Any]) -> None:
+    """The one field a program does not fill in.
+
+    This was a copyable command, on the argument that a ledger write belongs to
+    the CLI. It still does -- the buttons run exactly that command -- but the
+    reason to type it by hand was never a good one: `report check` refuses while
+    any cited run carries an unjudged deviation, so this is on the critical path
+    between a result and a paper, and it was the only step on that path that
+    required leaving the app.
+
+    The note is not optional here even though the CLI defaults it to empty. A
+    verdict with no reasoning ages badly, and the ledger is read months later by
+    someone who no longer remembers which of the three it was.
+    """
+    from nicegui import ui
+
+    run_id = (entry.get("runs") or [None])[-1]
+    quantity = entry.get("quantity")
+    if not run_id or not quantity:
+        # `verdict` is keyed on a run and a quantity. Without both there is
+        # nothing to write against, and a button that cannot work should say so
+        # rather than fail on click.
+        kit.note("no run and quantity to judge against yet")
+        return
+
+    async def judge(verdict: str) -> None:
+        reason = (note.value or "").strip()
+        if not reason:
+            workspace.say("say why — a verdict with no reasoning ages badly")
+            return
+        note.value = ""
+        payload = await run_tool(
+            "tools.ledger", "verdict", str(run_id),
+            "--quantity", str(quantity),
+            "--verdict", verdict,
+            "--note", reason,
+            "--json",
+        )
+        workspace.say(f"{run_id} {quantity}: {envelope_message(payload)}")
+        workspace.invalidate("ledger")
+        workspace.tick()
+
+    with kit.el("div", "grad-card"):
+        with kit.row("head attention", gap=9):
+            kit.text("UNJUDGED DEVIATION", "", tag="span")
+            kit.spacer()
+            kit.text(f"{run_id} · {quantity}", "", tag="span")
+        with kit.el("div", "body"):
+            note = (
+                ui.input(placeholder="why — this is what the ledger is read for later")
+                .props("borderless dense")
+                .classes("field")
+                .style("width: 100%; padding: 0 8px")
             )
+            with kit.row("", gap=6).style("margin-top: 8px"):
+                for verdict, caption, tone, hint in VERDICTS:
+                    kit.button(
+                        caption,
+                        tone=tone,
+                        title=hint,
+                        on_click=lambda _=None, v=verdict: workspace.spawn(judge(v), "verdict"),
+                    )
