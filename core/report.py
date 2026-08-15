@@ -430,8 +430,32 @@ def check_citations(tex: str, bib: dict[str, dict[str, Any]]) -> list[dict[str, 
 # check that fires on those is a check that gets argued around (§6). This is
 # therefore a floor, not a proof: it catches the shape a result takes, and the
 # `\gradnum` discipline is what covers the rest.
+# The trailing guard is `(?!\w)(?!\.\d)` rather than `(?![\w.])`: a full stop
+# after a number ends a sentence far more often than it continues a version, and
+# excluding every following dot meant "the loss was 2.71." -- the most natural
+# way anyone writes the thing this rule exists to catch -- matched nothing at
+# all. `(?!\.\d)` still refuses to stop half-way through `1.2.3`.
 BARE_NUMBER_RE = re.compile(
-    r"(?<![\w.])(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+(?:\.\d+)?\s*\\?%|\d+[eE][-+]?\d+)(?![\w.])"
+    r"(?<![\w.])(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+(?:\.\d+)?\s*\\?%|\d+[eE][-+]?\d+)"
+    r"(?!\w)(?!\.\d)"
+)
+
+# A version, not a measurement. `GPT-3.5`, `Python 3.11`, `CUDA 12.1`, `v2.0`
+# all have the shape this rule looks for, and an ML report that names a model or
+# a library by version is writing honest prose -- refusing it would make the
+# gate something to be switched off rather than satisfied.
+#
+# The discriminator is what comes *before* the number. A version follows a
+# proper noun or attaches to one with a hyphen; a measured value follows a verb
+# or a preposition -- "loss of 2.71", "reached 3.05", "improved to 0.94". So a
+# number preceded by a capitalised word, or glued to letters, is left alone.
+#
+# The cost is a real false negative: "Loss 2.71" at the start of a sentence is
+# missed. That is the right way round for a check whose failure mode is
+# refusing a correct report, and `\gradnum` remains the discipline that actually
+# guarantees traceability -- this only catches the lapse.
+_VERSION_CONTEXT_RE = re.compile(
+    r"(?:[A-Za-z][\w.+]*[-_]|\b[A-Z][\w.+]*\s+|\bv)\s*$"
 )
 
 # Structural commands whose arguments are not prose.
@@ -492,6 +516,10 @@ def check_prose_numbers(tex: str) -> list[dict[str, Any]]:
     and the one number a model is most tempted to type is the headline result.
     A claim that never goes through `\\gradnum` is a claim rule 1 never sees,
     which also takes it out of `cited_run_ids` and therefore out of rule 3.
+
+    Version strings are exempt -- see `_VERSION_CONTEXT_RE`. "GPT-3.5" and
+    "Python 3.11" have exactly the shape of a measured value, and a report is
+    entitled to name the model it compared against.
     """
     region = written_prose(tex)
     if region is None:
@@ -500,6 +528,8 @@ def check_prose_numbers(tex: str) -> list[dict[str, Any]]:
     body = prose_of(region)
     for line_no, line in enumerate(body.splitlines(), start=1):
         for match in BARE_NUMBER_RE.finditer(line):
+            if _VERSION_CONTEXT_RE.search(line[: match.start()]):
+                continue
             findings.append(
                 {
                     "rule": "claims",

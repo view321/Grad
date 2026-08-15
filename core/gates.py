@@ -347,6 +347,15 @@ def check_smoke_caps(
             detail={**clamped, "target": target_name},
         )
 
+    # A ceiling of zero or less is not "this smoke may cost nothing", it is a
+    # spec that declared `smoke_cost_usd = 0` (or asked for `cost_usd: 0`)
+    # meaning it expects the step to be free. Taken literally it made
+    # `affordable_s` zero and refused every such smoke as too expensive --
+    # punishing the spec that claimed the *least* cost. The configured cap is
+    # the honest reading, and it is what every other path here compares against.
+    if clamped["cost_ceiling_usd"] <= 0:
+        clamped["cost_ceiling_usd"] = max_cost
+
     if rate > 0:
         affordable_s = int((clamped["cost_ceiling_usd"] / rate) * 3600)
         if affordable_s < MIN_SMOKE_WALL_S:

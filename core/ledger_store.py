@@ -286,25 +286,24 @@ def campaign_bound_expectation_ids() -> set[str]:
 
     Imported at point of use: `core.campaign` reads this module.
 
-    An unreadable campaign ledger yields the empty set, which *widens* the gate
-    -- and that is a deliberate trade rather than an oversight. The common case
-    by far is a workspace that has never run a campaign, where there is no file
-    and `jsonl.read` returns nothing; refusing every submission because the
-    optional half of a uniqueness check could not be consulted would take the
-    whole system down for a feature most projects never touch. The narrow
-    binding check against runs, which is the one that governs submissions, is
-    read from a ledger whose absence is not tolerated in the same way.
+    Only `ImportError` is tolerated, and it is the one case that means "there
+    is no campaign machinery here": an absent ledger is not an error at all,
+    because `jsonl.read` returns nothing for a file that does not exist. A
+    broader `except` would have swallowed a *malformed* campaign ledger and
+    returned the empty set, which widens the uniqueness check that calls this
+    -- a gate quietly answering "nothing is bound" because it could not read
+    the file is the failure this whole module is written to avoid.
     """
     try:
         from core import campaign as _campaign  # noqa: PLC0415 - avoids an import cycle
-
-        return {
-            c["expectation_id"]
-            for c in _campaign.campaigns().values()
-            if c.get("expectation_id")
-        }
-    except Exception:  # noqa: BLE001 - no campaign ledger yet
+    except ImportError:
         return set()
+
+    return {
+        c["expectation_id"]
+        for c in _campaign.campaigns().values()
+        if c.get("expectation_id")
+    }
 
 
 def consumed_expectation_ids() -> set[str]:

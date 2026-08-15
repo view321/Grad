@@ -244,32 +244,37 @@ async def drive_turn(
     await client.query(prompt)
     sdk_session_id: str | None = None
     last_usage: Any = None
-    async for message in client.receive_response():
-        # Whatever has not been printed yet -- a token as it arrives, the tail
-        # of a message that was never streamed, or a line naming a tool call.
-        # Never both halves of the same text.
-        chunk = stream.feed(message)
-        if chunk and on_chunk is not None:
-            on_chunk(chunk)
-        # Captured from the stream rather than asked for: the SDK assigns it, and
-        # this is the id `resume` takes when a session is reopened. A resumed
-        # conversation can be given a new id, so the latest wins.
-        candidate = getattr(message, "session_id", None)
-        if isinstance(candidate, str) and candidate:
-            sdk_session_id = candidate
-        # The *last* usage seen, recorded once after the loop -- not one record
-        # per message. `ResultMessage` arrives last and carries the turn's
-        # cumulative usage, so summing every message that has a `usage`
-        # attribute would count the same tokens twice.
-        usage = getattr(message, "usage", None)
-        if usage is not None:
-            last_usage = usage
-
     recorded = None
-    if last_usage is not None:
-        recorded = quota_log.from_sdk_usage(
-            quota_log.STAGE_MAIN, last_usage, model=None, role="research", session=session
-        )
+    try:
+        async for message in client.receive_response():
+            # Whatever has not been printed yet -- a token as it arrives, the
+            # tail of a message that was never streamed, or a line naming a tool
+            # call. Never both halves of the same text.
+            chunk = stream.feed(message)
+            if chunk and on_chunk is not None:
+                on_chunk(chunk)
+            # Captured from the stream rather than asked for: the SDK assigns
+            # it, and this is the id `resume` takes when a session is reopened.
+            # A resumed conversation can be given a new id, so the latest wins.
+            candidate = getattr(message, "session_id", None)
+            if isinstance(candidate, str) and candidate:
+                sdk_session_id = candidate
+            # The *last* usage seen, recorded once after the loop -- not one
+            # record per message. `ResultMessage` arrives last and carries the
+            # turn's cumulative usage, so summing every message that has a
+            # `usage` attribute would count the same tokens twice.
+            usage = getattr(message, "usage", None)
+            if usage is not None:
+                last_usage = usage
+    finally:
+        # In a `finally` because a turn that died half-way still spent what it
+        # spent. Letting the exception skip this would make a failing session
+        # the cheapest way to run untracked -- the accounting would be missing
+        # exactly the turns most worth accounting for.
+        if last_usage is not None:
+            recorded = quota_log.from_sdk_usage(
+                quota_log.STAGE_MAIN, last_usage, model=None, role="research", session=session
+            )
     return {"sdk_session_id": sdk_session_id, "quota": recorded}
 
 

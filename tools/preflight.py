@@ -123,21 +123,27 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     existing = jsonl.read_json(paths.preflight_record(h)) or {}
     results: dict[str, Any] = dict(existing.get("checks", {}))
 
+    #: Only what *this* invocation computed. `results` starts as a snapshot of
+    #: the record taken before the checks ran, and those checks take minutes --
+    #: so writing all of it back would overwrite a concurrent update with a copy
+    #: that was already stale when it was read. A check this run did not touch
+    #: is a check this run has nothing to say about.
+    computed: dict[str, Any] = {}
+
     for name in wanted:
         if not args.force and results.get(name, {}).get("ok"):
             results[name]["skipped_because"] = "already passing for this hash"
             continue
-        results[name] = _run_check(name, sub, cfg, spec_checks)
+        results[name] = computed[name] = _run_check(name, sub, cfg, spec_checks)
 
-    # Merged under the lock rather than written over the top. The checks above
-    # take minutes -- `tests` runs the suite, `smoke` reaches a GPU -- and the
-    # smoke path writes its own result through `record_check_result` while they
-    # run. A plain write of the in-memory dict would drop anything that landed
-    # in between, which for this file means a gate reading a record that is
-    # missing a check that actually passed.
+    # Merged under the lock rather than written over the top. The smoke path
+    # writes its own result through `record_check_result` while the checks
+    # above are still running, and a plain write would drop it -- which for
+    # this file means a gate reading a record that is missing a check that
+    # actually passed.
     def _merge(current: dict[str, Any] | None) -> dict[str, Any]:
         merged = dict((current or {}).get("checks") or {})
-        merged.update(results)
+        merged.update(computed)
         return {
             "submission_hash": h,
             "full_hash": sub.full_hash(),

@@ -267,17 +267,30 @@ def _notes_id(path: Path) -> str:
     `notes:notes\\foo.md` -- two documents, same content, both citable -- while
     the bare-name form collided between same-named files in different folders.
 
-    Separators are normalised because a corpus id that differs by slash
-    direction is two ids on Windows and one everywhere else.
+    Canonicalised in one step, then made relative in another. Folding the two
+    together meant a path outside the workspace -- `../shared/notes.md`, or a
+    symlink pointing out of it -- fell into the fallback and lost its
+    resolution as well as its relativity, so the very paths most in need of
+    canonical form were the ones that did not get it. Resolving first keeps
+    `..` and symlinks collapsed whichever branch the id ends up on.
+
+    `as_posix()` rather than replacing backslashes: on POSIX a backslash is a
+    legal character *in a filename*, and rewriting it would fuse `a\\b.md` and
+    `a/b.md` into one id.
     """
     try:
         resolved = path.resolve()
-        relative = resolved.relative_to(paths.root().resolve())
+    except OSError:
+        # A path that cannot be resolved (a broken link, a permission wall) is
+        # still one file with one name; absolute is the best canonical form
+        # available.
+        resolved = Path(path).absolute()
+    try:
+        return resolved.relative_to(paths.root().resolve()).as_posix()
     except (ValueError, OSError):
-        # Outside the workspace: keep the absolute path, which is still one
-        # stable id for one file.
-        relative = path if path.is_absolute() else Path(path).absolute()
-    return str(relative).replace("\\", "/")
+        # Outside the workspace: the resolved absolute path is still one stable
+        # id for one file.
+        return resolved.as_posix()
 
 
 def _notes_args(p: argparse.ArgumentParser) -> None:

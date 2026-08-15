@@ -847,7 +847,13 @@ def _render_bib(entries: dict[str, dict[str, Any]]) -> str:
     ]
     for key, entry in sorted(entries.items()):
         out.append(f"@{entry['type']}{{{key},")
-        for field in ("title", "author", "year", "note", "gradsource", "gradmatch"):
+        # `gradtitlematch` belongs here with `gradmatch`: `check_citations`
+        # re-checks *both* overlap scores against the thresholds `cite` applied,
+        # so dropping one from the rendered file made every genuine S2 citation
+        # fail the gate that its own resolution had already satisfied.
+        for field in (
+            "title", "author", "year", "note", "gradsource", "gradmatch", "gradtitlematch",
+        ):
             if entry.get(field) not in (None, ""):
                 out.append(f"  {field} = {{{entry[field]}}},")
         out.append("}")

@@ -270,7 +270,174 @@ def test_rerunning_write_replaces_the_prose_rather_than_stacking_it():
 
 
 # ---------------------------------------------------------------------------
+# the prose rule, and the honest prose it must not refuse
+# ---------------------------------------------------------------------------
+def _written(body: str) -> str:
+    return (
+        "\\begin{document}\n\\maketitle\n"
+        f"{report_lib.PROSE_START}\n{body}\n{report_lib.PROSE_END}\n\\end{{document}}"
+    )
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "We compared against GPT-3.5 on the same eval.",
+        "All runs used Python 3.11 and CUDA 12.1.",
+        "The driver was v2.0 throughout.",
+        "Llama-3.1 was the baseline.",
+        "Trained with PyTorch 2.4 on one node.",
+    ],
+)
+def test_a_version_string_is_not_a_measured_value(sentence):
+    """A report naming the model or library it used is writing honest prose.
+
+    These have exactly the shape the rule looks for -- a decimal with a
+    non-word character before it -- so refusing them would make the gate
+    something to switch off rather than satisfy.
+    """
+    assert report_lib.check_prose_numbers(_written(sentence)) == []
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "The model reached a validation loss of 2.71.",
+        "Accuracy improved to 0.94 on the held-out split.",
+        "It recovered 94.2% of the baseline.",
+        "The gap narrowed to 1.3e-2 by the final step.",
+        "Final loss: 2.71",
+    ],
+)
+def test_a_measured_value_is_still_caught(sentence):
+    """The exemption must not swallow the rule it is carved out of.
+
+    The first case is also a regression: a number ending a sentence was
+    followed by a full stop, and the original guard excluded any following dot
+    -- so the most natural way to write a result matched nothing at all.
+    """
+    findings = report_lib.check_prose_numbers(_written(sentence))
+    assert findings, f"expected a finding for: {sentence}"
+    assert findings[0]["rule"] == "claims"
+
+
+# ---------------------------------------------------------------------------
+# a turn that died half-way still spent what it spent
+# ---------------------------------------------------------------------------
+def test_usage_is_recorded_even_when_the_turn_raises(workspace):
+    """Skipping the record on failure would make a failing session the cheapest
+    way to run untracked."""
+    import asyncio
+
+    import agent
+    from core import quota_log
+
+    class _Msg:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class _DyingClient:
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield _Msg(usage={"input_tokens": 90, "output_tokens": 10}, session_id="s")
+            raise RuntimeError("the transport dropped")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.drive_turn(_DyingClient(), "hi", agent.TurnStream(), session="s-1"))
+
+    rows = [r for r in quota_log.entries() if r["stage"] == quota_log.STAGE_MAIN]
+    assert rows and rows[0]["input_tokens"] == 90
+
+
+# ---------------------------------------------------------------------------
 # ledgers and folds
+# ---------------------------------------------------------------------------
+def test_a_spec_that_declares_a_free_smoke_is_not_refused(workspace, cfg):
+    """`smoke_cost_usd = 0` meant "I expect this to be free", and taking it
+    literally made the affordable wall clock zero -- refusing the spec that
+    claimed the *least* cost."""
+    d = workspace / "pipeline"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "train.py").write_text("print('x')\n", encoding="utf-8")
+    (d / "spec.toml").write_text(
+        "entrypoint = 'train.py'\nimage = 'org/img@sha256:aaaa'\n"
+        "[estimate]\nsmoke_cost_usd = 0.0\n",
+        encoding="utf-8",
+    )
+    from core.submission import Submission
+
+    sub = Submission.load(d / "spec.toml", resolve_digest=False)
+    caps = gates.check_smoke_caps(sub, cfg, rate_usd_per_hour=0.40)
+    assert caps["cost_ceiling_usd"] == pytest.approx(0.50)
+    assert caps["timeout_s"] >= 60
+
+
+def test_a_malformed_campaign_ledger_is_not_read_as_nothing_bound(workspace, monkeypatch):
+    """Returning the empty set on any error widened the uniqueness check: a
+    gate answering "nothing is bound" because it could not read the file."""
+    from core import campaign as campaign_mod
+
+    def _boom():
+        raise ValueError("the campaign ledger is corrupt")
+
+    monkeypatch.setattr(campaign_mod, "campaigns", _boom)
+    with pytest.raises(ValueError):
+        ls.consumed_expectation_ids()
+
+
+def test_only_the_checks_this_run_computed_are_written_back(workspace, cfg, monkeypatch):
+    """`results` is a snapshot taken before the checks ran, and they take
+    minutes -- writing all of it back would overwrite a concurrent update with
+    a copy that was already stale when it was read."""
+    from tools import preflight
+
+    # A record already on disk with one passing check.
+    preflight.record_check_result("hash-1", "tests", {"ok": True, "marker": "first"})
+    # A second writer updates it while we would have been running checks.
+    preflight.record_check_result("hash-1", "tests", {"ok": True, "marker": "second"})
+    record = jsonl.read_json(paths.preflight_record("hash-1"))
+    assert record["checks"]["tests"]["marker"] == "second", "the later write wins"
+
+
+# ---------------------------------------------------------------------------
+# document ids that survive how the path was spelled
+# ---------------------------------------------------------------------------
+def test_a_notes_id_is_the_same_however_the_path_was_written(workspace, monkeypatch):
+    from tools import paper_ingest
+
+    notes = workspace / "notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "derivation.md").write_text("x", encoding="utf-8")
+
+    monkeypatch.chdir(workspace)
+    by_relative = paper_ingest._notes_id(pytest.importorskip("pathlib").Path("notes/derivation.md"))  # noqa: SLF001
+    by_absolute = paper_ingest._notes_id(notes / "derivation.md")  # noqa: SLF001
+    by_traversal = paper_ingest._notes_id(notes / ".." / "notes" / "derivation.md")  # noqa: SLF001
+
+    assert by_relative == by_absolute == by_traversal == "notes/derivation.md"
+    assert "\\" not in by_relative
+
+
+def test_a_notes_path_outside_the_workspace_keeps_its_resolution(workspace, tmp_path):
+    """The fallback used to drop the resolution as well as the relativity, so
+    the paths most in need of canonical form were the ones that did not get
+    it."""
+    from tools import paper_ingest
+
+    outside = tmp_path.parent / "outside-workspace"
+    outside.mkdir(exist_ok=True)
+    target = outside / "shared.md"
+    target.write_text("x", encoding="utf-8")
+
+    direct = paper_ingest._notes_id(target)  # noqa: SLF001
+    traversed = paper_ingest._notes_id(outside / "." / "shared.md")  # noqa: SLF001
+    assert direct == traversed
+    assert direct.endswith("outside-workspace/shared.md")
+    assert "\\" not in direct
+
+
 # ---------------------------------------------------------------------------
 def test_a_duplicate_project_record_cannot_redefine_a_ceiling(workspace):
     """The fold was last-writer-wins for the one record type that sets a

@@ -350,6 +350,27 @@ def test_the_generated_bib_carries_provenance(workspace):
     assert report_lib.check_citations(r"\cite{k}", parsed) == []
 
 
+def test_an_s2_entry_round_trips_both_overlap_scores(workspace):
+    """`check_citations` re-checks `gradmatch` *and* `gradtitlematch`, so both
+    have to survive being written to references.bib and read back.
+
+    `_render_bib` listed only the first, which meant a citation `cite` had
+    genuinely resolved and verified was refused by `check` the moment it was
+    written down -- the writer and the gate disagreeing about the evidence.
+    """
+    written = {
+        "k": {
+            "type": "article", "key": "k", "title": "Scaling Laws", "author": "Unknown",
+            "year": "2020", "note": "S2:0123456789abcdef", "gradsource": "s2",
+            "gradmatch": 0.42, "gradtitlematch": 0.31,
+        }
+    }
+    parsed = report_lib.parse_bib(report._render_bib(written))
+    assert parsed["k"]["gradmatch"] == "0.42"
+    assert parsed["k"]["gradtitlematch"] == "0.31"
+    assert report_lib.check_citations(r"\cite{k}", parsed) == []
+
+
 def test_an_unresolvable_placeholder_is_left_in_place_and_refused(workspace, project, monkeypatch):
     """"a citation quietly deleted is worse than one that fails loudly, because
     the sentence it supported survives without support." """
