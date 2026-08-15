@@ -1,4 +1,4 @@
-"""The NiceGUI desktop app: a tiling workspace over eleven windows.
+"""The NiceGUI desktop app: a tiling workspace over twelve windows.
 
     "The things that make it pleasant -- being able to see a funnel's reasoning,
      a preflight's failing check, a prediction against its outcome -- are the
@@ -13,7 +13,7 @@ where:
 * `ui/models.py`   -- what each window shows, as plain data, pure and tested
 * `ui/registry.py` -- the list of windows the whole shell is derived from
 * `ui/shell.py`    -- the chrome, and how a window survives a retile
-* `ui/windows/`    -- eleven renderers, none of which read a ledger directly
+* `ui/windows/`    -- twelve renderers, none of which read a ledger directly
 
 This module keeps only what is genuinely the application's: the SDK session, the
 per-client keying, and `run()`.
@@ -69,6 +69,10 @@ class Session:
 
     def __init__(self, key: str = "default") -> None:
         self.key = key
+        # A live client, so a claim it holds is not stale. Registering here
+        # rather than at claim time means `most_recent` can tell "another window
+        # is in this session" from "the window that was in it is gone".
+        sessions.register(key)
         self.client: Any = None
         #: The turn in flight, as `agent.TurnStream` blocks: prose, and the tool
         #: calls between it. The chat window's timer draws from here, so a card
@@ -237,11 +241,24 @@ class Session:
         self.adopt()
 
     async def ask(self, prompt: str, on_settle: Any) -> None:
-        await self.start()
         import agent  # noqa: PLC0415
 
-        self.settled.append({"role": "user", "text": prompt})
+        # Set *before* the first await, not after. `start()` spawns the SDK
+        # subprocess and takes seconds on a cold session, and the composer's
+        # guard is `if session.busy: return` -- so a second Enter during that
+        # window used to pass the guard, and two `ask` coroutines would run
+        # `query`/`receive_response` concurrently on one client, interleaving
+        # two turns into one block list.
+        if self.busy:
+            return
         self.busy = True
+        try:
+            await self.start()
+        except Exception:
+            self.busy = False
+            raise
+
+        self.settled.append({"role": "user", "text": prompt})
         # The turn lands in the stream's blocks as it arrives; the chat window's
         # ~15 Hz timer is what turns that into something on screen. The same list
         # the stream appends to, not a copy -- a snapshot taken here would never
@@ -249,17 +266,22 @@ class Session:
         stream = agent.TurnStream()
         self.blocks = stream.blocks
         try:
-            await self.client.query(prompt)
-            async for message in self.client.receive_response():
-                # Captured from the stream rather than asked for: the SDK
-                # assigns it, and this is the id `resume` takes when the session
-                # is reopened. Every message carrying one carries the same one,
-                # so the first is enough -- but a resumed conversation can be
-                # given a *new* id by the CLI, so the latest wins.
-                sdk_id = getattr(message, "session_id", None)
-                if isinstance(sdk_id, str) and sdk_id:
-                    self.sdk_session_id = sdk_id
-                stream.feed(message)
+            # The same driver the CLI runs: it checks the token allocation before
+            # issuing the turn and records what the turn spent. Doing it here
+            # rather than inline is what stops the two surfaces disagreeing about
+            # whether the budget applies.
+            result = await agent.drive_turn(
+                self.client, prompt, stream, session=self.session_id
+            )
+            if result.get("sdk_session_id"):
+                self.sdk_session_id = result["sdk_session_id"]
+        except agent.BudgetRefused as exc:
+            # Not an error in the transcript's sense: the system did what it
+            # says it does. It still has to be visible, because otherwise the
+            # composer just goes quiet.
+            stream.note(
+                f"\n\n**{exc.refusal['message']}**\n\n`{exc.refusal['fix']}`"
+            )
         except Exception as exc:  # noqa: BLE001 - the transcript must say why a turn died
             # Otherwise the turn settles as an empty message: the prompt looks
             # unanswered and there is nothing on screen to say why. Only the
@@ -319,6 +341,20 @@ class Session:
 
     def _persist(self) -> None:
         """Closing the window should not be destructive."""
+        # The claim is checked at the write, not only at adoption. `write`
+        # replaces the whole file, so a client that has lost its claim -- a
+        # reload took it over, a workspace switch moved underneath it -- would
+        # otherwise overwrite the holder's transcript with its own stale copy,
+        # which is the exact data loss the claim exists to prevent.
+        #
+        # Only *another live* holder blocks the write. An unclaimed session has
+        # no one to overwrite, and refusing there would make persistence depend
+        # on having gone through `adopt` rather than on the invariant.
+        if sessions.held_by_other(self.session_id, self.key):
+            log.warning(
+                "not persisting session %s: another client holds it", self.session_id
+            )
+            return
         try:
             sessions.write(
                 self.session_id,
@@ -452,19 +488,34 @@ def _current_project() -> str | None:
 
 
 def _client_key() -> str:
-    """A filesystem-safe id for this client's transcript.
+    """A unique id for this *connection*, used as the session-claim owner.
 
-    The browser id is signed into a cookie (see `_storage_secret`), so a reload
-    restores its own transcript rather than someone else's; the connection id is
-    the fallback when storage is unavailable, and isolates without persisting.
+    Both halves are here on purpose. The browser id is signed into a cookie (see
+    `_storage_secret`) and identifies the person; the connection id distinguishes
+    one tab from another.
+
+    It used to be the browser id alone, which made two tabs of one browser the
+    same owner -- and `claim` returns True when the holder *is* the owner, so
+    both tabs adopted the same session and both wrote the whole file on every
+    turn. That is the two-writers data loss the claim exists to prevent, reached
+    through the claim itself.
+
+    The cost of per-connection ownership is that a page reload arrives as a new
+    owner while the old client's `on_disconnect` may not have fired yet, so the
+    reloaded page can land on the next session down the list rather than the one
+    it was just in. `sessions.claim` takes over a claim whose owner is no longer
+    live, which closes that window as soon as the disconnect lands; opening the
+    wrong session is recoverable from the sessions menu, and overwriting one is
+    not.
     """
     from nicegui import app as nicegui_app, context  # noqa: PLC0415
 
     try:
-        key = str(nicegui_app.storage.browser.get("id") or "")
+        browser = str(nicegui_app.storage.browser.get("id") or "")
     except (RuntimeError, KeyError):  # no storage_secret configured
-        key = ""
-    key = key or str(context.client.id)
+        browser = ""
+    connection = str(getattr(context.client, "id", "")) or "0"
+    key = f"{browser or 'anon'}-{connection}"
     return re.sub(r"[^A-Za-z0-9_-]", "", key)[:64] or "default"
 
 

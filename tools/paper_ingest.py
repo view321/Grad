@@ -257,6 +257,42 @@ def _embed_chunks(con: Any, cfg: Any, chunk_ids: list[int], texts: list[str]) ->
     return len(vectors)
 
 
+def _notes_id(path: Path) -> str:
+    """A stable document id for a notes file: its path relative to the root.
+
+    One file has to have one id however it was named on the command line. The
+    id used to be `path.relative_to(root)` for an absolute path inside the
+    workspace and `path.name` otherwise, so `paper_ingest notes notes/foo.md`
+    and the same file by absolute path produced `notes:foo.md` and
+    `notes:notes\\foo.md` -- two documents, same content, both citable -- while
+    the bare-name form collided between same-named files in different folders.
+
+    Canonicalised in one step, then made relative in another. Folding the two
+    together meant a path outside the workspace -- `../shared/notes.md`, or a
+    symlink pointing out of it -- fell into the fallback and lost its
+    resolution as well as its relativity, so the very paths most in need of
+    canonical form were the ones that did not get it. Resolving first keeps
+    `..` and symlinks collapsed whichever branch the id ends up on.
+
+    `as_posix()` rather than replacing backslashes: on POSIX a backslash is a
+    legal character *in a filename*, and rewriting it would fuse `a\\b.md` and
+    `a/b.md` into one id.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        # A path that cannot be resolved (a broken link, a permission wall) is
+        # still one file with one name; absolute is the best canonical form
+        # available.
+        resolved = Path(path).absolute()
+    try:
+        return resolved.relative_to(paths.root().resolve()).as_posix()
+    except (ValueError, OSError):
+        # Outside the workspace: the resolved absolute path is still one stable
+        # id for one file.
+        return resolved.as_posix()
+
+
 def _notes_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("path", help="a markdown file or a directory of them")
     p.add_argument("--no-vectors", action="store_true")
@@ -282,7 +318,7 @@ def cmd_notes(args: argparse.Namespace) -> dict[str, Any]:
             ]
             if not chunks:
                 continue
-            doc_id = f"notes:{path.relative_to(paths.root()) if path.is_absolute() and paths.root() in path.parents else path.name}"
+            doc_id = f"notes:{_notes_id(path)}"
             corpus.upsert_document(
                 con,
                 {"id": doc_id, "title": path.stem, "source": "notes", "path": str(path),

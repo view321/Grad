@@ -111,7 +111,40 @@ def escaped_evolve_block(baseline: str, candidate: str) -> dict[str, Any]:
     Whitespace-only differences outside the block do not count as an escape:
     a reformatter is not an environment change, and a check that fires
     spuriously is a check that gets argued around (§6).
+
+    **The markers are not evidence about themselves.** Each side's "outside" was
+    computed from its own markers, so a mutation that wrapped injected code --
+    new imports, a file write, an environment change -- in a *fresh*
+    `EVOLVE-BLOCK-START`/`END` pair moved that code into `inside` and left the
+    two outsides identical, and the escape check reported no escape. An LLM
+    mutation operator imitating the marker syntax it can see in its input is a
+    realistic accident, not just an attack. So the marker structure itself has
+    to match the baseline's before the outside comparison means anything.
     """
+    base_starts, base_ends = baseline.count(BLOCK_START), baseline.count(BLOCK_END)
+    cand_starts, cand_ends = candidate.count(BLOCK_START), candidate.count(BLOCK_END)
+
+    if cand_starts != cand_ends:
+        return {
+            "escaped": True,
+            "reason": (
+                f"the candidate has {cand_starts} EVOLVE-BLOCK-START marker(s) and "
+                f"{cand_ends} END marker(s); an unbalanced file has no well-defined "
+                "mutable region"
+            ),
+            "requires": "smoke",
+        }
+    if (cand_starts, cand_ends) != (base_starts, base_ends):
+        return {
+            "escaped": True,
+            "reason": (
+                f"the mutation changed the number of EVOLVE-BLOCK regions "
+                f"({base_starts} -> {cand_starts}); new markers can hide changed code "
+                "from this check, so the region structure is fixed by the baseline"
+            ),
+            "requires": "smoke",
+        }
+
     _, base_outside = split_blocks(baseline)
     _, cand_outside = split_blocks(candidate)
 

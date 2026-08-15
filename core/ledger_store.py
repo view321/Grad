@@ -115,7 +115,7 @@ def runs_events() -> list[dict[str, Any]]:
     return jsonl.read(paths.runs_path())
 
 
-def append_run_event(record: dict[str, Any]) -> dict[str, Any]:
+def append_run_event(record: dict[str, Any], *, precondition: Any = None) -> dict[str, Any]:
     """Append one run event.
 
     A `run_submitted` event binds an expectation, and the gate that checks the
@@ -124,22 +124,38 @@ def append_run_event(record: dict[str, Any]) -> dict[str, Any]:
     therefore repeated here, inside the append lock, where it is atomic with the
     write. `check_expectation` still runs first because it produces the better
     error message; this is the backstop, not the explanation.
+
+    `precondition` is the caller's own in-lock check, run first. The spend
+    ceilings need one for the same reason the binding does: `check_spend` reads
+    the ledger and the record lands later, so two submitters could both pass and
+    both commit. See `submit.record_submission`.
     """
     expectation_id = record.get("expectation_id") if record.get("type") == T_RUN_SUBMITTED else None
     if not expectation_id:
-        return jsonl.append(paths.runs_path(), record)
+        return jsonl.append(paths.runs_path(), record, precondition=precondition)
 
     def _still_unbound() -> None:
-        if expectation_id in bound_expectation_ids():
+        # Binding before spend, matching `check_submit`'s order: when both have
+        # gone stale, the caller should hear the same refusal first inside the
+        # lock as it would have outside it.
+        if expectation_id in consumed_expectation_ids():
             from core.errors import EXIT_EXPECTATION, GateRefusal
 
+            retracted = expectation_id in falsified_ids()
             raise GateRefusal(
                 "expectation_bound",
-                f"expectation {expectation_id!r} was bound to another run while this one was "
-                "being submitted; each prediction covers exactly one run",
+                f"expectation {expectation_id!r} was "
+                + (
+                    "retracted while this run was being submitted"
+                    if retracted
+                    else "bound to another run or campaign while this one was being submitted"
+                )
+                + "; each prediction covers exactly one run",
                 EXIT_EXPECTATION,
                 fix="mint a new expectation and resubmit: python -m tools.ledger expect ... --json",
             )
+        if precondition is not None:
+            precondition()
 
     return jsonl.append(paths.runs_path(), record, precondition=_still_unbound)
 
@@ -263,6 +279,45 @@ def bound_expectation_ids() -> set[str]:
         for rec in runs_events()
         if rec.get("type") == T_RUN_SUBMITTED and rec.get("expectation_id")
     }
+
+
+def campaign_bound_expectation_ids() -> set[str]:
+    """Expectations a campaign has consumed.
+
+    Imported at point of use: `core.campaign` reads this module.
+
+    Only `ImportError` is tolerated, and it is the one case that means "there
+    is no campaign machinery here": an absent ledger is not an error at all,
+    because `jsonl.read` returns nothing for a file that does not exist. A
+    broader `except` would have swallowed a *malformed* campaign ledger and
+    returned the empty set, which widens the uniqueness check that calls this
+    -- a gate quietly answering "nothing is bound" because it could not read
+    the file is the failure this whole module is written to avoid.
+    """
+    try:
+        from core import campaign as _campaign  # noqa: PLC0415 - avoids an import cycle
+    except ImportError:
+        return set()
+
+    return {
+        c["expectation_id"]
+        for c in _campaign.campaigns().values()
+        if c.get("expectation_id")
+    }
+
+
+def consumed_expectation_ids() -> set[str]:
+    """Every expectation that can no longer be bound: to a run, to a campaign,
+    or retracted.
+
+    One predicate, because there were three. `gates.check_expectation` consulted
+    runs only, `evolve` consulted runs and campaigns, and neither consulted
+    `falsified_ids()` -- so a prediction bound to a campaign could be re-bound to
+    a run, and a *retracted* prediction could be bound to anything. "Each
+    prediction covers exactly one run" has to mean the same thing at every
+    binding site or it means nothing at one of them.
+    """
+    return bound_expectation_ids() | campaign_bound_expectation_ids() | falsified_ids()
 
 
 def in_flight() -> list[Run]:

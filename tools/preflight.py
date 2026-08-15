@@ -123,26 +123,46 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     existing = jsonl.read_json(paths.preflight_record(h)) or {}
     results: dict[str, Any] = dict(existing.get("checks", {}))
 
+    #: Only what *this* invocation computed. `results` starts as a snapshot of
+    #: the record taken before the checks ran, and those checks take minutes --
+    #: so writing all of it back would overwrite a concurrent update with a copy
+    #: that was already stale when it was read. A check this run did not touch
+    #: is a check this run has nothing to say about.
+    computed: dict[str, Any] = {}
+
     for name in wanted:
         if not args.force and results.get(name, {}).get("ok"):
             results[name]["skipped_because"] = "already passing for this hash"
             continue
-        results[name] = _run_check(name, sub, cfg, spec_checks)
+        results[name] = computed[name] = _run_check(name, sub, cfg, spec_checks)
 
-    record = {
-        "submission_hash": h,
-        "full_hash": sub.full_hash(),
-        "spec": str(sub.spec_path),
-        "verified_at": now_iso(),
-        "resolved": sub.resolved(),
-        "checks": results,
-        "warnings": sub.warnings,
-        "estimate_usd": sub.estimated_cost_usd(),
-        "estimated_duration_s": sub.estimated_duration_s(),
-    }
-    jsonl.write_json(paths.preflight_record(h), record)
+    # Merged under the lock rather than written over the top. The smoke path
+    # writes its own result through `record_check_result` while the checks
+    # above are still running, and a plain write would drop it -- which for
+    # this file means a gate reading a record that is missing a check that
+    # actually passed.
+    def _merge(current: dict[str, Any] | None) -> dict[str, Any]:
+        merged = dict((current or {}).get("checks") or {})
+        merged.update(computed)
+        return {
+            "submission_hash": h,
+            "full_hash": sub.full_hash(),
+            "spec": str(sub.spec_path),
+            "verified_at": now_iso(),
+            "resolved": sub.resolved(),
+            "checks": merged,
+            "warnings": sub.warnings,
+            "estimate_usd": sub.estimated_cost_usd(),
+            "estimated_duration_s": sub.estimated_duration_s(),
+        }
 
-    failing = [n for n, r in results.items() if r.get("ok") is False]
+    record = jsonl.update_json(paths.preflight_record(h), _merge)
+    results = record["checks"]
+
+    # `is not True`, matching `gates.check_preflight`: a check that recorded no
+    # verdict at all is not a check that passed, and the CLI must not report a
+    # clean run where the gate will refuse.
+    failing = [n for n, r in results.items() if not (isinstance(r, dict) and r.get("ok") is True)]
     payload = {
         "submission_hash": h,
         "record": str(paths.preflight_record(h)),
@@ -371,13 +391,22 @@ def record_check_result(submission_hash: str, name: str, result: dict[str, Any])
 
     Used by the submitters to fold a smoke result back into the pending
     preflight record for the submission it validates.
+
+    Locked read-modify-write: a submitter folding a smoke result here while
+    `preflight run` writes its own checks would otherwise drop one of the two
+    sets, and a record missing a check is a record the gate refuses on -- or,
+    worse, one whose missing check nobody notices.
     """
-    path = paths.preflight_record(submission_hash)
-    record = jsonl.read_json(path) or {"submission_hash": submission_hash, "checks": {}}
-    record.setdefault("checks", {})[name] = {**result, "at": now_iso()}
-    record["verified_at"] = now_iso()
-    jsonl.write_json(path, record)
-    return record
+
+    def _fold(current: dict[str, Any] | None) -> dict[str, Any]:
+        record = current or {"submission_hash": submission_hash, "checks": {}}
+        if not isinstance(record.get("checks"), dict):
+            record["checks"] = {}
+        record["checks"][name] = {**result, "at": now_iso()}
+        record["verified_at"] = now_iso()
+        return record
+
+    return jsonl.update_json(paths.preflight_record(submission_hash), _fold)
 
 
 if __name__ == "__main__":

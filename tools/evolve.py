@@ -365,18 +365,33 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     }
     camp.append_campaign(record)
 
-    result = _drive(
-        campaign_id=campaign_id,
-        task_dir=task_dir,
-        baseline_source=baseline_source,
-        generations=args.generations,
-        population=args.population,
-        project_id=project_id,
-        per_candidate=args.estimate_per_candidate_usd,
-        timeout_s=args.timeout_s,
-        overrides=args.overrides,
-        cfg=cfg,
-    )
+    # `_drive` raises for the expected case as well as the unexpected one: the
+    # installed ShinkaEvolve exposes no per-generation entry point, so the first
+    # proposal raises ConfigError by design (§23 item 1). Left uncaught, the
+    # campaign record stayed `open` forever -- consuming its expectation,
+    # accepting halt requests nothing would ever read, and counting against the
+    # project's allocation. A campaign that stopped is a campaign that closes,
+    # whichever way it stopped.
+    try:
+        result = _drive(
+            campaign_id=campaign_id,
+            task_dir=task_dir,
+            baseline_source=baseline_source,
+            generations=args.generations,
+            population=args.population,
+            project_id=project_id,
+            per_candidate=args.estimate_per_candidate_usd,
+            timeout_s=args.timeout_s,
+            overrides=args.overrides,
+            cfg=cfg,
+        )
+    except BaseException as exc:  # noqa: BLE001 - including KeyboardInterrupt
+        camp.close_campaign(
+            campaign_id,
+            status="failed",
+            reason=f"{type(exc).__name__}: {exc}",
+        )
+        raise
 
     camp.close_campaign(campaign_id, status=result["status"], reason=result.get("reason", ""))
     return {
@@ -406,15 +421,17 @@ def _bind_expectation(expectation_id: str) -> dict[str, Any]:
                 "--direction increase --claim 'the evolved variant beats baseline X' --json"
             ),
         ) from None
-    bound = {
-        c.get("expectation_id")
-        for c in camp.campaigns().values()
-        if c.get("expectation_id")
-    } | ls.bound_expectation_ids()
-    if expectation_id in bound:
+    # One predicate, shared with `gates.check_expectation`: runs, campaigns, and
+    # retractions. This function used to compute the union itself while the
+    # submit gate checked runs only, so the two binding sites disagreed about
+    # what "already bound" meant -- and neither of them checked `falsify`.
+    if expectation_id in ls.consumed_expectation_ids():
+        retracted = expectation_id in ls.falsified_ids()
         raise GateRefusal(
-            "expectation_bound",
-            f"expectation {expectation_id!r} is already bound to a run or campaign",
+            "expectation_falsified" if retracted else "expectation_bound",
+            f"expectation {expectation_id!r} was retracted"
+            if retracted
+            else f"expectation {expectation_id!r} is already bound to a run or campaign",
             5,
             fix="mint a new expectation for this campaign",
         )

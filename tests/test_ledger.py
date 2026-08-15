@@ -106,7 +106,12 @@ def test_in_range_result(workspace):
 def test_missing_quantity_is_flagged_not_ignored(workspace):
     expectation = {"id": "exp-1", "quantity": "val_loss", "predicted": {"low": 1, "high": 2}}
     dev = submit_lib.compute_deviations(expectation, {"other": 1.0})[0]
-    assert dev["in_range"] is False
+    # None, not False: `Run.unjudged_deviations` documents None as "the cases no
+    # program can settle" and names this one, and the SQLite index stores NULL
+    # to separate "needs a verdict" from "numerically out of range". What
+    # matters either way is that it is not True, so a verdict is still demanded.
+    assert dev["in_range"] is None
+    assert dev["in_range"] is not True
     assert "no value" in dev["reason"]
 
 

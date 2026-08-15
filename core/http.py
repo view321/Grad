@@ -794,12 +794,26 @@ def rerank(query: str, documents: Sequence[str], *, cfg: Config, top_n: int) -> 
         )
     data = resp.json()
     usage = data.get("usage", {}) or {}
+    # A response that omits `usage.cost` used to book the call at $0.00, which is
+    # indistinguishable from a call that was genuinely free. The shape of this
+    # response is documented but unverified against the live service, so the
+    # absence is recorded rather than rounded to zero: `cost_basis` is what tells
+    # a later reader whether the credits ceiling actually saw this spend.
+    reported = usage.get("cost")
+    try:
+        cost = float(reported) if reported is not None else 0.0
+    except (TypeError, ValueError):
+        reported, cost = None, 0.0
     quota_log.record(
         quota_log.STAGE_RERANK,
         model=model,
         unit="credits",
-        credits_usd=float(usage.get("cost", 0.0) or 0.0),
-        detail={"documents": len(documents), "top_n": top_n},
+        credits_usd=cost,
+        detail={
+            "documents": len(documents),
+            "top_n": top_n,
+            "cost_basis": "reported" if reported is not None else "unreported",
+        },
     )
     return [
         {"index": r.get("index"), "score": r.get("relevance_score", r.get("score"))}
@@ -837,11 +851,26 @@ def embed(texts: Sequence[str], *, cfg: Config, input_type: str = "document") ->
             fix="check the Voyage key: python -m tools.jobs credential set voyage_key",
         )
     data = resp.json()
+    # Voyage returns a token count and no price, so the cost is computed from
+    # the configured rate. Recording the call with `credits_usd` left at its
+    # 0.0 default made every embedding free to `budget.spend`, which sums that
+    # field -- so ingesting a corpus spent real dollars no ceiling and no meter
+    # ever saw.
+    total_tokens = int((data.get("usage") or {}).get("total_tokens") or 0)
+    rate_per_1m = float(cfg.get("retrieval", "embed_usd_per_1m_tokens", 0.0) or 0.0)
     quota_log.record(
         quota_log.STAGE_EMBED,
         model=model,
         unit="credits",
-        detail={"texts": len(texts), "total_tokens": (data.get("usage") or {}).get("total_tokens")},
+        credits_usd=total_tokens / 1_000_000.0 * rate_per_1m,
+        detail={
+            "texts": len(texts),
+            "total_tokens": total_tokens,
+            "usd_per_1m_tokens": rate_per_1m,
+            # Says which of the two it is wherever the number is read: a rate
+            # from config priced this, not the provider's own accounting.
+            "cost_basis": "configured_rate",
+        },
     )
 
     # The caller zips these against chunk ids, so position *is* identity here.

@@ -1,4 +1,4 @@
-"""The eleven windows.
+"""The twelve windows.
 
 Each module here exposes `render(workspace)` and, optionally, `subtitle()` and
 `chips()` for its title bar. None of them import each other, and none of them
@@ -21,6 +21,8 @@ __all__ = [
     "notebook",
     "papers",
     "preflight",
+    "quota",
     "queue",
+    "tasks",
     "wiki",
 ]

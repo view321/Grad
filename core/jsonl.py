@@ -230,3 +230,32 @@ def read_json(path: Path | str) -> Any | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+
+
+def update_json(path: Path | str, mutate: Any) -> Any:
+    """Read, mutate, and write a JSON file with the whole sequence locked.
+
+    `write_json` is atomic per *file*, which is not the same as atomic per
+    *update*: a preflight record is read, one check is inserted, and the result
+    is written back, so a submitter folding a smoke result while `preflight run`
+    is writing its own checks means one of the two sets of checks is silently
+    dropped -- and these records are the input to the gate that decides whether
+    code may cost money.
+
+    The lock is taken on a sidecar rather than on the file itself, because
+    `write_json` replaces the file and a lock held on the replaced inode
+    protects nothing.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with _thread_lock(lock_path):
+        with open(lock_path, "a+", encoding="utf-8") as fh:
+            _lock(fh)
+            try:
+                current = read_json(path)
+                updated = mutate(current)
+                write_json(path, updated)
+                return updated
+            finally:
+                _unlock(fh)

@@ -141,6 +141,17 @@ def projects() -> dict[str, dict[str, Any]]:
             continue
         kind = rec.get("type")
         if kind == T_PROJECT:
+            # First create wins. A duplicate -- two `budget new --id X` racing,
+            # or a stray line -- used to replace the fold wholesale, so the later
+            # record's ceilings won and the raise history vanished: an
+            # append-only ledger whose fold was last-writer-wins for the one
+            # record type that defines a ceiling. `create` refuses duplicates
+            # inside the append lock now; this is the backstop for the ones
+            # already written.
+            if pid in folded:
+                folded[pid].setdefault("duplicate_creates", 0)
+                folded[pid]["duplicate_creates"] += 1
+                continue
             folded[pid] = {
                 "id": pid,
                 "created_at": rec.get("created_at"),
@@ -194,6 +205,19 @@ def create(
             f"project {project_id!r} already exists",
             fix=f"python -m tools.budget status --project {project_id} --json",
         )
+
+    def _still_absent() -> None:
+        # Inside the append lock, like the expectation binding and the campaign
+        # halt. The check above runs first for the better message; this is what
+        # makes it atomic with the write, so two `budget new --id X` racing
+        # cannot both land -- the second record would otherwise redefine the
+        # first's ceilings.
+        if project_id in projects():
+            raise UsageError(
+                f"project {project_id!r} was created while this one was being written",
+                fix=f"python -m tools.budget status --project {project_id} --json",
+            )
+
     record = {
         "type": T_PROJECT,
         "id": project_id,
@@ -203,7 +227,7 @@ def create(
         "budget": {k: float(v) for k, v in budget.items() if v is not None},
         "status": "open",
     }
-    jsonl.append(projects_path(), record)
+    jsonl.append(projects_path(), record, precondition=_still_absent)
     return record
 
 
@@ -341,8 +365,19 @@ def status(project_id: str) -> dict[str, Any]:
             "ceiling": ceiling,
             "spent": consumed,
             "remaining": None if ceiling is None else round(float(ceiling) - consumed, 6),
+            # `ceiling is None`, not `not ceiling`: a project deliberately
+            # budgeted at zero ("no GPU spend on this one") has a real ceiling,
+            # and reporting `fraction: None` for it meant the Stop hook's
+            # threshold warnings skipped it entirely. A zero ceiling with
+            # anything spent is at 100%, not at "unbounded".
             "fraction": (
-                None if not ceiling else min(1.0, consumed / float(ceiling))
+                None
+                if ceiling is None
+                else (
+                    min(1.0, consumed / float(ceiling))
+                    if float(ceiling) > 0
+                    else (1.0 if consumed > 0 else 0.0)
+                )
             ),
             "over": bool(ceiling is not None and consumed > float(ceiling)),
         }

@@ -170,6 +170,11 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         "GRAD_UI_ORIGIN": args.ui_origin,
         "GRAD_LAB_PORT": str(port),
         "JUPYTER_CONFIG_DIR": str(_jupyter_config_dir()),
+        # Not on argv. `jobs.py` makes the argument for the credential prompt --
+        # "an argv is visible to anything that can list processes" -- and this
+        # token grants access to a Lab server running with the user's filesystem
+        # rights. JupyterLab reads JUPYTER_TOKEN for exactly this reason.
+        "JUPYTER_TOKEN": token,
     }
     argv = [
         executable, "lab",
@@ -181,7 +186,6 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         "--custom-css",
         f"--port={port}",
         "--ip=127.0.0.1",
-        f"--IdentityProvider.token={token}",
         f"--ServerApp.root_dir={paths.root()}",
         f"--ServerApp.config_file={_jupyter_config_dir() / 'jupyter_server_config.py'}",
     ]

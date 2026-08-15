@@ -48,6 +48,14 @@ LABEL_RE = re.compile(r"\\label\{([^}]*)\}")
 # excluded deliberately: they are legitimate in a document full of maths.
 UNESCAPED_RE = re.compile(r"(?<!\\)([&#_])")
 
+# Two independent conditions, both required, applied by `report cite` when it
+# accepts an S2 match and re-checked by `check_citations` when it verifies the
+# entry that resolution wrote. They live here rather than in `tools/report.py`
+# because the writer and the gate have to agree on them, and a threshold defined
+# next to only one of the two is a threshold that drifts.
+S2_MIN_CONTEXT_OVERLAP = 0.25
+S2_MIN_TITLE_OVERLAP = 0.20
+
 
 def report_dir(project_id: str) -> Path:
     return paths.root() / "reports" / project_id
@@ -249,13 +257,52 @@ def parse_bib(text: str) -> dict[str, dict[str, Any]]:
     return entries
 
 
+def corpus_doc_ids() -> set[str] | None:
+    """Every document id in the local index, or None if there is no index.
+
+    None and "empty" are different answers and the caller must not confuse them:
+    an absent corpus cannot refute a `gradsource = {corpus}` claim, while an
+    empty one refutes every such claim.
+    """
+    try:
+        from core import corpus  # noqa: PLC0415 - optional dependency at the point of use
+
+        con = corpus.connect(create=False)
+    except Exception:  # noqa: BLE001 - no corpus, or sqlite unavailable
+        return None
+    try:
+        return {str(row[0]) for row in con.execute("SELECT id FROM documents")}
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def check_citations(tex: str, bib: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     """Rule 2: every `\\cite{}` key exists in references.bib, and every bib entry
-    came from the corpus or a verified S2 id.
+    resolves against something real.
 
-    The second half is the one that matters. A `.bib` a model wrote from memory
-    passes "the key exists" trivially; what it cannot pass is "this entry has a
-    `gradsource` naming where it was resolved from".
+    The second half is the one that matters, and it used to be the easiest half
+    to fake: the only provenance check was that the entry *carried the string*
+    `gradsource = {corpus}`, which is one line of BibTeX to type. The claim in
+    this docstring -- "what it cannot pass is 'this entry has a gradsource'" --
+    was exactly backwards.
+
+    So the id is re-resolved instead of the label being trusted:
+
+      * `corpus` entries must name a document id that is in the local index now;
+      * `s2` entries must carry the `S2:<id>` note and the two overlap scores
+        `cite` recorded when it accepted the match, at or above the thresholds
+        it applied.
+
+    The S2 half is weaker than the corpus half and honestly so: re-querying the
+    live service inside a gate would make `check` need the network. What it
+    costs a forger is no longer one line but a consistent set of fields --
+    and `report cite` writes all of them from a resolution that actually
+    happened.
     """
     findings: list[dict[str, Any]] = []
     used: set[str] = set()
@@ -272,6 +319,8 @@ def check_citations(tex: str, bib: dict[str, dict[str, Any]]) -> list[dict[str, 
                     "fix": "python -m tools.report cite --project <id> --json",
                 }
             )
+
+    doc_ids = corpus_doc_ids()
     for key, entry in sorted(bib.items()):
         source = entry.get("gradsource")
         if source not in ("corpus", "s2"):
@@ -290,7 +339,212 @@ def check_citations(tex: str, bib: dict[str, dict[str, Any]]) -> list[dict[str, 
                     ),
                 }
             )
+            continue
+
+        note = str(entry.get("note") or "").strip()
+        if source == "corpus":
+            if not note:
+                findings.append(
+                    {
+                        "rule": "citations",
+                        "key": key,
+                        "problem": f"bib entry {key!r} claims the corpus but names no document id",
+                        "fix": "python -m tools.report cite --project <id> --json",
+                    }
+                )
+            elif doc_ids is None:
+                findings.append(
+                    {
+                        "rule": "citations",
+                        "key": key,
+                        "problem": (
+                            f"bib entry {key!r} claims the corpus, but there is no local index "
+                            "to resolve it against"
+                        ),
+                        "fix": (
+                            "python -m tools.paper_ingest arxiv <id> --json   # build the corpus "
+                            "this citation claims to come from"
+                        ),
+                    }
+                )
+            elif note not in doc_ids:
+                findings.append(
+                    {
+                        "rule": "citations",
+                        "key": key,
+                        "problem": (
+                            f"bib entry {key!r} claims corpus document {note!r}, which is not in "
+                            "the local index -- the entry was not written by `report cite`, or "
+                            "the document has since been removed"
+                        ),
+                        "fix": "python -m tools.report cite --project <id> --json",
+                    }
+                )
+        else:  # s2
+            if not re.fullmatch(r"S2:[A-Za-z0-9]+", note):
+                findings.append(
+                    {
+                        "rule": "citations",
+                        "key": key,
+                        "problem": (
+                            f"bib entry {key!r} claims Semantic Scholar but its note is {note!r}, "
+                            "not the `S2:<paper_id>` a resolution records"
+                        ),
+                        "fix": "python -m tools.report cite --project <id> --json",
+                    }
+                )
+                continue
+            match, title_match = entry.get("gradmatch"), entry.get("gradtitlematch")
+            try:
+                ok = (
+                    match is not None
+                    and title_match is not None
+                    and float(match) >= S2_MIN_CONTEXT_OVERLAP
+                    and float(title_match) >= S2_MIN_TITLE_OVERLAP
+                )
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                findings.append(
+                    {
+                        "rule": "citations",
+                        "key": key,
+                        "problem": (
+                            f"bib entry {key!r} claims Semantic Scholar but carries no passing "
+                            "overlap evidence (gradmatch >= "
+                            f"{S2_MIN_CONTEXT_OVERLAP}, gradtitlematch >= {S2_MIN_TITLE_OVERLAP})"
+                        ),
+                        "fix": "python -m tools.report cite --project <id> --json",
+                    }
+                )
     # Unused entries are noted, not refused: over-collecting is not a lie.
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# bare numbers in prose
+# ---------------------------------------------------------------------------
+# What a *measured* value looks like when it is typed rather than referenced: a
+# decimal, a percentage, or scientific notation. Bare small integers are not
+# flagged -- "Figure 1", "the three seeds", "Section 2" are structure, and a
+# check that fires on those is a check that gets argued around (§6). This is
+# therefore a floor, not a proof: it catches the shape a result takes, and the
+# `\gradnum` discipline is what covers the rest.
+# The trailing guard is `(?!\w)(?!\.\d)` rather than `(?![\w.])`: a full stop
+# after a number ends a sentence far more often than it continues a version, and
+# excluding every following dot meant "the loss was 2.71." -- the most natural
+# way anyone writes the thing this rule exists to catch -- matched nothing at
+# all. `(?!\.\d)` still refuses to stop half-way through `1.2.3`.
+BARE_NUMBER_RE = re.compile(
+    r"(?<![\w.])(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+(?:\.\d+)?\s*\\?%|\d+[eE][-+]?\d+)"
+    r"(?!\w)(?!\.\d)"
+)
+
+# A version, not a measurement. `GPT-3.5`, `Python 3.11`, `CUDA 12.1`, `v2.0`
+# all have the shape this rule looks for, and an ML report that names a model or
+# a library by version is writing honest prose -- refusing it would make the
+# gate something to be switched off rather than satisfied.
+#
+# The discriminator is what comes *before* the number. A version follows a
+# proper noun or attaches to one with a hyphen; a measured value follows a verb
+# or a preposition -- "loss of 2.71", "reached 3.05", "improved to 0.94". So a
+# number preceded by a capitalised word, or glued to letters, is left alone.
+#
+# The cost is a real false negative: "Loss 2.71" at the start of a sentence is
+# missed. That is the right way round for a check whose failure mode is
+# refusing a correct report, and `\gradnum` remains the discipline that actually
+# guarantees traceability -- this only catches the lapse.
+_VERSION_CONTEXT_RE = re.compile(
+    r"(?:[A-Za-z][\w.+]*[-_]|\b[A-Z][\w.+]*\s+|\bv)\s*$"
+)
+
+# Structural commands whose arguments are not prose.
+_STRUCTURAL_RE = re.compile(
+    r"\\(?:gradnum|label|ref|eqref|cite[tp]?\*?|includegraphics|input|include|"
+    r"documentclass|usepackage|bibliography|bibliographystyle|url|href)\s*"
+    r"(?:\[[^\]]*\])*\s*\{[^}]*\}"
+)
+
+# Maths and generated tabular material, where numbers are legitimate.
+_MATH_RE = re.compile(
+    r"\$\$.*?\$\$|\$.*?\$|\\\[.*?\\\]|\\\(.*?\\\)|"
+    r"\\begin\{(equation|align|gather|multline|eqnarray|tabular|table|figure|verbatim|lstlisting)\*?\}"
+    r".*?\\end\{\1\*?\}",
+    re.DOTALL,
+)
+
+
+# The fence `report write` puts around model-written prose. Defined here because
+# both the writer and the gate need it: the writer to replace its own output
+# instead of stacking a second copy, and the gate to know which part of the
+# document a model wrote.
+PROSE_START = "% GRAD-PROSE-START -- generated by `report write`; edits inside are replaced"
+PROSE_END = "% GRAD-PROSE-END"
+
+
+def written_prose(tex: str) -> str | None:
+    """The model-written region, or None if `write` has not run.
+
+    The scan below is deliberately scoped to this. `report draft` puts real
+    numbers into the skeleton -- a prediction's band, a run's cost -- straight
+    from the ledger, and those are not claims a model typed: they are the
+    evidence the model is being asked to write *about*. Flagging them would
+    make the rule fire on the tool's own honest output, which is how a check
+    ends up switched off.
+    """
+    start = tex.find(PROSE_START)
+    end = tex.find(PROSE_END)
+    if start == -1 or end == -1 or end < start:
+        return None
+    return tex[start + len(PROSE_START) : end]
+
+
+def prose_of(tex: str) -> str:
+    """The body text, with comments, maths, tables, and command arguments gone."""
+    body = tex.partition(r"\begin{document}")[2] or tex
+    body = re.sub(r"(?<!\\)%.*$", "", body, flags=re.MULTILINE)
+    body = _MATH_RE.sub(" ", body)
+    body = _STRUCTURAL_RE.sub(" ", body)
+    return body
+
+
+def check_prose_numbers(tex: str) -> list[dict[str, Any]]:
+    """Rule 1c: a measured number typed into the prose, rather than referenced.
+
+    `WRITE_PROMPT` has always told the model "a number typed into the prose
+    fails the check". Nothing enforced it, so the sentence was a request --
+    and the one number a model is most tempted to type is the headline result.
+    A claim that never goes through `\\gradnum` is a claim rule 1 never sees,
+    which also takes it out of `cited_run_ids` and therefore out of rule 3.
+
+    Version strings are exempt -- see `_VERSION_CONTEXT_RE`. "GPT-3.5" and
+    "Python 3.11" have exactly the shape of a measured value, and a report is
+    entitled to name the model it compared against.
+    """
+    region = written_prose(tex)
+    if region is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    body = prose_of(region)
+    for line_no, line in enumerate(body.splitlines(), start=1):
+        for match in BARE_NUMBER_RE.finditer(line):
+            if _VERSION_CONTEXT_RE.search(line[: match.start()]):
+                continue
+            findings.append(
+                {
+                    "rule": "claims",
+                    "line": line_no,
+                    "problem": (
+                        f"the prose states {match.group(0).strip()!r} directly; a measured "
+                        "value has to be referenced as \\gradnum{<key>} so it traces to a run"
+                    ),
+                    "fix": (
+                        "add the value to claims.json with its run_id and quantity, then write "
+                        "\\gradnum{<key>} -- or, if it is not a measurement, put it in maths"
+                    ),
+                }
+            )
+            break  # one finding per line is enough to send the author to it
     return findings
 
 
@@ -357,10 +611,19 @@ def check_latex(tex: str) -> list[dict[str, Any]]:
             }
         )
 
+    in_tabular = 0
     for line_no, line in enumerate(tex.splitlines(), start=1):
         body = re.sub(r"(?<!\\)%.*$", "", line)
-        # Only outside maths: `_` and `&` are legitimate in equations and tables.
-        if "$" in body or body.lstrip().startswith("\\") or "&" in body:
+        # `&` is legitimate in a table, so table rows are skipped -- but the
+        # skip used to be `"&" in body`, which discarded every line containing
+        # the character *before* the rule that looks for it could fire. The one
+        # thing it was meant to catch was the one thing it could never report.
+        if re.search(r"\\begin\{(tabular|tabularx|array)", body):
+            in_tabular += 1
+        if re.search(r"\\end\{(tabular|tabularx|array)", body):
+            in_tabular = max(0, in_tabular - 1)
+            continue
+        if in_tabular or "$" in body or body.lstrip().startswith("\\"):
             continue
         for match in UNESCAPED_RE.finditer(body):
             findings.append(
