@@ -293,6 +293,54 @@ def test_most_recent_without_an_owner_claims_nothing(workspace):
     assert sessions.holder("abc") is None
 
 
+def test_two_clients_on_a_fresh_workspace_do_not_land_on_the_same_session(workspace):
+    """The gap a fixed fallback name left. `adopt` writes no file, so both
+    clients see an empty listing -- and reaching for `default` there put two
+    writers on one transcript before either had said anything, which is the
+    exact race the claim exists to prevent."""
+    from ui import app as app_mod
+
+    first, second = app_mod.Session("client-1"), app_mod.Session("client-2")
+    first.adopt()
+    second.adopt()
+
+    assert first.session_id != second.session_id
+    assert sessions.holder(first.session_id) == "client-1"
+    assert sessions.holder(second.session_id) == "client-2"
+
+
+def test_a_second_client_takes_the_next_session_and_then_a_new_one(workspace):
+    """With sessions on disk: the second client gets the next-most-recent, and
+    a third -- with nothing left to hand out -- gets one of its own."""
+    from ui import app as app_mod
+
+    sessions.write("only-one", [user("hello")])
+    clients = [app_mod.Session(f"client-{n}") for n in range(3)]
+    for client in clients:
+        client.adopt()
+
+    ids = [client.session_id for client in clients]
+    assert ids[0] == "only-one"
+    assert len(set(ids)) == 3, "no two clients on one transcript"
+
+
+def test_a_client_that_disconnects_hands_its_session_back(workspace):
+    import asyncio
+
+    from ui import app as app_mod
+
+    sessions.write("abc", [user("hello")])
+    first = app_mod.Session("client-1")
+    first.adopt()
+    assert first.session_id == "abc"
+
+    asyncio.run(first.release())
+
+    second = app_mod.Session("client-2")
+    second.adopt()
+    assert second.session_id == "abc", "the session was never handed back"
+
+
 def test_a_claim_is_scoped_to_the_workspace_it_was_made_in(monkeypatch, tmp_path, workspace):
     """Every root has a `default`, so a claim keyed on the bare id would let one
     client switching workspaces find another client's claim on a file it has

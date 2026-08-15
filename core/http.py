@@ -24,6 +24,33 @@ from core.errors import ConfigError, UpstreamError
 _last_request: dict[str, float] = {}
 
 
+#: Where a paper's identity is read from, **in this order, everywhere**.
+#:
+#: The order is the point. `/snippet/search` returns `corpusId` and `paperId`;
+#: `/paper/search` is asked for fields that include neither corpus id nor
+#: anything but `paperId`; Asta returns whichever its own shape carries. Reading
+#: them in different orders in different methods -- corpus id first in one, SHA
+#: only in another -- gave the *same paper* two ids, and `corpus.rrf` fuses by
+#: id, so it ranked twice and took a slot from something else. `cmd_search`
+#: calls both endpoints for every expanded query, so that was the ordinary path
+#: and not a corner of it.
+#:
+#: `paperId` leads because it is the one field every endpoint returns, and
+#: because `paper_id` -- the seed `neighbours` expands from -- is read from it
+#: too. One field decides both, so a candidate and its citation expansion cannot
+#: disagree about which paper they are.
+IDENTITY_KEYS = ("paperId", "paper_id", "corpusId", "corpus_id", "id")
+
+
+def identifier_of(paper: dict[str, Any]) -> Any:
+    """A paper's identity, by `IDENTITY_KEYS`. None when it carries none."""
+    for key in IDENTITY_KEYS:
+        value = paper.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def candidate_id(identifier: Any, title: Any = "", text: Any = "") -> str | None:
     """The key the funnel fuses candidates on, or None when there is not one.
 
@@ -140,9 +167,7 @@ class SemanticScholar:
             snippet = item.get("snippet", {})
             paper = item.get("paper", {})
             key = candidate_id(
-                paper.get("corpusId") or paper.get("paperId"),
-                paper.get("title"),
-                snippet.get("text", ""),
+                identifier_of(paper), paper.get("title"), snippet.get("text", "")
             )
             if key is None:
                 continue
@@ -165,7 +190,7 @@ class SemanticScholar:
         data = self._get("/paper/search", {"query": query, "limit": limit, "fields": fields})
         out = []
         for p in data.get("data", []):
-            key = candidate_id(p.get("paperId"), p.get("title"), p.get("abstract"))
+            key = candidate_id(identifier_of(p), p.get("title"), p.get("abstract"))
             if key is None:
                 continue
             out.append(
@@ -561,15 +586,8 @@ def _row(item: dict[str, Any], *, source: str) -> dict[str, Any] | None:
     paper = item.get("paper") if isinstance(item.get("paper"), dict) else item
     snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else item
 
-    identifier = (
-        paper.get("corpusId")
-        or paper.get("corpus_id")
-        or paper.get("paperId")
-        or paper.get("paper_id")
-        or paper.get("id")
-    )
     text = snippet.get("text") or item.get("text") or ""
-    key = candidate_id(identifier, paper.get("title"), text)
+    key = candidate_id(identifier_of(paper), paper.get("title"), text)
     if key is None:
         return None
     year = paper.get("year")
@@ -578,6 +596,9 @@ def _row(item: dict[str, Any], *, source: str) -> dict[str, Any] | None:
     external = paper.get("externalIds") or paper.get("external_ids") or {}
     return {
         "id": key,
+        # The same field the id came from, by the same order -- so the seed
+        # `neighbours` expands from cannot name a different paper than the
+        # candidate it was taken from.
         "paper_id": paper.get("paperId") or paper.get("paper_id") or paper.get("id"),
         "title": paper.get("title"),
         "year": year,

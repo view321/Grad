@@ -115,9 +115,23 @@ class Session:
         """
         chosen = sessions.most_recent(self.key)
         if chosen is None:
-            # A fresh workspace, or every session already open in another
-            # window. Either way this client needs one of its own.
-            chosen = sessions.LEGACY_ID if not sessions.listing() else sessions.new_id()
+            # A fresh workspace, or every existing session already open in
+            # another window. Either way this client needs one nobody else can
+            # be in, and a **fresh id is the only thing that guarantees that**.
+            #
+            # This used to reach for `LEGACY_ID` when the listing was empty, on
+            # the theory that a first session should be named where the
+            # pre-sessions code wrote. That was a race with no upside: `adopt`
+            # writes no file, so two clients connecting to an empty workspace
+            # both see an empty listing, both pick the same fixed name, and the
+            # second one's claim fails -- putting two writers on one transcript
+            # before either had said anything. And the theory was empty as well:
+            # this branch only runs when the listing *is* empty, which means
+            # there is no legacy file to keep writing to. `listing()` would have
+            # found it, and `most_recent` would have returned it.
+            #
+            # A new id cannot collide, so there is no claim to lose here.
+            chosen = sessions.new_id()
             sessions.claim(chosen, self.key)
         self.session_id = chosen
         self.restore()

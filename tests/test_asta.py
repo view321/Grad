@@ -249,7 +249,9 @@ FLAT = {"results": [{"corpusId": 991, "paperId": "p1", "title": "Attention", "ye
 @pytest.mark.parametrize("payload", [NESTED, FLAT], ids=["nested", "flat"])
 def test_both_plausible_result_shapes_produce_the_same_candidate(workspace, transport, payload):
     row = call_with(workspace, transport, payload)[0]
-    assert row["id"] == "s2:991"
+    # The SHA, not the corpus id: `IDENTITY_KEYS` leads with `paperId` because
+    # it is the field every endpoint returns. Both fixtures carry both.
+    assert row["id"] == "s2:p1"
     assert row["title"] == "Attention"
     assert row["year"] in (2017, "2017")
     assert row["snippet"] == "a 500-word excerpt"
@@ -278,6 +280,54 @@ def test_an_unrecognised_envelope_raises_rather_than_returning_nothing(workspace
 def test_prose_where_a_result_set_was_expected_says_what_arrived(workspace, transport):
     with pytest.raises(UpstreamError, match="not a result set"):
         call_with(workspace, transport, "I could not find anything about that.")
+
+
+def test_one_paper_gets_one_id_down_every_path_that_feeds_the_pool(workspace, transport, monkeypatch):
+    """`cmd_search` calls snippet search *and* paper search for every expanded
+    query, and fuses the results by id. `/snippet/search` returns `corpusId` and
+    `paperId` while `/paper/search` is only asked for the latter -- so reading
+    them in different orders gave the same paper two ids, and it ranked twice
+    and took a slot from something else. This is the ordinary path, not a corner
+    of it, which is why the order lives in one constant."""
+    paper = {"paperId": "sha-1", "corpusId": 991, "title": "Attention",
+             "abstract": "an abstract", "externalIds": {"ArXiv": "1706.03762"}}
+
+    asta_id = call_with(workspace, transport, {"data": [dict(paper)]})[0]["id"]
+
+    class FakeHttpx:
+        @staticmethod
+        def get(url, params=None, headers=None, timeout=None):
+            if "snippet" in url:
+                return FakeResponse(payload={"data": [
+                    {"snippet": {"text": "an excerpt"}, "paper": dict(paper)},
+                ]})
+            # What `/paper/search` actually returns: the SHA, no corpus id.
+            flat = {k: v for k, v in paper.items() if k != "corpusId"}
+            return FakeResponse(payload={"data": [flat]})
+
+    monkeypatch.setattr(http, "_httpx", lambda: FakeHttpx)
+    s2 = http.SemanticScholar(config_mod.load(reload=True))
+    snippet_id = s2.snippet_search("attention")[0]["id"]
+    paper_id = s2.paper_search("attention")[0]["id"]
+
+    assert snippet_id == paper_id == asta_id == "s2:sha-1"
+
+
+def test_the_id_and_the_citation_seed_name_the_same_paper(workspace, transport):
+    """`paper_id` is what `neighbours` expands from. If it were read by a
+    different rule than the id, a candidate and its citation expansion could
+    disagree about which paper they were."""
+    row = call_with(workspace, transport, {"data": [
+        {"paperId": "sha-1", "corpusId": 991, "title": "Attention"},
+    ]})[0]
+    assert row["id"] == f"s2:{row['paper_id']}"
+
+
+def test_a_paper_with_only_a_corpus_id_still_gets_one(workspace, transport):
+    row = call_with(workspace, transport, {"data": [
+        {"corpusId": 991, "title": "Attention"},
+    ]})[0]
+    assert row["id"] == "s2:991"
 
 
 def test_hits_with_no_id_stay_distinct_instead_of_fusing_into_one(workspace, transport):
@@ -377,7 +427,7 @@ def test_both_tier_one_clients_answer_in_the_same_shape(workspace, transport, mo
     assert shared <= set(s2_row)
     # The same corpus and the same corpus ids, so a paper found through both
     # tiers fuses to one candidate instead of ranking twice under two names.
-    assert asta_row["id"] == s2_row["id"] == "s2:991"
+    assert asta_row["id"] == s2_row["id"] == "s2:p1"
     assert asta_row["title"] == s2_row["title"]
     assert asta_row["snippet"] == s2_row["snippet"]
     # `source` is the one field that must differ: a trace has to say who spoke.
