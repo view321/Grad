@@ -43,6 +43,11 @@ def _sdk() -> Any:
             "claude-agent-sdk is not installed, so the Haiku funnel stages cannot run",
             fix="pip install claude-agent-sdk   (or run the funnel with --no-expand --no-triage)",
         ) from exc
+    # Same seam as `agent.py:_sdk`: without it, a funnel run from the desktop
+    # app opens a console window per Haiku stage.
+    from core import spawn  # noqa: PLC0415
+
+    spawn.mask_sdk_console()
     return claude_agent_sdk
 
 
@@ -262,7 +267,8 @@ def _with_retry(make_coro: Callable[[], Any]) -> dict[str, Any]:
 # public API
 # ---------------------------------------------------------------------------
 def expand(question: str, *, model: str, log_name: str) -> dict[str, Any]:
-    """Stage 0: one question -> keyword queries for S2, plus one HyDE abstract.
+    """Stage 0: one question -> keyword queries for the tier-1 retriever, plus
+    one HyDE abstract.
 
     Expansion is retriever-specific and this is easy to get wrong: HyDE is a
     dense-retrieval gain, and feeding a synthetic abstract to a lexical endpoint

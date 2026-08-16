@@ -227,16 +227,26 @@ def _shell() -> str:
 .grad-wordmark { font-family: var(--grad-font-mono); font-size: 15px; font-weight: 700;
                  letter-spacing: 0.22em; }
 .grad-appbar .dim { opacity: 0.55; }
-.grad-appbar-btn {
+/* Three classes deep on purpose. These buttons are built by `kit.button`, so
+   they carry `.grad-btn` and `.ghost` as well -- and `_controls()` is
+   concatenated after this block, so at equal specificity its `.grad-btn`
+   rules win the cascade: `color: var(--grad-ink)` on an ink app bar was an
+   invisible button, and `.ghost`'s `border: 0` took the outline with it. The
+   extra ancestor is what keeps these rules winning without caring where in
+   the stylesheet they sit. */
+.grad-appbar .grad-btn.grad-appbar-btn {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
     padding: 3px 8px; border: 1.5px solid var(--grad-paper); cursor: pointer;
     background: transparent; color: inherit;
 }
-.grad-appbar-btn:hover { background: var(--grad-paper); color: var(--grad-ink); }
+.grad-appbar .grad-btn.grad-appbar-btn:hover { background: var(--grad-paper); color: var(--grad-ink); }
 
 /* The `⋯` button carries a menu, so it gets the caret's job: a little wider
-   than a word button, and legible as a target rather than as punctuation. */
-.grad-dots { font-size: 15px; line-height: 1; padding: 1px 9px 4px; letter-spacing: 0.1em; }
+   than a word button, and legible as a target rather than as punctuation.
+   Deeper than the rule above, which would otherwise re-shrink the glyph. */
+.grad-appbar .grad-btn.grad-appbar-btn.grad-dots {
+    font-size: 15px; line-height: 1; padding: 1px 9px 4px; letter-spacing: 0.1em;
+}
 
 /* One row of the `⋯` menu: a mark, a name, and what the window is for. Rows are
    buttons so the keyboard reaches them, which means resetting the four
@@ -406,6 +416,14 @@ def _controls() -> str:
 .grad-btn.dashed { border: var(--grad-pending); background: transparent; opacity: 0.75; }
 .grad-btn[disabled], .grad-btn.disabled {
     background: var(--grad-paper-sunk); opacity: 0.5; pointer-events: none;
+}
+/* `active` + disabled is a *badge*, not a dead control: "IN USE" on the
+   current project is disabled precisely because it is already in effect. The
+   general disabled rule above swaps the fill to sunk paper but leaves
+   `.active`'s paper text in place -- paper on paper, illegible. Keep the
+   inverted ink fill and most of its contrast. */
+.grad-btn.active[disabled], .grad-btn.active.disabled {
+    background: var(--grad-ink); color: var(--grad-paper); opacity: 0.85;
 }
 .grad-btn.ghost { border: 0; background: transparent; padding: 6px 8px; }
 .grad-btn.ghost:hover { background: var(--grad-paper-sunk); }

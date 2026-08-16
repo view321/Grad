@@ -1,6 +1,6 @@
 """Window 6 — the retrieval funnel.
 
-400 → 50 → 15, with stage 3's one-line reason per surviving candidate. This is
+300 → 50 → 15, with stage 3's one-line reason per surviving candidate. This is
 the debugging surface for retrieval, and it is what makes the stage-0/3
 evaluation interpretable rather than a pair of numbers.
 

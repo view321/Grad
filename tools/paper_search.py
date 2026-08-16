@@ -1,10 +1,14 @@
 """grad-paper-search -- the five-stage retrieval funnel (HANDOFF §5).
 
-    | 0 | Query expansion | Haiku: 1 question -> ~5 keyword queries + 1 HyDE abstract | quota  |
-    | 1 | Retrieve        | Asta snippets + local index (RRF) + citation expansion    | free   |
-    | 2 | Rerank          | voyageai/rerank-2.5 -> top ~50                            | credits|
-    | 3 | Triage          | Haiku reads all 50 in one call, returns ~15 with a reason | quota  |
-    | 4 | Select          | The main agent reads the 15                               | quota  |
+    | 0 | Query expansion | Haiku: 1 question -> 4-6 keyword queries + 1 HyDE abstract | quota  |
+    | 1 | Retrieve        | tier 1 (pwc by default) + local index (RRF) + expansion    | free   |
+    | 2 | Rerank          | voyageai/rerank-2.5 -> top ~50                             | credits|
+    | 3 | Triage          | Haiku reads all 50 in one call, returns ~15 with a reason  | quota  |
+    | 4 | Select          | The main agent reads the 15                                | quota  |
+
+    Under the default `pwc` tier 1, "expansion" is a dense-neighbour walk rather
+    than the citation graph, rows arrive title-only, and abstracts are backfilled
+    from arXiv in one batched call -- see `tier1_clients` and `_fill_abstracts`.
 
 The ordering is the design: each stage is cheaper per candidate than the one
 after it, so the expensive stages only ever see filtered input. Stages 0 and 3
@@ -28,15 +32,17 @@ from core.ledger_store import now_iso
 
 cli = Cli(
     "grad-paper-search",
-    "Search the literature (Ai2 Asta / Semantic Scholar) and the local index, rerank, triage.",
+    "Search the literature (Papers with Code / Semantic Scholar) and the local index, rerank, triage.",
     epilog=(
         "Discovery and recall are different problems. Tier 1 finds papers you have not\n"
         "read; tier 2 (the local index) answers 'where did I see that lemma'.\n"
         "A local index cannot do discovery by construction, which is why both exist.\n\n"
-        "Tier 1 defaults to Asta, which serves the same Semantic Scholar corpus over MCP\n"
-        "without an institutional email. --tier1 s2 uses the REST API directly.\n\n"
-        "The retriever sets the ceiling: expansion and citation expansion buy more than\n"
-        "reranker shopping does."
+        "Tier 1 defaults to pwc (Papers with Code): anonymous, fast, title-only rows\n"
+        "with abstracts backfilled from arXiv. --tier1 asta serves the Semantic Scholar\n"
+        "corpus over MCP without an institutional email; --tier1 s2 uses the REST API\n"
+        "directly (shared anonymous pool, usually rate limited).\n\n"
+        "The retriever sets the ceiling: query expansion and neighbour/citation\n"
+        "expansion buy more than reranker shopping does."
     ),
 )
 
@@ -127,7 +133,7 @@ def _search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--tier1",
         choices=list(TIER1_SOURCES),
-        help="which discovery client to use (default from config; asta unless changed)",
+        help="which discovery client to use (default from config; pwc unless changed)",
     )
     p.add_argument("--top", type=int, help="how many to return (default from config)")
     p.add_argument("--candidates", type=int, help="stage-1 candidate ceiling")
@@ -585,7 +591,7 @@ def cmd_stats(_: argparse.Namespace) -> dict[str, Any]:
 
 @cli.command(
     "trace",
-    "show a previous funnel run (400 -> 50 -> 15, with reasons)",
+    "show a previous funnel run (300 -> 50 -> 15, with reasons)",
     setup=lambda p: p.add_argument("name", nargs="?", help="trace name; omit to list"),
 )
 def cmd_trace(args: argparse.Namespace) -> dict[str, Any]:
