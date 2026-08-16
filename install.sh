@@ -21,14 +21,45 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$ROOT/.venv"
-EXTRAS="${GRAD_EXTRAS:-ui,notebook,agent,lab}"
-
 step() { printf '\033[36m==> %s\033[0m\n' "$1"; }
 ok()   { printf '  \033[32m+\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$1"; }
 die()  { printf '  \033[31mx\033[0m %s\n' "$1" >&2; exit 1; }
+
+# `curl .../install.sh | bash` runs this text with no file behind it, so
+# BASH_SOURCE is empty (and under `set -u`, asking for it unguarded would kill
+# the script). No file -- or a copy saved alone, with no pyproject.toml beside
+# it -- means there is no repository to install from, and the repository *is*
+# the install: prompts, skills and workspace are read from it at runtime. So
+# clone it, then run the clone's own copy of this script.
+SELF="${BASH_SOURCE[0]:-}"
+if [ -n "$SELF" ] && [ -f "$(dirname "$SELF")/pyproject.toml" ]; then
+  ROOT="$(cd "$(dirname "$SELF")" && pwd)"
+else
+  REPO_URL="https://github.com/view321/Grad.git"
+  step "No repository behind this script; cloning Grad"
+  command -v git >/dev/null 2>&1 || die "git is not installed; install it and re-run"
+  DEST="${XDG_DATA_HOME:-$HOME/.local/share}/grad/app"
+  if [ -f "$DEST/pyproject.toml" ]; then
+    ok "reusing the existing clone at $DEST"
+    git -C "$DEST" pull --ff-only >/dev/null 2>&1 \
+      || warn "could not fast-forward it; installing what is there"
+  else
+    mkdir -p "$(dirname "$DEST")"
+    git clone "$REPO_URL" "$DEST"
+    ok "cloned into $DEST"
+  fi
+  exec bash "$DEST/install.sh"
+fi
+VENV="$ROOT/.venv"
+# The set the app needs at runtime, which is not the set it needs to start.
+# `remote` is keyring -- every credential path -- and storing a credential is
+# the step immediately after installing. `retrieval` is httpx and sqlite-vec, so
+# without it the paper funnel cannot run. `math` is the SymPy the system prompt
+# tells the agent to reach for by name. None of the three fails at install time;
+# they fail later, one feature at a time, on a machine where the developer
+# already had all of them.
+EXTRAS="${GRAD_EXTRAS:-ui,notebook,agent,lab,retrieval,remote,math}"
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) PLATFORM="windows" ;;

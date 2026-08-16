@@ -344,8 +344,15 @@ def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> N
                             workspace.use_project(pid), "project switch"
                         ),
                     )
-                    kit.text(project["id"], "", style="font-weight: 700")
-                    kit.text(project["title"], "grad-caption")
+                    kit.text(project["id"], "", style="font-weight: 700; white-space: nowrap")
+                    # Squeezable, but never to less than a word a line: the id,
+                    # the badge and the spend own their width, the title takes
+                    # what is left and ellipsizes.
+                    kit.text(
+                        project["title"], "grad-caption",
+                        style="flex: 1 1 auto; min-width: 0; overflow: hidden;"
+                        " text-overflow: ellipsis; white-space: nowrap",
+                    )
                     kit.spacer()
                     if project["status"] == "closed":
                         kit.chip("CLOSED", "neutral")
@@ -530,30 +537,41 @@ def _credentials(ui: Any, workspace: Workspace, menu: _Menu) -> None:
     kit.error_strip(model.get("error"))
 
     for row in model["rows"]:
-        with kit.row("grad-row", gap=6):
-            kit.chip(row["state"], row["tone"])
-            kit.text(row["name"], "grad-mono", tag="span")
-            kit.text(row["purpose"], "grad-caption", tag="span")
-            kit.spacer()
-            value = (
-                ui.input(placeholder="paste to set")
-                .props("borderless dense type=password")
-                .classes("field")
-                .style("flex: 0 0 200px; padding: 0 8px")
-            )
+        # Two lines, not one. On one line the fixed-width pieces -- chip, name,
+        # a 200px input, two buttons -- left the purpose text a few dozen
+        # pixels in a 540px dialog, and flex squeezed it to its min-content
+        # width: one word per line, a column taller than the rest of the row.
+        with kit.column("grad-row", gap=6):
+            # Full width explicitly: `.grad-row`'s `align-items: flex-start`
+            # would otherwise shrink each line to its content and the input
+            # with it.
+            with kit.row("", gap=6).style("width: 100%"):
+                kit.chip(row["state"], row["tone"])
+                kit.text(row["name"], "grad-mono", tag="span")
+                kit.text(
+                    row["purpose"], "grad-caption", tag="span",
+                    style="flex: 1 1 auto; min-width: 0",
+                )
+            with kit.row("", gap=6).style("width: 100%"):
+                value = (
+                    ui.input(placeholder="paste to set")
+                    .props("borderless dense type=password")
+                    .classes("field")
+                    .style("flex: 1 1 auto; padding: 0 8px")
+                )
 
-            def store(_=None, name=row["name"], field=value) -> None:
-                pasted, field.value = field.value or "", ""
-                workspace.spawn(workspace.set_credential(name, pasted), "credential set")
-                menu.redraw()
+                def store(_=None, name=row["name"], field=value) -> None:
+                    pasted, field.value = field.value or "", ""
+                    workspace.spawn(workspace.set_credential(name, pasted), "credential set")
+                    menu.redraw()
 
-            def forget(_=None, name=row["name"]) -> None:
-                workspace.spawn(workspace.delete_credential(name), "credential delete")
-                menu.redraw()
+                def forget(_=None, name=row["name"]) -> None:
+                    workspace.spawn(workspace.delete_credential(name), "credential delete")
+                    menu.redraw()
 
-            kit.button("SET", tone="neutral", on_click=store)
-            kit.button("✕", tone="neutral", disabled=not row["stored"], title="forget it",
-                       on_click=forget)
+                kit.button("SET", tone="neutral", on_click=store)
+                kit.button("✕", tone="neutral", disabled=not row["stored"], title="forget it",
+                           on_click=forget)
 
     kit.text(
         "stored in Windows Credential Manager, never in the workspace and never in the "

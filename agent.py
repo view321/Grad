@@ -53,6 +53,12 @@ def _sdk() -> Any:
             "and authenticate with your subscription:\n"
             "  claude setup-token   # then set CLAUDE_CODE_OAUTH_TOKEN"
         ) from exc
+    # Before any client is built: the SDK spawns the `claude` CLI without
+    # `creationflags`, and under the installed app (pythonw, no console) that
+    # is a black window titled "claude" over the workspace on every session.
+    from core import spawn  # noqa: PLC0415
+
+    spawn.mask_sdk_console()
     return claude_agent_sdk
 
 

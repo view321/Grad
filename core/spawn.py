@@ -83,3 +83,43 @@ def detached() -> dict[str, Any]:
 def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     """`subprocess.run`, without a window. Callers pass everything else."""
     return subprocess.run(argv, **{**quiet(), **kwargs})
+
+
+_sdk_masked = False
+
+
+def mask_sdk_console() -> None:
+    """Make the Agent SDK's own child -- the `claude` CLI -- spawn quietly.
+
+    Everything this module quiets is a process *we* spawn, but the one console
+    program this app cannot avoid starting is spawned by someone else:
+    `claude-agent-sdk` launches `claude.exe` through `anyio.open_process` and
+    passes no `creationflags`. From a terminal that is invisible -- the child
+    inherits the console -- which is exactly why it survived development. From
+    the installed app (`pythonw.exe`, no console) every new session put a black
+    window titled "claude" on top of the workspace.
+
+    `anyio.open_process` accepts `creationflags`; the SDK just never sends one.
+    So the seam is anyio's: wrap it once, add `CREATE_NO_WINDOW` when the caller
+    asked for nothing, and the child gets the same hidden console every other
+    console child here gets -- along with every console descendant *it* starts,
+    which is the property the module docstring is about.
+
+    Idempotent, Windows-only, and deliberately narrow: an explicit
+    `creationflags` from any caller is passed through untouched.
+    """
+    global _sdk_masked
+
+    if not WINDOWS or _sdk_masked:
+        return
+    import anyio  # noqa: PLC0415 - the SDK's own dependency, present iff it is
+
+    real = anyio.open_process
+
+    async def _quiet_open_process(*args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("creationflags"):
+            kwargs["creationflags"] = NO_WINDOW
+        return await real(*args, **kwargs)
+
+    anyio.open_process = _quiet_open_process
+    _sdk_masked = True

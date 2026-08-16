@@ -26,8 +26,10 @@ Run these over Bash. Every one takes `--json` — always use it — and every er
 carries a `fix` field that is usually the literal next command.
 
 - `python -m tools.paper_search search "<question>" --json` — literature funnel:
-  Semantic Scholar plus the local index, reranked and triaged. `local` searches
-  only papers already read. `--no-expand`/`--no-triage` skip the Haiku stages.
+  Papers with Code by default (`--tier1 asta|s2` for Semantic Scholar) plus the
+  local index, reranked (credits) and triaged. `local` searches only what is in
+  the local index: papers read and your own notes. `--no-expand`/`--no-triage`
+  skip the Haiku stages; add `--no-rerank` to spend nothing at all.
 - `python -m tools.paper_ingest arxiv <id> --json` — add a paper (LaTeX source)
   to the local index. `notes <path>` adds your own notes.
 - `python -m tools.nb exec --code "..." --json` — persistent Jupyter kernel,

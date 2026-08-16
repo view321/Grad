@@ -18,7 +18,18 @@
     quit it.
 
 .PARAMETER InstallExtras
-    Extras to install. Defaults to the set the desktop app needs.
+    Extras to install. Defaults to the set the app actually needs at runtime,
+    which is not the same as the set it needs to start.
+
+    This defaulted to "ui,notebook,agent,lab" and produced an install that
+    launched and then refused the first three things anyone does with it.
+    `remote` is where `keyring` lives, so every credential path raised -- and
+    storing a credential is the step immediately after installing. `retrieval`
+    is `httpx` and `sqlite-vec`, so the paper funnel could not run. `math` is
+    SymPy, which the system prompt tells the agent to reach for by name.
+
+    None of it failed at install time. It failed later, one feature at a time,
+    on a machine where the developer already had all of it.
 
 .PARAMETER NoShortcut
     Skip creating the Start Menu and Desktop shortcuts.
@@ -36,11 +47,16 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+.EXAMPLE
+    irm https://raw.githubusercontent.com/view321/Grad/main/install.ps1 | iex
+    # No checkout needed: the script clones the repository itself and then
+    # runs the clone's own copy of this installer.
 #>
 
 [CmdletBinding()]
 param(
-    [string] $InstallExtras = "ui,notebook,agent,lab",
+    [string] $InstallExtras = "ui,notebook,agent,lab,retrieval,remote,math",
     [switch] $NoShortcut,
     [string] $Python = "",
     [string] $Workspace = ""
@@ -49,13 +65,63 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$VenvDir = Join-Path $Root ".venv"
-$AppData = Join-Path $env:LOCALAPPDATA "Grad"
-
 function Write-Step($message) { Write-Host "==> $message" -ForegroundColor Cyan }
 function Write-Warn($message) { Write-Host "  ! $message" -ForegroundColor Yellow }
 function Write-Ok($message)   { Write-Host "  + $message" -ForegroundColor Green }
+
+# --------------------------------------------------------------------------
+# 0. The repository, when this script arrived without one
+# --------------------------------------------------------------------------
+# `irm .../install.ps1 | iex` hands PowerShell this text with no file behind
+# it: `$MyInvocation.MyCommand` is a script block, it has no `.Path`, and under
+# StrictMode even asking for one throws -- so the property is read through
+# PSObject, which answers null instead. No path (or a path with no
+# `pyproject.toml` beside it -- a copy saved alone into Downloads) means there
+# is no repository to install from, and the repository *is* the install: the
+# prompts, the skills and the workspace are read from it at runtime. So it is
+# cloned, and then the clone's own copy of this script runs -- the one-line
+# bootstrap must not drift from the installer it bootstraps.
+$RepoUrl = "https://github.com/view321/Grad.git"
+$PathProperty = $MyInvocation.MyCommand.PSObject.Properties['Path']
+$ScriptPath = if ($PathProperty) { $PathProperty.Value } else { $null }
+$Root = if ($ScriptPath) { Split-Path -Parent $ScriptPath } else { $null }
+
+if (-not $Root -or -not (Test-Path (Join-Path $Root "pyproject.toml"))) {
+    Write-Step "No repository behind this script; cloning Grad"
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw ("git was not found on PATH, and this script needs to clone $RepoUrl. " +
+               "Install it from https://git-scm.com/download/win and re-run.")
+    }
+    # Beside the app's own state, not %USERPROFILE%\Grad -- that is the default
+    # *workspace*, and the whole point of the split is that an update can
+    # replace this folder without touching your research.
+    $CloneDest = Join-Path (Join-Path $env:LOCALAPPDATA "Grad") "app"
+    if (Test-Path (Join-Path $CloneDest "pyproject.toml")) {
+        Write-Ok "reusing the existing clone at $CloneDest"
+        # Through cmd, because git reports progress on stderr and PowerShell 5.1
+        # turns redirected stderr into a terminating error under
+        # $ErrorActionPreference = "Stop".
+        cmd /c "git -C `"$CloneDest`" pull --ff-only >nul 2>&1"
+        if ($LASTEXITCODE -ne 0) { Write-Warn "could not fast-forward it; installing what is there" }
+    } else {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CloneDest) | Out-Null
+        git clone $RepoUrl $CloneDest
+        if ($LASTEXITCODE -ne 0) { throw "git clone $RepoUrl failed." }
+        Write-Ok "cloned into $CloneDest"
+    }
+    # A child process rather than dot-sourcing: `& file.ps1` in this session
+    # would be refused by a Restricted execution policy, and the pipe-to-iex
+    # audience is exactly the audience that has one.
+    $Forward = @("-InstallExtras", $InstallExtras)
+    if ($NoShortcut) { $Forward += "-NoShortcut" }
+    if ($Python)     { $Forward += @("-Python", $Python) }
+    if ($Workspace)  { $Forward += @("-Workspace", $Workspace) }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $CloneDest "install.ps1") @Forward
+    exit $LASTEXITCODE
+}
+
+$VenvDir = Join-Path $Root ".venv"
+$AppData = Join-Path $env:LOCALAPPDATA "Grad"
 
 # --------------------------------------------------------------------------
 # 1. Python
@@ -109,6 +175,22 @@ Write-Step "Installing Grad and its dependencies (this takes a few minutes)"
 & $VenvPython -m pip install -e "$($Root)[$($InstallExtras)]"
 if ($LASTEXITCODE -ne 0) { throw "pip install failed." }
 Write-Ok "installed extras: $InstallExtras"
+
+if (($InstallExtras -split ',') -contains 'ui') {
+    # Import what the desktop app needs, now, in the venv that will run it.
+    # `pystray` spent months absent from the `ui` extra and nothing failed at
+    # install time -- just a tray icon that never appeared, which is the way
+    # back to a hidden window. A declared-but-broken dependency should fail
+    # here, where the fix is obvious, not at first launch.
+    & $VenvPython -c "import pystray, PIL, nicegui, webview"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "the ui dependencies did not import cleanly; the desktop app may"
+        Write-Warn "open without a notification-area icon. Re-run this script after:"
+        Write-Warn "    $VenvPython -m pip install -e `"$Root[ui]`" --force-reinstall"
+    } else {
+        Write-Ok "desktop dependencies import (pystray, PIL, nicegui, webview)"
+    }
+}
 
 # --------------------------------------------------------------------------
 # 3. The things this installer cannot install
