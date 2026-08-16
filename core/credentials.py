@@ -51,6 +51,13 @@ CLAUDE_TOKEN = "claude_oauth_token"
 # absence is a note, not an error.
 ASTA_KEY = "asta_api_key"
 
+# The eighth, and the third that can reach a machine. Kaggle's API authenticates
+# with a username/key pair; only the key is secret, so only the key is here --
+# the username is `[kaggle] username` in the config, exactly as HF's token is a
+# credential and its `[hf] namespace` is not. Which account runs the notebooks
+# belongs in a file you can read; the thing that authorises it does not.
+KAGGLE_KEY = "kaggle_key"
+
 #: Every credential this project knows, in one tuple so nothing derived from it
 #: can be added to and then forgotten. `status()` reports these,
 #: `tools/jobs.py` accepts these, and `scrub_environment` removes the `GRAD_*`
@@ -65,6 +72,7 @@ ALL: tuple[str, ...] = (
     CONTEXT7_KEY,
     CLAUDE_TOKEN,
     ASTA_KEY,
+    KAGGLE_KEY,
 )
 
 
@@ -140,6 +148,43 @@ def _env_fallback_allowed() -> bool:
     return os.environ.get("GRAD_ALLOW_ENV_CREDENTIALS") == "1"
 
 
+NOT_AUTHENTICATED = (
+    "there are no subscription credentials for the Agent SDK, so the model was never "
+    "reached. The agent runs these CLIs over Bash, and that hop strips "
+    "CLAUDE_CODE_OAUTH_TOKEN from the environment -- so the token has to come from the "
+    "credential store, not from the environment."
+)
+AUTH_FIX = (
+    "claude setup-token   # mint a token, then store it where the hop cannot strip it:\n"
+    "python -m tools.jobs credential set claude_oauth_token"
+)
+
+
+def sdk_env() -> dict[str, str]:
+    """Subscription credentials for a CLI that spawns its own Agent SDK client.
+
+    Two callers with the same problem: `core/haiku.py`'s funnel stages and
+    `core/mutate.py`'s mutation operator. Both are SDK clients running inside a
+    tool CLI, and both are reached the way every capability here is reached --
+    the agent runs the CLI over Bash, and `scrub_environment` has already taken
+    `CLAUDE_CODE_OAUTH_TOKEN` out of the environment that hop inherits.
+
+    The ambient variable comes first, so running one of these by hand in a
+    terminal keeps working with no setup at all. The credential store is the
+    fallback that makes the same command work when the *agent* is the one running
+    it.
+
+    `ClaudeAgentOptions.env` merges over the inherited environment rather than
+    replacing it, so this adds one variable and takes nothing away.
+    """
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if not token:
+        token = get(CLAUDE_TOKEN, required=False)
+    if not token:
+        raise ConfigError(NOT_AUTHENTICATED, fix=AUTH_FIX)
+    return {"CLAUDE_CODE_OAUTH_TOKEN": token}
+
+
 def scrub_environment() -> list[str]:
     """Remove credential-shaped variables from the agent's own environment.
 
@@ -165,6 +210,18 @@ def scrub_environment() -> list[str]:
         "OPENROUTER_API_KEY",
         "VOYAGE_API_KEY",
         "CONTEXT7_API_KEY",
+        # The pair the `kaggle` CLI reads straight out of the environment. Both
+        # are listed, not just the secret one: the CLI authenticates only when it
+        # has *both*, so removing the key alone is what makes the remaining
+        # username harmless -- and leaving the pair intact would hand the agent
+        # exactly the general remote-execution capability §9 denies it, through a
+        # CLI `hooks.py` can only ask it not to type.
+        "KAGGLE_USERNAME",
+        "KAGGLE_KEY",
+        # Not a credential, but it points at a `kaggle.json` that holds the pair.
+        # Scrubbing the two variables and leaving this one behind moves the
+        # capability rather than removing it.
+        "KAGGLE_CONFIG_DIR",
         *(f"GRAD_{name.upper()}" for name in ALL),
     ):
         if os.environ.pop(var, None) is not None:

@@ -146,6 +146,10 @@ def test_a_submission_without_a_cfg_still_appends(workspace, cfg):
     monkey = {
         "hash": lambda: "h", "estimated_cost_usd": lambda: 1.0,
         "estimated_duration_s": lambda: 60,
+        # The record carries the resolved document as well as its digest, so the
+        # archive can re-derive the hash without the workspace present. A stub
+        # submission has to answer for it like a real one.
+        "resolved": lambda: {"schema": 1, "entrypoint": "train.py"},
     }
     for name, fn in monkey.items():
         object.__setattr__(sub, name, fn)

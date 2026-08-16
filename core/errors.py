@@ -28,8 +28,31 @@ EXIT_CONFIG = 11           # missing credential, unknown host, malformed config
 # allocation" is not "the machine is out of money", and conflating them makes
 # the wrong fix look right.
 EXIT_PROJECT_BUDGET = 12   # gate: a project's own budget is exhausted
+# Distinct from 6 for the same reason 12 is. A free-but-rationed backend
+# (Kaggle: ~30 GPU h/week) is bounded in *hours*, not dollars, so every run
+# costs $0.00 and the dollar ceilings can never refuse one. "You are out of
+# accelerator hours until the window rolls" and "you are out of money" have
+# different fixes, and raising `monthly_usd` is not one of them.
+EXIT_QUOTA = 13            # gate: a metered allowance other than money is exhausted
+# Distinct from 7, and the distinction is the whole reason it exists. 7 says a run
+# went *stale* -- it is past its collection window and something has gone wrong
+# with it. This says too much is in flight *right now*, which is not a fault at
+# all: the fix is to wait, or to collect one, and neither is what 7's fix field
+# says. They are easy to conflate because running things in parallel is what turns
+# the second into the first -- three concurrent submissions open three collection
+# windows at once, and one wedged job takes the other two down with it. This
+# ceiling exists so that stops being the normal state.
+EXIT_CONCURRENCY = 14      # gate: too many runs or tasks in flight at once
 
-GATE_CODES = {EXIT_PREFLIGHT, EXIT_EXPECTATION, EXIT_SPEND, EXIT_STALE_RUN, EXIT_PROJECT_BUDGET}
+GATE_CODES = {
+    EXIT_PREFLIGHT,
+    EXIT_EXPECTATION,
+    EXIT_SPEND,
+    EXIT_STALE_RUN,
+    EXIT_PROJECT_BUDGET,
+    EXIT_QUOTA,
+    EXIT_CONCURRENCY,
+}
 
 EXIT_MEANINGS = {
     EXIT_OK: "ok",
@@ -45,6 +68,8 @@ EXIT_MEANINGS = {
     EXIT_RUNNING: "job still running",
     EXIT_CONFIG: "configuration or credential problem",
     EXIT_PROJECT_BUDGET: "gate refusal: project budget exceeded",
+    EXIT_QUOTA: "gate refusal: accelerator quota exhausted",
+    EXIT_CONCURRENCY: "gate refusal: too many in flight at once",
 }
 
 

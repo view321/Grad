@@ -25,6 +25,10 @@ local index cannot do by construction. Three doors, chosen by `--tier1` or
   institutional addresses, so a personal account shares the anonymous pool,
   which is near-permanently rate limited. (`both` = asta+s2, `all`, `none`.)
 
+`asta` and `s2` are **switched off** in `[retrieval] tier1_disabled`, on those
+latency numbers. Asking for one by name is refused rather than silently
+answered by `pwc`; empty that list in `config/grad.toml` to use them.
+
 **Tier 2 — recall.** SQLite FTS5 + vectors over papers actually read and your
 own notes. This answers "where did I see that lemma," which no external index
 can.
@@ -63,7 +67,7 @@ a better ranker: the main agent can read 15 snippets, Haiku can read 50.
 ```bash
 python -m tools.paper_search search "..." --json                 # everything
 python -m tools.paper_search search "..." --no-expand --no-rerank --no-triage --json  # free path (rerank is the credits stage)
-python -m tools.paper_search search "..." --tier1 asta --json    # Semantic Scholar snippets instead of pwc
+python -m tools.paper_search search "..." --tier1 asta --json    # refused while asta is in tier1_disabled
 python -m tools.paper_search search "..." --local-only --json    # tier 2 only: papers read + own notes
 python -m tools.paper_search search "..." --no-local --json      # tier 1 only: discovery
 python -m tools.paper_search search "..." --no-citations --json  # skip neighbour/citation expansion

@@ -128,6 +128,23 @@ def notes_dir() -> Path:
     return _p("notes")
 
 
+# --- per-project memory (see core/projects.py) -----------------------------
+def projects_dir() -> Path:
+    return _p("projects")
+
+
+def project_dir(project_id: str) -> Path:
+    """One project's artifact directory.
+
+    Named by the project id, which `core/budget.py` already constrains to
+    something id-shaped -- so this is not a place a caller can escape from with
+    a `../`. Checked anyway in `core/projects.py:resolve_dir`, because the id
+    reaches that function from a `--project` flag and a path built from
+    unvalidated input is the one bug in this file that would matter.
+    """
+    return projects_dir() / project_id
+
+
 def notebooks_dir() -> Path:
     return _p("notebooks")
 

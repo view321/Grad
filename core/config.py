@@ -77,7 +77,22 @@ DEFAULTS: dict[str, Any] = {
         # arXiv's Atom API, used for one thing: abstracts in bulk. See
         # `arxiv_abstracts`.
         "arxiv_base": "https://export.arxiv.org/api/query",
+        # Tier-1 sources switched off, whatever asks for them. Both doors onto
+        # the Semantic Scholar corpus are shut here on latency grounds alone --
+        # see `tools/paper_search.py:disabled_tier1`. Empty the list to have
+        # them back; nothing else has to change.
+        "tier1_disabled": ["asta", "s2"],
         "openrouter_base": "https://openrouter.ai/api/v1",
+        # Which rail stage 2 rides: `auto` (Voyage if that key is stored, else
+        # OpenRouter), or either name to pin it. Voyage serve this model
+        # themselves and `embed_model` already needs that key, so the default
+        # asks for one credential where it used to need two -- and OpenRouter
+        # stays supported for anyone already billing through it. See
+        # `core/http.py:rerank_provider`.
+        "rerank_provider": "auto",
+        # Read on both rails: `voyageai/` is stripped for Voyage's own API and
+        # added back for OpenRouter's catalogue, so this one value is correct
+        # either way. See `core/http.py:rerank_model`.
         "rerank_model": "voyageai/rerank-2.5",
         "embed_model": "voyage-4",
         "embed_dim": 1024,
@@ -88,6 +103,9 @@ DEFAULTS: dict[str, Any] = {
         # per million tokens; wrong-but-present beats absent, and it is one line
         # to correct when the price moves.
         "embed_usd_per_1m_tokens": 0.06,
+        # The same arithmetic for the same reason, one stage earlier. Only the
+        # Voyage rail needs it: OpenRouter prices the call and reports it.
+        "rerank_usd_per_1m_tokens": 0.05,
         # triage_model / expand_model moved to [models] triage / expand (§16).
         # They are still *readable* here as overrides -- see LEGACY_MODEL_KEYS --
         # but they are no longer defaulted here, so [models] is the one place a
@@ -169,6 +187,30 @@ DEFAULTS: dict[str, Any] = {
         "dry_run_timeout_s": 900,
         "test_timeout_s": 900,
     },
+    # How much may be in flight at once, and it is a ceiling for the same reason
+    # every other number in this file is one.
+    #
+    # `max_concurrent_runs` is the one with teeth. `gates.check_stale` refuses
+    # *every* later submission while *any* uncollected run is past its window, so
+    # three parallel submissions open three collection windows at once and one
+    # wedged job takes the other two down with it. Running things in parallel is
+    # precisely what turns exit 7 from an occasional annoyance into the normal
+    # state, and this is what stops it. Two is deliberately low: it is enough to
+    # overlap a long job with a short one, which is the case worth having, and not
+    # enough to lose track of what is out there.
+    #
+    # `max_concurrent_tasks` bounds local background commands (`tools/task.py`).
+    # Different number because it bounds a different resource -- this machine's
+    # CPU, not a backend's willingness to be polled.
+    #
+    # `default_jobs` is what `--jobs` defaults to where a tool parallelises inside
+    # itself: the funnel's stage 1, preflight's independent checks. Network-bound
+    # work, so it is the largest of the three.
+    "execution": {
+        "max_concurrent_runs": 2,
+        "max_concurrent_tasks": 4,
+        "default_jobs": 4,
+    },
     "hf": {
         "default_flavor": "a10g-small",
         # HF Jobs report a job's start and end; the price of a flavor comes from
@@ -181,6 +223,87 @@ DEFAULTS: dict[str, Any] = {
             "a10g-small": 1.05,
             "a10g-large": 1.50,
             "a100-large": 4.13,
+        },
+    },
+    # Kaggle kernels: a third submitter, and the first whose scarce resource is
+    # not money. Every run costs $0.00, so the §6 dollar ceilings can never
+    # refuse one -- which would make them decoration on this backend rather than
+    # a gate. What Kaggle actually rations is accelerator *hours*, weekly, so
+    # that is what `core/kaggle_quota.py` counts and refuses against.
+    "kaggle": {
+        # Whose account. Not a credential: only the key is secret, and which
+        # account is running the notebooks belongs somewhere you can read it.
+        # `core/credentials.py:KAGGLE_KEY` holds the other half.
+        #
+        # Usually set by `python -m tools.kaggle account --set <username>`, which
+        # writes it to the app directory instead of here -- this file is
+        # hand-annotated and `tomllib` cannot write it back without discarding
+        # every comment in it. That stored selection wins over this key; leaving
+        # this empty is the normal case.
+        "username": "",
+        "default_accelerator": "NvidiaTeslaP100",
+        # Kernel slugs are `<username>/<prefix>-<run_id>`, so every kernel this
+        # tool pushes is identifiable as ours on the Kaggle side.
+        "kernel_prefix": "grad",
+        # Kaggle kernels are private by default here, and it is not a detail:
+        # a public kernel publishes the pipeline, the data pointer and the
+        # results to the internet the moment it is pushed.
+        "is_private": True,
+        # Off by default, and this one is a real trade. A kernel with internet
+        # can `pip install` and pull weights; it can also exfiltrate anything it
+        # can read. Turning it on is a per-spec decision (`[target] internet`),
+        # not a default, because the default is the one nobody re-reads.
+        "enable_internet": False,
+        "poll_interval_s": 30,
+        # Push and status calls are quick; `output` downloads every file the
+        # kernel produced and is the one that can genuinely take minutes.
+        "push_timeout_s": 900,
+        "status_timeout_s": 120,
+        "output_timeout_s": 1800,
+        # How long a smoke run may sit queued before the poll gives up. Separate
+        # from the wall-clock cap on the smoke itself: queue time is Kaggle being
+        # busy, and charging it to a cap the spec asked for would fail the check
+        # for a reason that has nothing to do with the code under test.
+        "queue_grace_s": 900,
+        # Which weekly pool each accelerator draws from. A table rather than a
+        # constant for the reason `[docs]` gives: Kaggle adds hardware, and a new
+        # id should be a one-line edit here rather than a code change. An id that
+        # is not in this table is a configuration error and never a guess --
+        # guessing "gpu" for a TPU would charge the wrong pool, and guessing
+        # "cpu" would charge no pool at all, which is the failure that makes a
+        # quota gate decoration.
+        "accelerators": {
+            "none": "cpu",
+            "NvidiaTeslaP100": "gpu",
+            "NvidiaTeslaT4": "gpu",
+            "NvidiaTeslaT4Highmem": "gpu",
+            "NvidiaTeslaA100": "gpu",
+            "NvidiaL4": "gpu",
+            "NvidiaL4X1": "gpu",
+            "NvidiaH100": "gpu",
+            "NvidiaRtxPro6000": "gpu",
+            "TpuV38": "tpu",
+            "Tpu1VmV38": "tpu",
+            "TpuV5E8": "tpu",
+            "TpuV6E8": "tpu",
+        },
+        # The published allowances, which Kaggle varies with demand and does not
+        # expose as a remaining balance. So this is the same kind of number as
+        # `[quota]`'s token ceiling: **a proxy you control, not a mirror of
+        # Kaggle's limit.** Set it under the real allowance and it binds first,
+        # which is the point -- a gate that refuses at 30.0h when Kaggle would
+        # have allowed 34 costs you four hours; one that refuses at 34 when
+        # Kaggle stops at 30 loses you a run mid-training.
+        "quota": {
+            "gpu_hours_per_week": 30.0,
+            "tpu_hours_per_week": 20.0,
+            "window_days": 7,
+            # A single session's ceiling, which is a different failure from the
+            # weekly one: Kaggle kills the kernel at the cap and the run dies
+            # with whatever it had not checkpointed. Refusing before the push is
+            # the only place that is cheap.
+            "max_session_hours": 12.0,
+            "max_tpu_session_hours": 9.0,
         },
     },
     # HANDOFF-2 §16: models are selected by *role*, not scattered across
@@ -231,6 +354,36 @@ DEFAULTS: dict[str, Any] = {
         # that trade becomes visible, which is why the accounting split landed
         # before this did.
         "compact_at_tokens": 300_000,
+        # How much of the selected project's `MEMORY.md` reaches the system
+        # prompt. Characters rather than tokens: this is read while a session is
+        # being built and loading a tokeniser there to make a bound exact would
+        # cost more than the bound is worth. Roughly four characters to the
+        # token, so this is about 4k.
+        #
+        # It is a ceiling on a *recurring* cost, which is what makes it worth
+        # having at all. The system prompt is re-read from cache on every tool
+        # round-trip of every turn, so a memory file that grows without bound
+        # becomes the dominant line in `quota summary` without ever appearing as
+        # a decision anyone made. 0 disables project memory entirely.
+        "memory_max_chars": 16_000,
+        # How hard the main agent thinks: auto | low | medium | high | xhigh |
+        # max. "auto" passes nothing and leaves it to the CLI, which is what
+        # every session did before the knob existed.
+        #
+        # This is only the *starting point*. The live selection is made from the
+        # chat statusline and kept in the app directory, because the right level
+        # is a property of the task and changes several times an afternoon --
+        # and because this file is hand-annotated and cannot be written back
+        # without losing its comments. See `core/effort.py`.
+        "effort": "auto",
+    },
+    # The cross-workspace experiment archive (`core/experiments.py`).
+    "experiments": {
+        # Artifacts above this size are recorded with their length and no
+        # digest. Hashing a multi-gigabyte checkpoint on the `collect` path
+        # would turn bookkeeping into a visible stall; the size alone still
+        # catches truncation, which is the common corruption.
+        "hash_max_bytes": 64 * 1024 * 1024,
     },
     "hosts": {},
 }
@@ -376,6 +529,28 @@ class Config:
             )
         return hosts[name]
 
+    def accelerator_kind(self, name: str) -> str:
+        """Which weekly pool a Kaggle accelerator draws from: gpu, tpu, or cpu.
+
+        The same argument `host()` makes, for the same reason. An unrecognised
+        accelerator id is a configuration error rather than a default, because
+        every available default is wrong in a way that matters: falling back to
+        `"gpu"` charges a TPU run to the GPU allowance, and falling back to
+        `"cpu"` charges it to nothing at all -- and a run that draws no pool is
+        exactly how a weekly ceiling quietly stops bounding anything.
+        """
+        table = self.get("kaggle", "accelerators", {}) or {}
+        if name not in table:
+            known = ", ".join(sorted(table)) or "(none configured)"
+            raise ConfigError(
+                f"unknown Kaggle accelerator {name!r}; known accelerators: {known}",
+                fix=(
+                    f"add `{name} = \"gpu\"` (or tpu/cpu) to [kaggle.accelerators] in "
+                    f"{paths.config_path()} -- the value names the weekly pool it draws from"
+                ),
+            )
+        return str(table[name])
+
 
 def _merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
@@ -429,7 +604,63 @@ _NUMERIC = (
     # outage at the endpoint rather than as a typo in a config file.
     ("retrieval", "request_deadline_s"),
     ("retrieval", "stage1_budget_s"),
+    # All three are read straight into `max(1, int(...))` and into a ceiling
+    # comparison. A string here is a TypeError from inside the gate that is
+    # refusing a submission, which reads like a bug in the gate.
+    ("execution", "max_concurrent_runs"),
+    ("execution", "max_concurrent_tasks"),
+    ("execution", "default_jobs"),
+    ("kaggle", "poll_interval_s"),
+    ("kaggle", "push_timeout_s"),
+    ("kaggle", "status_timeout_s"),
+    ("kaggle", "output_timeout_s"),
+    ("kaggle", "queue_grace_s"),
 )
+
+# The nested ones. `_NUMERIC` addresses `raw[section][key]` and the Kaggle
+# allowances live one table deeper, in `[kaggle.quota]` -- so they would have
+# been validated by nothing at all, which is the wrong place for a string to
+# surface: `"thirty"` there is a TypeError from inside the gate that is refusing
+# a submission, and it reads like a bug in the gate.
+_NUMERIC_NESTED = (
+    ("kaggle", "quota", "gpu_hours_per_week"),
+    ("kaggle", "quota", "tpu_hours_per_week"),
+    ("kaggle", "quota", "window_days"),
+    ("kaggle", "quota", "max_session_hours"),
+    ("kaggle", "quota", "max_tpu_session_hours"),
+)
+
+
+def _check_number(value: Any, dotted: str, path: Path) -> None:
+    """One config number, or a ConfigError naming it.
+
+    Factored out rather than written twice: `[kaggle.quota]` needs exactly these
+    three checks and a second copy is a second place for them to drift.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"[{dotted.rsplit('.', 1)[0]}] {dotted.rsplit('.', 1)[1]} must be a number, "
+            f"not {type(value).__name__}",
+            fix=f"fix {dotted} in {path}",
+        )
+    # TOML has literal `nan` and `inf`, so these reach the gates as ordinary
+    # floats. Neither belongs in a ceiling: NaN fails every comparison, so a
+    # gate written as `if spend > ceiling` waves everything through, and inf
+    # is a ceiling that can never be reached. Both read as "no limit" while
+    # looking like a number in the file.
+    if not math.isfinite(value):
+        raise ConfigError(
+            f"{dotted} must be a finite number, not {value}",
+            fix=(
+                f"fix {dotted} in {path}; nan and inf are valid TOML floats "
+                "but neither can bound anything"
+            ),
+        )
+    if value < 0:
+        raise ConfigError(
+            f"{dotted} must not be negative",
+            fix=f"fix {dotted} in {path}",
+        )
 
 
 def _validate(cfg: Config, path: Path) -> None:
@@ -437,7 +668,7 @@ def _validate(cfg: Config, path: Path) -> None:
     # `Config.get` subscripts the section, so `spend = "lots"` in the file would
     # surface as an AttributeError from inside the loop below -- a traceback that
     # reads like a bug in the loader rather than a typo in a TOML file.
-    for section in (*dict.fromkeys(s for s, _ in _NUMERIC), "hf", "models"):
+    for section in (*dict.fromkeys(s for s, _ in _NUMERIC), "hf", "models", "kaggle"):
         table = cfg.raw.get(section)
         if table is not None and not isinstance(table, dict):
             raise ConfigError(
@@ -448,29 +679,19 @@ def _validate(cfg: Config, path: Path) -> None:
         value = cfg.get(section, key)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _check_number(value, f"{section}.{key}", path)
+    for section, table_name, key in _NUMERIC_NESTED:
+        table = cfg.get(section, table_name)
+        if table is None:
+            continue
+        if not isinstance(table, dict):
             raise ConfigError(
-                f"[{section}] {key} must be a number, not {type(value).__name__}",
-                fix=f"fix {section}.{key} in {path}",
+                f"[{section}.{table_name}] must be a table, not {type(table).__name__}",
+                fix=f"write it as a [{section}.{table_name}] section in {path}",
             )
-        # TOML has literal `nan` and `inf`, so these reach the gates as ordinary
-        # floats. Neither belongs in a ceiling: NaN fails every comparison, so a
-        # gate written as `if spend > ceiling` waves everything through, and inf
-        # is a ceiling that can never be reached. Both read as "no limit" while
-        # looking like a number in the file.
-        if not math.isfinite(value):
-            raise ConfigError(
-                f"[{section}] {key} must be a finite number, not {value}",
-                fix=(
-                    f"fix {section}.{key} in {path}; nan and inf are valid TOML floats "
-                    "but neither can bound anything"
-                ),
-            )
-        if value < 0:
-            raise ConfigError(
-                f"[{section}] {key} must not be negative",
-                fix=f"fix {section}.{key} in {path}",
-            )
+        if table.get(key) is not None:
+            _check_number(table[key], f"{section}.{table_name}.{key}", path)
+    _validate_kaggle(cfg, path)
     # A model id is a string. An integer or a list here would surface as an
     # opaque SDK error on the first turn rather than as a typo in a TOML file,
     # and an unknown role name is a silently ignored setting -- which is worse,
@@ -493,3 +714,46 @@ def _validate(cfg: Config, path: Path) -> None:
             fix=f"fix the [hf.flavor_rates] section in {path}",
         )
     cfg.hosts  # noqa: B018 - raises ConfigError on a malformed inventory
+
+
+#: The pools a Kaggle accelerator can draw from. `cpu` draws from none, which is
+#: why it is a named kind rather than an absence: a CPU-only kernel is a real,
+#: unmetered thing to run, and treating "no pool" as "unknown" would refuse it.
+ACCELERATOR_KINDS = ("gpu", "tpu", "cpu")
+
+
+def _validate_kaggle(cfg: Config, path: Path) -> None:
+    """The accelerator inventory and the weekly allowances.
+
+    Checked at load rather than at submit, for the reason the whole module
+    exists: a malformed table must never be discovered by the gate that was
+    about to use it. An accelerator mapped to `"GPU"` or to `"tpu "` is the case
+    worth catching -- the lookup would miss, the run would be charged to no pool,
+    and the weekly ceiling would silently stop counting the thing it exists to
+    count.
+    """
+    table = cfg.get("kaggle", "accelerators", {})
+    if not isinstance(table, dict):
+        raise ConfigError(
+            "[kaggle.accelerators] must be a table of accelerator id -> gpu|tpu|cpu",
+            fix=f"fix the [kaggle.accelerators] section in {path}",
+        )
+    for name, kind in table.items():
+        if not isinstance(kind, str) or kind not in ACCELERATOR_KINDS:
+            raise ConfigError(
+                f"[kaggle.accelerators] {name} must be one of "
+                f"{', '.join(ACCELERATOR_KINDS)}, not {kind!r}",
+                fix=(
+                    f"fix kaggle.accelerators.{name} in {path}; the value names which weekly "
+                    "pool the accelerator draws from, and an unrecognised one would charge none"
+                ),
+            )
+    default = cfg.get("kaggle", "default_accelerator", "")
+    if default and default not in table:
+        raise ConfigError(
+            f"[kaggle] default_accelerator {default!r} is not in [kaggle.accelerators]",
+            fix=(
+                f"add it to [kaggle.accelerators] in {path} with its pool (gpu/tpu/cpu), "
+                f"or pick one of: {', '.join(sorted(table))}"
+            ),
+        )

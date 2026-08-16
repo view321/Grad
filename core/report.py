@@ -301,6 +301,76 @@ def check_code_versions(run_ids: set[str]) -> list[dict[str, Any]]:
     return findings
 
 
+def check_replication(tex: str, claims: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rule 5: say when a published number rests on a single sample.
+
+    Not a refusal, and deliberately not. One seed is a legitimate result for
+    plenty of claims -- a throughput measurement, a smoke check, anything whose
+    variance is not the question -- and refusing them would make this rule the
+    one people route around. What it stops is a number being published *without
+    anyone having noticed* how thin it is, which is the failure mode the whole
+    expectations ledger is built against.
+
+    Reported per claim rather than per run, because that is the granularity a
+    reader fixes it at: one figure in the report is the thing to re-run with
+    more seeds, not "the run".
+    """
+    findings: list[dict[str, Any]] = []
+    for key in sorted(set(GRADNUM_RE.findall(tex))):
+        entry = claims.get(key)
+        if not isinstance(entry, dict):
+            continue  # rule 1's finding, not this one
+        run_id, quantity = entry.get("run_id"), entry.get("quantity")
+        if not run_id or not quantity:
+            continue
+        try:
+            run = ls.run(str(run_id))
+        except Exception:  # noqa: BLE001 - also rule 1's finding
+            continue
+        samples = (run.get("samples") or {}).get(str(quantity))
+        if isinstance(samples, list) and len(samples) > 1:
+            continue
+        # A deviation records `n` even when the run was not replicated, so a
+        # record written since `core/stats.py` landed can say so precisely.
+        # One written before it cannot, and is left alone: reporting every
+        # historical claim as under-replicated would make the rule noise.
+        n = _sample_count(run, str(quantity))
+        if n is None or n > 1:
+            continue
+        findings.append(
+            {
+                "rule": "replication",
+                "key": key,
+                "run_id": run_id,
+                "problem": (
+                    f"claim {key!r} publishes {quantity} from a single sample of run "
+                    f"{run_id}; nothing here bounds its run-to-run variance"
+                ),
+                "fix": (
+                    "re-run with several seeds (emit one metrics record per seed), or say "
+                    "in the report that this figure is a single run"
+                ),
+            }
+        )
+    return findings
+
+
+def _sample_count(run: ls.Run, quantity: str) -> int | None:
+    """How many samples a run's deviation recorded for `quantity`, or None.
+
+    None means "this record predates replication accounting", which is a
+    different answer from 1 and must not be reported as one.
+    """
+    for dev in run.get("deviations") or []:
+        if dev.get("quantity") != quantity:
+            continue
+        stats_block = dev.get("stats")
+        if isinstance(stats_block, dict) and isinstance(stats_block.get("n"), int):
+            return int(stats_block["n"])
+        return None
+    return None
+
+
 def cited_run_ids(tex: str, claims: dict[str, Any]) -> set[str]:
     keys = set(GRADNUM_RE.findall(tex))
     out = set()

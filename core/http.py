@@ -1181,21 +1181,154 @@ class Context7:
 
 
 # ---------------------------------------------------------------------------
-# OpenRouter rerank (credits, not quota)
+# Rerank (credits, not quota) -- Voyage directly, or OpenRouter as a proxy
 # ---------------------------------------------------------------------------
+#: `[retrieval] rerank_provider`. `auto` is the default and resolves against
+#: what is actually stored, so neither key is mandatory and having only one is
+#: never a configuration step.
+RERANK_PROVIDERS = ("auto", "voyage", "openrouter")
+
+
+def rerank_provider(cfg: Config) -> str:
+    """Which rail stage 2 rides, resolved against the credential store.
+
+    Voyage serve `rerank-2.5` themselves, so routing it through OpenRouter was a
+    second account and a second key for the same weights -- and `embed()`
+    already requires the Voyage one. So Voyage wins whenever its key is present:
+    one credential covers both of retrieval's credit-spending stages.
+
+    OpenRouter is not dropped, because a key that is already stored and already
+    billing is a working setup and upgrading should not break it. It is used
+    when it is the only key present, and `rerank_provider = "openrouter"` pins
+    it for anyone who wants that rail even with a Voyage key available.
+
+    With neither stored this answers `voyage` rather than raising, so the
+    caller's own missing-credential error names the key worth storing -- and
+    `cmd_search` turns that into a warning and an unreranked pool, which is the
+    established behaviour for a stage 2 that cannot run.
+    """
+    chosen = str(cfg.get("retrieval", "rerank_provider", "auto")).lower()
+    if chosen not in RERANK_PROVIDERS:
+        raise ConfigError(
+            f"unknown rerank provider {chosen!r}",
+            fix=f'[retrieval] rerank_provider must be one of: {", ".join(RERANK_PROVIDERS)}',
+        )
+    if chosen != "auto":
+        return chosen
+    if credentials.present(credentials.VOYAGE_KEY):
+        return "voyage"
+    return "openrouter" if credentials.present(credentials.OPENROUTER_KEY) else "voyage"
+
+
+def rerank_model(cfg: Config, provider: str) -> str:
+    """One `rerank_model` setting that means the same thing on either rail.
+
+    OpenRouter namespaces its catalogue (`voyageai/rerank-2.5`); Voyage's own
+    API names the model alone (`rerank-2.5`) and rejects the namespaced form.
+    Rewriting it here is what keeps switching provider a one-key change instead
+    of two, and what lets a config written for OpenRouter keep working when the
+    default rail moves under it.
+
+    A model id that already names some *other* provider is left alone in both
+    directions: OpenRouter serves rerankers from several vendors, and only the
+    bare Voyage form is ambiguous enough to need qualifying.
+    """
+    model = str(cfg.get("retrieval", "rerank_model")).strip()
+    if provider == "voyage":
+        return model.split("/", 1)[1] if model.lower().startswith("voyageai/") else model
+    return model if "/" in model else f"voyageai/{model}"
+
+
 def rerank(query: str, documents: Sequence[str], *, cfg: Config, top_n: int) -> list[dict[str, Any]]:
-    """`voyageai/rerank-2.5` through OpenRouter's dedicated rerank endpoint.
+    """`rerank-2.5`, over whichever rail has a key. See `rerank_provider`.
 
     Hosted on purpose: local reranking competes for the same VRAM as the
     experiments this agent exists to run. It costs credits rather than quota,
     which is why it sits between the two Haiku stages -- the quota-consuming
     stage never sees the 350 candidates that were obviously wrong.
+
+    Both rails book their spend against the same `STAGE_RERANK` ledger line and
+    both say in `detail` how the number was arrived at, because they do not
+    arrive at it the same way: OpenRouter prices the call and reports it, Voyage
+    returns a token count and leaves the arithmetic here.
     """
     if not documents:
         return []
+    provider = rerank_provider(cfg)
+    model = rerank_model(cfg, provider)
+    call = _rerank_voyage if provider == "voyage" else _rerank_openrouter
+    rows, billing = call(query, documents, cfg=cfg, top_n=top_n, model=model)
+    quota_log.record(
+        quota_log.STAGE_RERANK,
+        model=model,
+        unit="credits",
+        credits_usd=billing.pop("credits_usd"),
+        detail={
+            "documents": len(documents),
+            "top_n": top_n,
+            # Which rail, in the ledger. Two providers spending against one line
+            # is fine; not being able to tell which one spent it is not.
+            "provider": provider,
+            **billing,
+        },
+    )
+    return rows
+
+
+def _rerank_voyage(
+    query: str, documents: Sequence[str], *, cfg: Config, top_n: int, model: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Voyage's own rerank endpoint, which is not shaped like OpenRouter's.
+
+    Three differences, all of them silent failures rather than errors if missed:
+    the result count is `top_k`, the hits come back under `data` rather than
+    `results`, and `usage` carries a token count instead of a price.
+    """
+    key = credentials.get(credentials.VOYAGE_KEY)
+    httpx = _httpx()
+    try:
+        resp = httpx.post(
+            "https://api.voyageai.com/v1/rerank",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"model": model, "query": query, "documents": list(documents), "top_k": top_n},
+            timeout=float(cfg.get("retrieval", "request_timeout_s", 60)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise UpstreamError(f"rerank request failed: {exc}", fix="retry, or run with --no-rerank") from exc
+    if resp.status_code >= 400:
+        raise UpstreamError(
+            f"rerank returned {resp.status_code}: {resp.text[:200]}",
+            fix=(
+                "check the Voyage key: python -m tools.jobs credential set voyage_key   "
+                '(or set [retrieval] rerank_provider = "openrouter" to bill through OpenRouter)'
+            ),
+        )
+    data = resp.json()
+    # Priced from config for the same reason `embed` is: Voyage bills per token
+    # and returns a token count but no price, and a `credits_usd` left at its
+    # 0.0 default makes stage 2 free to every ceiling that sums that field.
+    total_tokens = int((data.get("usage") or {}).get("total_tokens") or 0)
+    rate_per_1m = float(cfg.get("retrieval", "rerank_usd_per_1m_tokens", 0.0) or 0.0)
+    rows = [
+        {"index": r.get("index"), "score": r.get("relevance_score", r.get("score"))}
+        for r in data.get("data", [])
+    ]
+    return rows, {
+        "credits_usd": total_tokens / 1_000_000.0 * rate_per_1m,
+        "total_tokens": total_tokens,
+        "usd_per_1m_tokens": rate_per_1m,
+        # Says which of the two it is wherever the number is read: a rate from
+        # config priced this, not the provider's own accounting.
+        "cost_basis": "configured_rate",
+    }
+
+
+def _rerank_openrouter(
+    query: str, documents: Sequence[str], *, cfg: Config, top_n: int, model: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The same model through OpenRouter's dedicated rerank endpoint."""
     key = credentials.get(credentials.OPENROUTER_KEY)
     base = str(cfg.get("retrieval", "openrouter_base"))
-    model = str(cfg.get("retrieval", "rerank_model"))
     httpx = _httpx()
     try:
         resp = httpx.post(
@@ -1209,7 +1342,11 @@ def rerank(query: str, documents: Sequence[str], *, cfg: Config, top_n: int) -> 
     if resp.status_code >= 400:
         raise UpstreamError(
             f"rerank returned {resp.status_code}: {resp.text[:200]}",
-            fix="check the OpenRouter key and that the model id is still served",
+            fix=(
+                "check the OpenRouter key and that the model id is still served, or drop the "
+                'key entirely: [retrieval] rerank_provider = "voyage" reranks on the Voyage '
+                "credential the local index already uses"
+            ),
         )
     data = resp.json()
     usage = data.get("usage", {}) or {}
@@ -1223,21 +1360,14 @@ def rerank(query: str, documents: Sequence[str], *, cfg: Config, top_n: int) -> 
         cost = float(reported) if reported is not None else 0.0
     except (TypeError, ValueError):
         reported, cost = None, 0.0
-    quota_log.record(
-        quota_log.STAGE_RERANK,
-        model=model,
-        unit="credits",
-        credits_usd=cost,
-        detail={
-            "documents": len(documents),
-            "top_n": top_n,
-            "cost_basis": "reported" if reported is not None else "unreported",
-        },
-    )
-    return [
+    rows = [
         {"index": r.get("index"), "score": r.get("relevance_score", r.get("score"))}
         for r in data.get("results", [])
     ]
+    return rows, {
+        "credits_usd": cost,
+        "cost_basis": "reported" if reported is not None else "unreported",
+    }
 
 
 # ---------------------------------------------------------------------------

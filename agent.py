@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import hooks
-from core import appdata, config as config_mod, credentials, migrate, paths, quota_log
+from core import appdata, config as config_mod, credentials, effort, migrate, paths, quota_log
 from core.errors import EXIT_PROJECT_BUDGET
 
 BUILTIN_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -63,7 +63,7 @@ def _sdk() -> Any:
 
 
 def system_prompt() -> str:
-    """The prompt, plus the two paths it cannot state for itself.
+    """The prompt, plus the two paths it cannot state for itself, plus memory.
 
     `prompts/system.md` says to reach for "the skills in `skills/`", which is a
     correct instruction only while the workspace and the installation are the
@@ -75,19 +75,57 @@ def system_prompt() -> str:
     someone edits, and a substitution marker in it is one more thing an edit can
     break. The block is only added when the two directories actually differ, so
     the standard install's prompt is byte-for-byte what the file says.
+
+    **The project's `MEMORY.md` is appended here, and here is why that is the
+    right seam.** Every session builds its options through `build_options`, and a
+    compaction builds a *fresh* client through the same function -- so putting
+    memory in the system prompt means the one thing a compaction must not lose is
+    the one thing it cannot lose, without `core/compaction.py` knowing anything
+    about projects. The handover note carries the conversation; this carries what
+    the project knows, and the second of those should not depend on a model
+    remembering to write it down in the first.
     """
     text = paths.prompt_path().read_text(encoding="utf-8")
     root, skills = paths.root(), paths.skills_dir()
-    if skills.parent == root:
+    appended: list[str] = []
+    if skills.parent != root:
+        appended.append(
+            "## Where things are\n\n"
+            f"Your working directory is the workspace: `{root}`. The ledger, notebooks, "
+            "notes and figures are there and every path you write should be relative to it.\n\n"
+            f"Grad itself is installed at `{paths.install_dir()}`, which is a separate "
+            f"folder you do not write to. The skills are there: `{skills}`."
+        )
+    memory = project_memory_block()
+    if memory:
+        appended.append(memory)
+    # Byte-for-byte when there is nothing to add, which is a property worth
+    # keeping rather than an accident: the prompt is a document someone edits and
+    # diffs, and a trailing newline this function invented would show up in every
+    # comparison against the file.
+    if not appended:
         return text
-    return (
-        f"{text.rstrip()}\n\n"
-        "## Where things are\n\n"
-        f"Your working directory is the workspace: `{root}`. The ledger, notebooks, "
-        "notes and figures are there and every path you write should be relative to it.\n\n"
-        f"Grad itself is installed at `{paths.install_dir()}`, which is a separate "
-        f"folder you do not write to. The skills are there: `{skills}`.\n"
-    )
+    return "\n\n".join([text.rstrip(), *appended]) + "\n"
+
+
+def project_memory_block() -> str:
+    """The selected project's memory, or "" -- and never an exception.
+
+    Wrapped this tightly because it runs before the first turn of every session
+    on both surfaces. A project directory that does not exist, a ledger that
+    cannot be read, a `MEMORY.md` locked by an editor: each of those is a session
+    that starts without memory, which is exactly the session everyone had before
+    this existed. None of them is a session that fails to start.
+    """
+    try:
+        from core import budget, projects  # noqa: PLC0415
+
+        cfg = config_mod.load()
+        limit = int(cfg.get("agent", "memory_max_chars", projects.MEMORY_MAX_CHARS))
+        return projects.prompt_block(budget.current_project(), max_chars=max(0, limit))
+    except Exception:  # noqa: BLE001 - see the docstring
+        logging.getLogger("grad").debug("no project memory block", exc_info=True)
+        return ""
 
 
 def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str | None = None) -> Any:
@@ -123,6 +161,12 @@ def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str |
         "include_partial_messages": True,
     }
     options.update(thinking_option(cfg, sdk))
+    # How hard it thinks, from `core/effort.py`. Applied here rather than
+    # anywhere later because there is nowhere later: the SDK exposes no control
+    # request for it, so the level a client runs at is fixed when the client is
+    # built. `ui/app.py:Session.apply_effort` is what turns a change into a
+    # rebuild.
+    options.update(effort.option(cfg, sdk))
     return sdk.ClaudeAgentOptions(**options)
 
 

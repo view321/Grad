@@ -42,6 +42,11 @@ T_CAMPAIGN_CLOSED = "campaign_closed"
 T_HALT_REQUESTED = "campaign_halt_requested"
 T_CANDIDATE = "candidate"
 T_CANDIDATE_PROMOTED = "candidate_promoted"
+#: An island champion made eligible to breed on a neighbouring island. An event
+#: rather than an edit, because these files are append-only and a candidate's
+#: record is written once, when it is evaluated -- migration happens generations
+#: later and must not rewrite it.
+T_CANDIDATE_MIGRATED = "candidate_migrated"
 
 STATUSES = ("open", "closed", "exhausted", "failed", "halted")
 
@@ -165,6 +170,102 @@ def escaped_evolve_block(baseline: str, candidate: str) -> dict[str, Any]:
 
 def has_markers(source: str) -> bool:
     return BLOCK_START in source and BLOCK_END in source
+
+
+def block_texts(source: str) -> list[str]:
+    """The current contents of each mutable region, in order.
+
+    What the mutation operator is shown and asked to rewrite. Separate from
+    `split_blocks`, which flattens every region into one list and is the right
+    shape for the escape check and the wrong one for editing: an operator given
+    two concatenated regions cannot say which of them its replacement belongs to.
+    """
+    out: list[str] = []
+    current: list[str] = []
+    in_block = False
+    for line in source.splitlines():
+        if BLOCK_START in line:
+            in_block, current = True, []
+            continue
+        if BLOCK_END in line:
+            if in_block:
+                out.append("\n".join(current))
+            in_block, current = False, []
+            continue
+        if in_block:
+            current.append(line)
+    if in_block:
+        out.append("\n".join(current))
+    return out
+
+
+def replace_blocks(source: str, replacements: list[str]) -> str:
+    """`source` with each mutable region replaced, markers and outside untouched.
+
+    **This is what makes an escape structurally hard rather than merely
+    detected.** The operator never returns a whole file: it returns the contents
+    of a block, and this splices them between markers that came from the
+    baseline. Code outside the region cannot change because nothing outside the
+    region was ever in the model's output -- so the imports, the entry point and
+    the I/O the campaign was preflighted against are the baseline's by
+    construction.
+
+    `escaped_evolve_block` still runs on the result, and still matters: a
+    replacement that *contains* the marker text would re-open or re-close a
+    region and move real code across the boundary. That check is the one thing
+    this cannot do for itself, because at this point the marker text is data.
+    """
+    if len(replacements) != source.count(BLOCK_START):
+        raise ValueError(
+            f"the baseline has {source.count(BLOCK_START)} mutable region(s) but "
+            f"{len(replacements)} replacement(s) were given"
+        )
+    out: list[str] = []
+    taken = 0
+    in_block = False
+    for line in source.splitlines():
+        if BLOCK_START in line:
+            out.append(line)
+            out.extend(replacements[taken].splitlines())
+            taken += 1
+            in_block = True
+            continue
+        if BLOCK_END in line:
+            out.append(line)
+            in_block = False
+            continue
+        if not in_block:
+            out.append(line)
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def apply_edits(text: str, edits: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Apply `find`/`replace` pairs to one block's text. Returns (text, problems).
+
+    Each `find` must appear **exactly once**. Not "at least once": a search string
+    that matches twice is a mutation whose effect depends on which occurrence the
+    operator meant, and applying it to both is a guess that silently edits code
+    the model was not looking at. Zero matches is the ordinary LLM failure --
+    whitespace reconstructed slightly differently -- and both are reported rather
+    than fixed up, so the candidate is recorded as failed with a reason instead of
+    being evaluated as something nobody wrote.
+    """
+    problems: list[str] = []
+    for i, edit in enumerate(edits):
+        find = edit.get("find")
+        replace = edit.get("replace")
+        if not isinstance(find, str) or not find or not isinstance(replace, str):
+            problems.append(f"edit {i} needs a non-empty `find` and a string `replace`")
+            continue
+        count = text.count(find)
+        if count != 1:
+            problems.append(
+                f"edit {i}: `find` matched {count} times, not once"
+                + (" (the text may have been reconstructed with different whitespace)" if not count else "")
+            )
+            continue
+        text = text.replace(find, replace, 1)
+    return text, problems
 
 
 # ---------------------------------------------------------------------------
@@ -299,25 +400,71 @@ def append_candidate(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def candidates(campaign_id: str | None = None) -> list[dict[str, Any]]:
-    """Candidate evaluations, oldest first.
+    """Candidate evaluations, oldest first, with later events folded in.
 
     These live outside `runs.jsonl` on purpose (§23 item 4): they are sub-runs
     of a campaign, exempt from the per-run expectation gate, and a thousand of
     them would dominate a ledger meant to be read by hand.
+
+    Two things are folded on top of the evaluation record: whether the candidate
+    was promoted, and which islands it has since been migrated to. Both happen
+    after the record is written and neither may rewrite it.
     """
+    events = candidate_events()
     promoted = {
-        rec.get("candidate_id")
-        for rec in candidate_events()
-        if rec.get("type") == T_CANDIDATE_PROMOTED
+        rec.get("candidate_id") for rec in events if rec.get("type") == T_CANDIDATE_PROMOTED
     }
+    migrated: dict[str, list[int]] = {}
+    for rec in events:
+        if rec.get("type") != T_CANDIDATE_MIGRATED:
+            continue
+        target = rec.get("to_island")
+        if isinstance(target, int):
+            targets = migrated.setdefault(str(rec.get("candidate_id")), [])
+            if target not in targets:
+                targets.append(target)
     out = []
-    for rec in candidate_events():
+    for rec in events:
         if rec.get("type") != T_CANDIDATE:
             continue
         if campaign_id and rec.get("campaign") != campaign_id:
             continue
-        out.append({**rec, "promoted": rec.get("candidate_id") in promoted})
+        cid = rec.get("candidate_id")
+        out.append(
+            {
+                **rec,
+                "promoted": cid in promoted,
+                "migrated_to": list(migrated.get(str(cid), [])),
+            }
+        )
     return out
+
+
+def record_migration(
+    campaign_id: str, generation: int, moves: list[tuple[str, int, int]]
+) -> list[dict[str, Any]]:
+    """Record island migrations as events, one per move.
+
+    A *copy*, which is what `evolution.migrate` computes: the champion stays
+    eligible on its home island and becomes eligible on its neighbour too.
+    Moving it would empty the island it came from of its best member, which is
+    the opposite of what migration is for.
+    """
+    return [
+        jsonl.append(
+            candidates_path(),
+            {
+                "type": T_CANDIDATE_MIGRATED,
+                "campaign": campaign_id,
+                "candidate_id": candidate_id,
+                "generation": generation,
+                "from_island": source,
+                "to_island": target,
+                "at": now_iso(),
+            },
+        )
+        for candidate_id, source, target in moves
+    ]
 
 
 def promote_candidate(campaign_id: str, candidate_id: str, run_id: str) -> dict[str, Any]:

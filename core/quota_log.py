@@ -29,6 +29,11 @@ STAGE_RERANK = "funnel.rerank"        # stage 2 (credits, not quota)
 STAGE_TRIAGE = "funnel.triage"        # stage 3
 STAGE_EMBED = "embed"
 STAGE_INGEST = "ingest"
+#: One mutation proposal (§21). Here rather than in `tools/evolve.py` so it sits
+#: with the other stages a summary groups by -- and because the campaign loop is
+#: the one place in this system that issues model calls with no human waiting on
+#: them, which makes it the stage most worth being able to total.
+STAGE_EVOLVE = "evolve.mutate"
 
 
 def record(

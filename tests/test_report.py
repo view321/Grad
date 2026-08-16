@@ -484,7 +484,9 @@ def test_check_reports_every_rule_it_ran(workspace, project, stub_resolver):
     in_range_run()
     draft_and_cite()
     result = report.cmd_check(args())
-    assert set(result["by_rule"]) == {"claims", "citations", "unjudged", "latex", "version"}
+    assert set(result["by_rule"]) == {
+        "claims", "citations", "unjudged", "latex", "version", "replication",
+    }
 
 
 def test_check_refuses_while_a_placeholder_survives(workspace, project, monkeypatch):

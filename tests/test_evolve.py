@@ -19,7 +19,14 @@ import argparse
 
 import pytest
 
-from core import budget, campaign as camp, config as config_mod, ledger_store as ls, paths
+from core import (
+    budget,
+    campaign as camp,
+    config as config_mod,
+    evolution,
+    ledger_store as ls,
+    paths,
+)
 from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, GradError, NotFound, UsageError
 from tools import evolve
 
@@ -103,26 +110,60 @@ def run_args(task_dir, expectation_id, **overrides):
         task_dir=str(task_dir), expect=expectation_id, project=None, generations=2,
         population=2, estimate_per_candidate_usd=0.0, local=True, remote=False,
         overrides=[], timeout_s=30, json=True,
+        # The search knobs. `islands=1` and no migration by default so the tests
+        # that are about the *gate* are not also about the selection policy;
+        # `test_evolution.py` covers that half on its own.
+        mutator=evolve.MUTATOR_CLAUDE, jobs=2, eval_jobs=1, islands=1,
+        migrate_every=0, pressure=1.0, seed=1234,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
 class FakeMutator:
-    """A Shinka stand-in. Returns deterministic mutations inside the block."""
+    """An operator stand-in: real mutations of the parent's block, no model.
 
-    def __init__(self, *, escape_at=None):
+    Returns the shape `core/mutate.py:propose` returns, because the driver's
+    contract with the operator is that shape and a fake that returned bare
+    strings would test a driver nobody has.
+    """
+
+    def __init__(self, *, escape_at=None, fail_at=None, duplicate_at=None):
         self.escape_at = escape_at
+        self.fail_at = fail_at
+        self.duplicate_at = duplicate_at
         self.calls: list[int] = []
 
-    def propose(self, *, generation, population, best):
+    def propose(self, *, plans, baseline, history):
+        generation = plans[0]["generation"] if plans else 0
         self.calls.append(generation)
         out = []
-        for i in range(population):
+        for plan in plans:
+            i = plan["index"]
+            meta = {
+                "patch_type": plan["patch_type"],
+                "island": plan["island"],
+                "index": i,
+                "generation": generation,
+                "parent_id": (plan.get("parent") or {}).get("candidate_id"),
+                "mate_id": (plan.get("mate") or {}).get("candidate_id"),
+                "rationale": "a fake mutation",
+                "error": None,
+            }
+            if self.fail_at == generation and i == 0:
+                out.append({**meta, "source": "", "error": "the operator produced no source"})
+                continue
             if self.escape_at == generation and i == 0:
-                out.append(BASELINE.replace("import json", "import json\nimport os"))
-            else:
-                out.append(BASELINE.replace("return x * 2", f"return x * {generation + i + 2}"))
+                out.append(
+                    {**meta, "source": BASELINE.replace("import json", "import json\nimport os")}
+                )
+                continue
+            # Unique per (generation, index), because the driver deduplicates
+            # proposals against everything ever proposed: a naive
+            # `generation + i` repeats across generations and the fake would
+            # spend the campaign colliding with itself.
+            factor = 2 if self.duplicate_at == generation else generation * 100 + i + 3
+            out.append({**meta, "source": BASELINE.replace("return x * 2", f"return x * {factor}")})
         return out
 
 
@@ -176,8 +217,8 @@ def test_the_gate_stops_a_runaway_campaign_at_a_generation_boundary(workspace, m
     class ConcurrentSpender(FakeMutator):
         """Something else eats the allocation after the first generation."""
 
-        def propose(self, *, generation, population, best):
-            if generation == 1:
+        def propose(self, *, plans, baseline, history):
+            if plans and plans[0]["generation"] == 1:
                 ls.append_run_event(
                     {
                         "type": ls.T_RUN_SUBMITTED, "id": ls.new_id("run"),
@@ -185,7 +226,7 @@ def test_the_gate_stops_a_runaway_campaign_at_a_generation_boundary(workspace, m
                         "project": "proj-1", "estimate_usd": 9.0,
                     }
                 )
-            return super().propose(generation=generation, population=population, best=best)
+            return super().propose(plans=plans, baseline=baseline, history=history)
 
     monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: ConcurrentSpender())
     result = evolve.cmd_run(
@@ -381,12 +422,16 @@ def test_init_scaffolds_a_valid_task(workspace):
     result = evolve.cmd_init(
         argparse.Namespace(task_dir="pipeline/e", force=False, json=True)
     )
-    assert len(result["written"]) == 2
+    assert len(result["written"]) == 3
     source = (paths.root() / "pipeline" / "e" / "initial.py").read_text(encoding="utf-8")
     assert camp.has_markers(source)
     assert "combined_score" in (paths.root() / "pipeline" / "e" / "evaluate.py").read_text(
         encoding="utf-8"
     )
+    # The brief the operator is shown on every proposal. Scaffolded because a
+    # campaign whose operator was told nothing about the task spends its first
+    # generations inferring one.
+    assert (paths.root() / "pipeline" / "e" / "TASK.md").exists()
 
 
 def test_the_default_models_are_an_ensemble(workspace):
@@ -404,13 +449,19 @@ def test_shinkas_own_override_mechanism_wins(workspace):
     assert models == ("a", "b", "c")
 
 
-def test_capabilities_answers_the_driver_or_fork_question(workspace):
-    """§23 item 1, answered against the installed package rather than a
-    document."""
+def test_capabilities_reports_both_engines(workspace):
+    """§23 item 1, answered against the installed packages rather than a
+    document -- and no longer the deciding question, because the built-in
+    operator does not need a hook point: the loop is ours."""
     report = evolve.mutator_capabilities()
-    assert "installed" in report
-    if not report["installed"]:
-        assert "shinka" in report["reason"]
+    assert report["default"] == evolve.MUTATOR_CLAUDE
+    assert set(report["mutators"]) == {evolve.MUTATOR_CLAUDE, evolve.MUTATOR_SHINKA}
+    built_in = report["mutators"][evolve.MUTATOR_CLAUDE]
+    assert built_in["granularity"] == "candidate"
+    assert set(built_in["patch_types"]) == set(evolution.PATCH_TYPES)
+    shinka = report["mutators"][evolve.MUTATOR_SHINKA]
+    if not shinka["available"]:
+        assert shinka.get("reason") or shinka.get("note")
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +515,15 @@ def test_the_shinka_driver_accepts_a_per_generation_entry_point(workspace):
 
 
 def test_capabilities_names_the_granularity_it_found(workspace):
-    report = evolve.mutator_capabilities()
-    if report["installed"]:
-        assert report["granularity"] in ("candidate", "generation", "campaign")
-        assert isinstance(report["driver_viable"], bool)
+    shinka = evolve.mutator_capabilities()["mutators"][evolve.MUTATOR_SHINKA]
+    if shinka["available"]:
+        assert shinka["granularity"] in ("candidate", "generation")
     else:
-        assert "shinka" in report["reason"]
+        # Either not installed, or installed and whole-loop-only. Both refuse,
+        # and both name the built-in operator as the way forward.
+        assert "shinka" in (shinka.get("reason") or "").lower() or (
+            shinka.get("granularity") == "campaign"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -483,10 +537,10 @@ class HaltingMutator(FakeMutator):
         super().__init__(**kwargs)
         self._campaign = campaign_getter
 
-    def propose(self, *, generation, population, best):
-        if generation == 0:
+    def propose(self, *, plans, baseline, history):
+        if plans and plans[0]["generation"] == 0:
             camp.request_halt(self._campaign(), reason="halted from the workspace")
-        return super().propose(generation=generation, population=population, best=best)
+        return super().propose(plans=plans, baseline=baseline, history=history)
 
 
 def test_a_halt_stops_the_loop_at_the_next_generation_boundary(workspace, monkeypatch):
@@ -606,19 +660,107 @@ def test_a_boundary_record_does_not_count_as_a_generation_that_ran(workspace):
     assert camp.campaign("camp-1")["generation_log"][-1]["halted"] is True
 
 
+# ---------------------------------------------------------------------------
+# the built-in operator: what the driver does with what it returns
+# ---------------------------------------------------------------------------
+def test_a_duplicate_proposal_is_recorded_and_not_evaluated(workspace, monkeypatch):
+    """An operator shown the elites every generation proposes one of them back,
+    and evaluation is the expensive half. A duplicate is one wasted candidate;
+    silently evaluating it twice is one wasted GPU hour."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator(duplicate_at=1))
+    result = evolve.cmd_run(
+        run_args(task_dir, make_expectation(), generations=2, population=2)
+    )
+    rows = camp.candidates(result["campaign"])
+    dupes = [r for r in rows if r.get("duplicate_of")]
+    # Generation 1 proposes `x * 2` twice; the first is new, the second is not.
+    assert len(dupes) == 1
+    assert result["duplicates_rejected"] == 1
+    assert dupes[0]["metrics"] is None
+    assert dupes[0]["cost_usd"] == 0.0
+
+
+def test_an_operator_failure_is_one_candidate_not_one_campaign(workspace, monkeypatch):
+    """A turn that ended without calling the tool, or an edit that matched
+    nothing. The generation is one proposal short and the campaign carries on."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator(fail_at=0))
+    result = evolve.cmd_run(run_args(task_dir, make_expectation(), generations=2, population=2))
+
+    assert result["status"] == "closed"
+    rows = camp.candidates(result["campaign"])
+    failed = [r for r in rows if r.get("skipped") and "no source" in (r.get("error") or "")]
+    assert len(failed) == 1
+    assert failed[0]["cost_usd"] == 0.0
+    assert len([r for r in rows if r.get("metrics")]) == 3
+
+
+def test_the_seed_is_recorded_so_a_campaign_can_be_replayed(workspace, monkeypatch):
+    """The selection policy is deterministic in the seed by construction, which
+    is worth nothing if the seed is not in the ledger."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(run_args(task_dir, make_expectation(), seed=None))
+    assert isinstance(result["seed"], int)
+    assert camp.campaign(result["campaign"])["seed"] == result["seed"]
+
+
+def test_the_campaign_records_which_operator_ran(workspace, monkeypatch):
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(run_args(task_dir, make_expectation()))
+    record = camp.campaign(result["campaign"])
+    assert record["mutator"] == evolve.MUTATOR_CLAUDE
+    assert record["model"] == config_mod.load(reload=True).model_for("evolve")
+
+
+def test_the_bandit_is_rebuilt_from_the_records(workspace, monkeypatch):
+    """Held in no process's memory, so a crash cannot lose it and a reader can
+    check it. `status` reports the same numbers the loop used."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(run_args(task_dir, make_expectation(), generations=2, population=2))
+
+    reported = {row["patch_type"]: row["pulls"] for row in result["bandit"]}
+    assert sum(reported.values()) == 4
+    status = evolve.cmd_status(
+        argparse.Namespace(campaign=result["campaign"], top=5, json=True)
+    )
+    assert {r["patch_type"]: r["pulls"] for r in status["bandit"]} == reported
+
+
+def test_islands_and_migration_are_recorded(workspace, monkeypatch):
+    """Migration is an event rather than an edit: `candidates.jsonl` is
+    append-only and a candidate's record is written once, when it is evaluated."""
+    task_dir = scaffold(workspace)
+    monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: FakeMutator())
+    result = evolve.cmd_run(
+        run_args(task_dir, make_expectation(), generations=3, population=2,
+                 islands=2, migrate_every=1)
+    )
+    rows = camp.candidates(result["campaign"])
+    assert {evolution.island_of(r) for r in rows} == {0, 1}
+    # A champion made eligible on its neighbour, without leaving its own island.
+    migrants = [r for r in rows if r.get("migrated_to")]
+    assert migrants, "migration should have copied at least one champion"
+    for row in migrants:
+        assert evolution.island_of(row) in evolution.islands_of(row)
+
+
 def test_the_budget_boundary_record_is_not_counted_either(workspace, monkeypatch):
     """The same off-by-one existed on the pre-existing exhausted path."""
     budget.create("proj-1", title="t", budget={"gpu_usd": 10.0})
     task_dir = scaffold(workspace)
 
     class ConcurrentSpender(FakeMutator):
-        def propose(self, *, generation, population, best):
-            if generation == 1:
+        def propose(self, *, plans, baseline, history):
+            if plans and plans[0]["generation"] == 1:
                 ls.append_run_event(
                     {"type": ls.T_RUN_SUBMITTED, "id": ls.new_id("run"), "status": "in_flight",
                      "submitted_at": ls.now_iso(), "project": "proj-1", "estimate_usd": 9.0}
                 )
-            return super().propose(generation=generation, population=population, best=best)
+            return super().propose(plans=plans, baseline=baseline, history=history)
 
     monkeypatch.setattr(evolve, "_make_mutator", lambda *a, **k: ConcurrentSpender())
     result = evolve.cmd_run(

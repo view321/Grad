@@ -12,6 +12,7 @@ import pytest
 
 from core import gates, jsonl, ledger_store as ls, paths
 from core.errors import (
+    EXIT_CONCURRENCY,
     EXIT_EXPECTATION,
     EXIT_PREFLIGHT,
     EXIT_SPEND,
@@ -210,12 +211,60 @@ def test_a_stale_uncollected_run_blocks_new_submissions(workspace, cfg):
         {
             "type": ls.T_RUN_SUBMITTED, "id": "run-stale", "status": "in_flight",
             "submitted_at": long_ago, "estimate_usd": 1.0, "estimated_duration_s": 600,
+            "platform": "hf_jobs",
+        }
+    )
+    ls.append_run_event({"type": "run_handle", "id": "run-stale", "handle": {"job_id": "j1"}})
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_stale(cfg)
+    assert exc.value.exit_code == EXIT_STALE_RUN
+    # This one reached HF, so it is collectable and the fix names its collector.
+    assert exc.value.fix == "python -m tools.jobs collect run-stale --json"
+    assert exc.value.detail["unreached_run_ids"] == []
+
+
+def test_the_stale_gate_points_an_unreached_run_at_abandon_not_collect(workspace, cfg):
+    """The dead end this closes.
+
+    A run killed between its in-flight record and its handle can never be
+    collected -- `collect` refuses it with `no_handle` -- so a gate that told
+    every stale run to collect sent exactly these to the one command that
+    cannot work, leaving hand-editing runs.jsonl as the only exit.
+    """
+    long_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat()
+    ls.append_run_event(
+        {
+            "type": ls.T_RUN_SUBMITTED, "id": "run-unreached", "status": "in_flight",
+            "submitted_at": long_ago, "estimate_usd": 1.0, "estimated_duration_s": 600,
+            "platform": "hf_jobs",
         }
     )
     with pytest.raises(GateRefusal) as exc:
         gates.check_stale(cfg)
     assert exc.value.exit_code == EXIT_STALE_RUN
-    assert "collect" in exc.value.fix
+    assert "ledger abandon run-unreached" in exc.value.fix
+    assert exc.value.detail["unreached_run_ids"] == ["run-unreached"]
+
+
+def test_a_mixed_batch_names_a_fix_that_works(workspace, cfg):
+    """The collectable run is listed first, so a naive `stale[0]` would tell the
+    caller to collect it and leave the uncollectable one behind on the next
+    attempt -- one gate refusal per submission, forever."""
+    long_ago = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat()
+    for run_id in ("run-live", "run-unreached"):
+        ls.append_run_event(
+            {
+                "type": ls.T_RUN_SUBMITTED, "id": run_id, "status": "in_flight",
+                "submitted_at": long_ago, "estimate_usd": 1.0, "estimated_duration_s": 600,
+                "platform": "hf_jobs",
+            }
+        )
+    ls.append_run_event({"type": "run_handle", "id": "run-live", "handle": {"job_id": "j1"}})
+
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_stale(cfg)
+    assert "abandon run-unreached" in exc.value.fix
+    assert exc.value.detail["stale_run_ids"] == ["run-live", "run-unreached"]
 
 
 def test_a_recent_uncollected_run_does_not_block(workspace, cfg):
@@ -317,3 +366,123 @@ def test_a_preflight_check_with_no_verdict_is_not_a_pass(workspace, cfg):
             gates.check_submit(sub, make_expectation(), cfg)
         assert exc.value.exit_code == EXIT_PREFLIGHT
         assert "dry_run" in exc.value.message
+
+
+# ---------------------------------------------------------------------------
+# gate 5: not too many in flight at once (HANDOFF-2, the parallel-execution work)
+# ---------------------------------------------------------------------------
+def in_flight_run(estimate_usd: float = 1.0) -> str:
+    record = ls.append_run_event(
+        {
+            "type": ls.T_RUN_SUBMITTED,
+            "id": ls.new_id("run"),
+            "status": "in_flight",
+            "submitted_at": ls.now_iso(),
+            "task": "t1",
+            "project": "unassigned",
+            "platform": "kaggle",
+            "estimate_usd": estimate_usd,
+            "estimated_duration_s": 3600.0,
+        }
+    )
+    return record["id"]
+
+
+def test_the_concurrency_ceiling_refuses_with_its_own_code(workspace, cfg):
+    """Exit 14, never 7. They refuse for opposite reasons: 7 means something has
+    gone wrong with a run and needs clearing; 14 means nothing has gone wrong and
+    you should wait. One exit code would make "abandon it" look like the fix for
+    a healthy system.
+    """
+    sub = make_submission(workspace)
+    for _ in range(int(cfg.get("execution", "max_concurrent_runs", 2))):
+        in_flight_run()
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_concurrency(cfg, sub=sub)
+    assert exc.value.exit_code == EXIT_CONCURRENCY
+    assert exc.value.code == "too_many_in_flight"
+    # The fix names a run that can actually be collected.
+    assert "collect" in (exc.value.fix or "")
+
+
+def test_a_spec_may_set_its_own_concurrency_ceiling(workspace, cfg):
+    """The right number is a property of the work: two ten-hour training jobs is
+    a different proposition from two two-minute evaluations."""
+    d = workspace / "pipeline"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "train.py").write_text("print('x')\n", encoding="utf-8")
+    (d / "solo.toml").write_text(
+        "entrypoint = 'train.py'\nimage = 'org/img@sha256:aaaa'\n"
+        "[estimate]\nhours = 1.0\nrate_usd_per_hour = 2.0\n"
+        "[execution]\nmax_concurrent = 1\n",
+        encoding="utf-8",
+    )
+    solo = Submission.load(d / "solo.toml", resolve_digest=False)
+    assert gates.concurrency_ceiling(solo, cfg) == 1
+    assert gates.concurrency_ceiling(make_submission(workspace), cfg) == 2
+
+    in_flight_run()
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_concurrency(cfg, sub=solo)
+    assert exc.value.detail["source"] == "spec [execution] max_concurrent"
+    # The default-ceiling spec still has room, which is the point of per-spec.
+    assert gates.check_concurrency(cfg, sub=make_submission(workspace))["in_flight"] == 1
+
+
+def test_a_ceiling_of_zero_is_clamped_rather_than_refusing_everything(workspace, cfg):
+    """A typo that refuses every submission reads as the whole system being
+    broken rather than as a number being wrong."""
+    d = workspace / "pipeline"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "train.py").write_text("print('x')\n", encoding="utf-8")
+    (d / "zero.toml").write_text(
+        "entrypoint = 'train.py'\nimage = 'org/img@sha256:aaaa'\n"
+        "[execution]\nmax_concurrent = 0\n",
+        encoding="utf-8",
+    )
+    sub = Submission.load(d / "zero.toml", resolve_digest=False)
+    assert gates.concurrency_ceiling(sub, cfg) == 1
+
+
+def test_execution_settings_are_not_in_the_submission_hash(workspace):
+    """How many siblings a job was submitted beside cannot change its numbers, so
+    putting it in the hash would invalidate a good preflight for a scheduling
+    preference."""
+    d = workspace / "pipeline"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "train.py").write_text("print('x')\n", encoding="utf-8")
+    body = "entrypoint = 'train.py'\nimage = 'org/img@sha256:aaaa'\n"
+    (d / "one.toml").write_text(body, encoding="utf-8")
+    (d / "two.toml").write_text(body + "[execution]\nmax_concurrent = 8\n", encoding="utf-8")
+    one = Submission.load(d / "one.toml", resolve_digest=False)
+    two = Submission.load(d / "two.toml", resolve_digest=False)
+    assert one.hash() == two.hash()
+    assert two.execution == {"max_concurrent": 8}
+
+
+def test_the_stale_gate_is_reported_before_the_concurrency_one(workspace, cfg, monkeypatch):
+    """A stale run is *also* in flight, so checking concurrency first would say
+    "too many in flight, wait" -- advice that never becomes true, for a situation
+    whose actual fix is to collect or abandon the stale one.
+    """
+    sub = make_submission(workspace)
+    pass_preflight(sub)
+    expectation = make_expectation()
+    old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+    ls.append_run_event(
+        {
+            "type": ls.T_RUN_SUBMITTED,
+            "id": "run-stale",
+            "status": "in_flight",
+            "submitted_at": old.isoformat(timespec="seconds"),
+            "task": "t1",
+            "project": "unassigned",
+            "estimate_usd": 1.0,
+            "estimated_duration_s": 60.0,
+            "handle": {"job_id": "j"},
+        }
+    )
+    in_flight_run()
+    with pytest.raises(GateRefusal) as exc:
+        gates.check_submit(sub, expectation, cfg)
+    assert exc.value.exit_code == EXIT_STALE_RUN

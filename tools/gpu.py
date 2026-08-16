@@ -452,9 +452,14 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
             continue
 
     results: dict[str, Any] = {}
+    # Every value the run reported per quantity, not just the last. A run that
+    # reports one quantity several times is a replicated run -- see core/stats.py.
+    samples: dict[str, list[Any]] = {}
     metrics_error = None
     try:
-        results = submit_lib.parse_metrics(artifacts / Path(r.get("metrics_file") or "metrics.json").name)
+        results, samples = submit_lib.read_metrics(
+            artifacts / Path(r.get("metrics_file") or "metrics.json").name
+        )
     except GradError as exc:
         metrics_error = exc.message
 
@@ -478,6 +483,7 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
         cost_usd_actual=cost,
         artifacts_dir=artifacts,
         expectation=expectation,
+        samples=samples,
         extra={
             "exit_code": exit_code,
             "host": host.name,

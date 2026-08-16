@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from core import appdata, config as config_mod, instance, migrate, paths
+from core import appdata, config as config_mod, effort, instance, migrate, paths
 from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
 #: Roles the chat window knows how to draw, and therefore the ones `restore`
 #: keeps. `system` is the compaction marker: not something anyone said, but the
@@ -139,6 +139,22 @@ class Session:
         #: its own, which would spend a round-trip to produce an answer nobody
         #: asked for. Cleared once it has been sent.
         self.pending_seed: str | None = None
+        #: The reasoning effort the live client was *built* with. The SDK has no
+        #: control request for effort -- only `set_model` and
+        #: `set_permission_mode` -- so this is fixed at construction, and a
+        #: change means a new client. Recorded here so `apply_effort` can tell a
+        #: real change from a click that landed on the level already running.
+        self.client_effort: str | None = None
+        #: Held across `start` and `close`, so one can never run inside the
+        #: other. The SDK's `connect` is not safe against a concurrent
+        #: `disconnect`: disconnect nulls the client's transport while connect
+        #: is still between "spawn the CLI" and "build the query around the
+        #: transport", and the query comes out built around None. That is not
+        #: hypothetical -- a websocket blip during the first, slowest connect
+        #: (a cold `claude.exe` under a fresh install) fired the disconnect
+        #: handler mid-spawn, and every first prompt died on an AttributeError
+        #: deep in the SDK.
+        self._lifecycle = asyncio.Lock()
 
     async def start(self) -> None:
         if self.client is not None:
@@ -146,11 +162,20 @@ class Session:
         import agent  # noqa: PLC0415 - imported here so the UI can load without the SDK
         from claude_agent_sdk import ClaudeSDKClient  # noqa: PLC0415
 
-        cfg = config_mod.load()
-        agent.preflight_environment()
-        options = agent.build_options(cfg, resume=self.sdk_session_id)
-        self.client = ClaudeSDKClient(options=options)
-        await self.client.__aenter__()
+        async with self._lifecycle:
+            # Re-checked under the lock: a start that waited here waited on
+            # another start, and the client it built is the one to use.
+            if self.client is not None:
+                return
+            cfg = config_mod.load()
+            agent.preflight_environment()
+            options = agent.build_options(cfg, resume=self.sdk_session_id)
+            self.client = ClaudeSDKClient(options=options)
+            await self.client.__aenter__()
+            # Recorded after the client exists, so a construction that raised
+            # does not leave this claiming a level nothing is running at -- which
+            # would have `apply_effort` decide there was nothing to rebuild.
+            self.client_effort = effort.current(cfg)
 
     # -- named sessions -----------------------------------------------------
     def adopt(self) -> None:
@@ -261,8 +286,21 @@ class Session:
         The client owns a CLI subprocess and transport tasks. Entering the
         context by hand and never exiting it leaves those alive for the life of
         the app, and leaks a whole set on any later reconnect.
+
+        Serialised against `start` -- see `_lifecycle`. A close that arrives
+        while a connect is in flight waits for the connect to finish and then
+        closes a whole client, rather than pulling the transport out from under
+        the half-built one.
         """
+        async with self._lifecycle:
+            await self._close_locked()
+
+    async def _close_locked(self) -> None:
         client, self.client = self.client, None
+        # Cleared with the client it describes. Left set, a session that closed
+        # and reopened at a different level would compare the new selection
+        # against the old client's and decide no rebuild was needed.
+        self.client_effort = None
         # The reading belongs to the client that answered it. Keeping it across a
         # close would leave the meter reporting the context of a conversation
         # that no longer exists -- and every path that drops a client (a session
@@ -317,6 +355,11 @@ class Session:
             # turn about to be issued and kills it the moment it starts, which
             # is a turn that produces nothing and explains nothing.
             await self._stopped()
+            # Before `start`, so a level chosen while idle is the level this turn
+            # actually runs at -- and after `_stopped`, because it drops the
+            # client and doing that under a turn is what `_stop_turn` exists to
+            # clean up after.
+            await self.apply_effort()
             await self.start()
         except Exception:
             self.busy = False
@@ -546,6 +589,44 @@ class Session:
         if isinstance(usage, dict):
             self.context = usage
         return self.context
+
+    async def apply_effort(self) -> bool:
+        """Rebuild the client if the chosen effort is not the one it is running.
+
+        Returns whether a rebuild happened, which is what lets a caller say so.
+
+        **Lazy on purpose.** There is no control request for effort, so changing
+        it means dropping the SDK subprocess and spawning another -- seconds, on
+        a cold start. Doing that on every click would make idly comparing two
+        levels cost more than using either. Doing it here means the cost lands
+        once, immediately before a turn that was going to pay for a connected
+        client anyway.
+
+        The conversation survives because `start()` passes `resume=` with the
+        SDK's own session id. That is the entire difference between this and
+        `compact`, which deliberately clears the id: compacting is *meant* to
+        discard the conversation and replace it with a note, and this is meant to
+        change one setting and keep everything.
+        """
+        chosen = effort.current()
+        if self.client is None:
+            # Nothing is running, so the next `start` picks the level up for
+            # free. Recording it here as well would be a lie the moment the
+            # selection changed again before that start.
+            return False
+        if chosen == self.client_effort:
+            return False
+        if self.sdk_session_id is None:
+            # No id to resume, so a rebuild would silently start a new
+            # conversation. The level is left to apply at the next natural
+            # rebuild rather than paid for with the transcript -- the session has
+            # said nothing yet in any case, since the id arrives with the first
+            # turn.
+            log.info("effort change deferred: no sdk session id to resume yet")
+            return False
+        await self.close()
+        await self.start()
+        return True
 
     async def maybe_compact(self) -> dict[str, Any] | None:
         """Compact if the context has passed the configured threshold.
@@ -808,9 +889,45 @@ def build() -> None:
         session.notify = workspace.say
         # Per client, not `app.on_shutdown`: that would accumulate one handler
         # per connection and hold every session's subprocess open until the app
-        # itself exits.
-        context.client.on_disconnect(session.release)
+        # itself exits. Graced, not immediate: NiceGUI fires this on any socket
+        # drop, including the two-second ping timeout a busy event loop can
+        # miss -- and the busiest moment this loop has is spawning the CLI for
+        # the session's own first turn. Releasing right then closed the client
+        # mid-connect; see `Session._lifecycle` for what that corrupted.
+        context.client.on_disconnect(lambda: _release_when_gone(context.client, session))
         shell.build(workspace)
+
+
+#: How long a dropped websocket is given to come back before its session is
+#: closed. Longer than a reconnect takes, shorter than anyone waits before
+#: reopening the app -- and generous on purpose: the cost of waiting is a CLI
+#: subprocess held open a little longer, and the cost of not waiting was every
+#: first prompt on a fresh install dying mid-connect.
+RELEASE_GRACE_S = 10.0
+
+
+def _release_when_gone(client: Any, session: Session) -> None:
+    """Hand the session back only if this client's socket stays gone.
+
+    NiceGUI's disconnect handlers run on every socket drop, and a drop is not a
+    departure: the page auto-reconnects, and the ping timeout that declares one
+    is two seconds on the default settings -- short enough for the event loop
+    itself to miss it while it spawns the CLI. So the release waits, and asks
+    the client whether anyone came back before taking the session down.
+    """
+
+    async def _check() -> None:
+        await asyncio.sleep(RELEASE_GRACE_S)
+        if getattr(client, "has_socket_connection", False):
+            return
+        await session.release()
+
+    try:
+        asyncio.get_running_loop().create_task(_check())
+    except RuntimeError:
+        # No loop to wait on (tests, teardown). Nothing to grace; the direct
+        # release is what the handler did before the grace existed.
+        asyncio.run(session.release())
 
 
 def _serve_static(nicegui_app: Any) -> None:
@@ -910,6 +1027,33 @@ def _install_desktop(native: bool) -> None:
     """
     from nicegui import app as nicegui_app  # noqa: PLC0415
 
+    if native:
+        # Handed to the *window's* process, because that is the only place a
+        # close can be vetoed: what this process holds is a proxy with no
+        # events on it, and binding `closing` here silently did nothing for as
+        # long as it has existed. `ui/desktop.py:hold_window_open` is the whole
+        # story; it travels by pickle, which is why it is a module-level
+        # function taking a path rather than a closure over anything here.
+        #
+        # The flag is cleared first: one left behind by a crashed run would
+        # promise a notification area that this run has not built yet.
+        desktop.set_tray_flag(False)
+        nicegui_app.native.start_args["func"] = desktop.hold_window_open
+        nicegui_app.native.start_args["args"] = (str(desktop.tray_flag()),)
+        # The taskbar button's icon. Travels to the window's process the same way
+        # `func` does, and for the same reason it has to: the form that owns the
+        # icon lives there. Without it pywebview falls back to extracting the
+        # icon from `sys.executable`, so the app appears on the taskbar as
+        # Python. A path only -- `_split_picklable` sends strings through fine.
+        #
+        # Skipped when it could not be drawn rather than passed as None: pywebview
+        # tests `if _state['icon'] and os.path.isfile(...)`, so a None is
+        # harmless, but leaving the key out entirely keeps the "we could not draw
+        # it" case visible in the start args rather than looking like a choice.
+        icon = desktop.icon_path()
+        if icon:
+            nicegui_app.native.start_args["icon"] = icon
+
     @nicegui_app.on_startup
     def _wire() -> None:
         desktop.bind_loop(asyncio.get_running_loop())
@@ -918,21 +1062,6 @@ def _install_desktop(native: bool) -> None:
             # tab is the affordance and closing it is the user's business.
             return
         desktop.start_tray(on_restart_lab=_restart_lab_here)
-        window = getattr(nicegui_app.native, "main_window", None)
-        if window is None:
-            return
-
-        def _on_closing() -> bool:
-            """False cancels the close, which is how pywebview spells "hide"."""
-            if desktop.hide_to_tray():
-                return False
-            desktop.request_quit()
-            return False
-
-        try:
-            window.events.closing += _on_closing
-        except Exception:  # noqa: BLE001 - an un-hookable window just closes
-            log.debug("could not intercept the window close", exc_info=True)
 
     @nicegui_app.on_shutdown
     def _unwire() -> None:
@@ -1022,6 +1151,14 @@ def run(*, native: bool = True, port: int | None = None) -> None:
     ui.run(
         native=native,
         title="Grad",
+        # The browser tab's mark, and the same file the taskbar button uses. A
+        # second `icon_path()` call is a stat once the first has rendered it.
+        #
+        # This is not what fixes the taskbar in native mode -- a favicon belongs
+        # to the page, and the taskbar button belongs to the window -- but the
+        # two should not be different marks, and browser mode has no window to
+        # carry one.
+        favicon=desktop.icon_path(),
         # Explicit localhost: in browser mode NiceGUI would otherwise bind
         # 0.0.0.0, and this is an unauthenticated UI that accepts prompts for an
         # agent with Bash access.
@@ -1029,6 +1166,12 @@ def run(*, native: bool = True, port: int | None = None) -> None:
         port=port,
         # Signs the browser-id cookie each client's transcript is keyed by.
         storage_secret=_storage_secret(),
+        # The engineio ping timeout is derived from this (0.4x, floor 2s), and
+        # two seconds is less than the event loop can be stalled by spawning a
+        # cold `claude.exe` -- which is how the app's own first turn used to
+        # disconnect its own page. Ten gives a 4s ping timeout and a wider
+        # window for a reloaded page to reclaim its session.
+        reconnect_timeout=10.0,
         reload=False,
         # The design is a cream paper ground with ink rules. Quasar's dark mode
         # would fight every token in `ui/tokens.py`.

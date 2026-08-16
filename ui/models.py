@@ -537,8 +537,8 @@ def sessions_model(current: str | None = None) -> dict[str, Any]:
 #: that gates GPU submission as for one that raises a rate limit.
 CREDENTIAL_NOTES: dict[str, tuple[str, bool]] = {
     "hf_token": ("Hugging Face Jobs — submitting and collecting runs", True),
-    "openrouter_key": ("the reranker, funnel stage 2 (costs credits)", False),
-    "voyage_key": ("embeddings for the local index (costs credits)", False),
+    "openrouter_key": ("optional second rail for the reranker; Voyage is used by default", False),
+    "voyage_key": ("the reranker and the local index's embeddings (costs credits)", False),
     "asta_api_key": ("raises Asta's rate limits; discovery works without it", False),
     "s2_api_key": ("Semantic Scholar direct — only issued to institutional addresses", False),
     "context7_key": ("raises Context7's rate limits; lookups work without it", False),
@@ -635,18 +635,80 @@ def tasks_model(agent: list[dict[str, Any]] | None = None) -> dict[str, Any]:
             }
         )
     calls = list(agent or [])
+    background = _background_rows()
     return {
         "rows": rows,
         "running": len([r for r in rows if r["running"]]),
         "finished": len([r for r in rows if not r["running"]]),
         "agent": calls,
         "agent_running": len([c for c in calls if c["running"]]),
+        "background": background,
+        "background_running": len([r for r in background if r["running"]]),
         "empty_fix": (
             "nothing has been started from the workspace yet — VERIFY, RE-CHECK, "
-            "REBUILD and BUILD PDF all run here, and the agent's own calls appear "
-            "here while they run"
+            "REBUILD and BUILD PDF all run here, the agent's own calls appear here "
+            "while they run, and anything it backgrounded with `tools.task` appears "
+            "here until it is cleared"
         ),
     }
+
+
+#: How a background task's state is drawn. `lost` is `attention` rather than
+#: `broken`: nothing failed, we simply have no exit code -- usually a reboot.
+BACKGROUND_TONE = {
+    "running": "dashed",
+    "ok": "ok",
+    "failed": "broken",
+    "stopped": "attention",
+    "lost": "attention",
+}
+
+
+def _background_rows() -> list[dict[str, Any]]:
+    """The agent's own background tasks, from `core/tasks.py`.
+
+    The third way work ends up running with nobody watching it, and the one that
+    had nowhere to be seen: `ui/tasks.py`'s registry is in-process, so it holds
+    only what *this app* started. A `tools.task start` issued by the agent -- or
+    by a second terminal -- is a process on this machine that the workspace could
+    not see at all, which is precisely the "what is this machine doing" gap the
+    task runner was supposed to close rather than widen.
+
+    Read from the registry file, which is why it can be seen across processes at
+    all. `liveness_ttl_s` is set because this runs on the window's poll: see
+    `core/tasks.py:alive_pids`.
+
+    Newest first, matching the other two lists.
+    """
+    from core import tasks as core_tasks
+
+    try:
+        found = core_tasks.tasks(liveness_ttl_s=2.0)
+    except OSError:
+        # An unreadable registry must not take the window down; the other two
+        # lists are still worth drawing.
+        return []
+    rows = []
+    for task in reversed(list(found.values())):
+        running = task["state"] == core_tasks.RUNNING
+        summary = core_tasks.summarise(task)
+        rows.append(
+            {
+                "id": task["id"],
+                "label": task["label"],
+                "command": summary["command"],
+                "state": task["state"],
+                "tone": BACKGROUND_TONE.get(task["state"], "neutral"),
+                "running": running,
+                "exit_code": task.get("exit_code"),
+                "stoppable": running,
+                "halt": " ".join(task["halt"]) if task.get("halt") else None,
+                "error": summary["error"],
+                "notes": summary["notes"],
+                "log": task.get("log"),
+            }
+        )
+    return rows
 
 
 #: How many of the agent's own calls the window keeps. Enough to cover the turn
@@ -1431,6 +1493,11 @@ QUEUE_STATE_ACCENT = {
     "DONE": "neutral",
     "FAILED": "broken",
     "QUEUED": "neutral",
+    # Neither done nor failed: nothing ran. Its own chip because "DONE" beside a
+    # run that produced no result is the one reading that sends someone looking
+    # for metrics that do not exist, and dashed because that is already what the
+    # rest of the design means by written off.
+    "ABANDONED": "dashed",
 }
 
 
@@ -1441,11 +1508,18 @@ QUEUE_STATE_ACCENT = {
 RUNNING_STATUSES = ("in_flight", "running", "in_progress")
 FAILED_STATUSES = ("failed", "submit_failed", "error")
 QUEUED_STATUSES = ("queued", "submitted", "pending")
+#: Written off by `ledger abandon`: terminal, but not a result and not a
+#: failure. It is collected in the fold's sense -- that is how it stops holding
+#: the ceiling -- so it has to be caught before the `DONE` branch below, which
+#: would otherwise label a run that never started as one that finished.
+ABANDONED_STATUS = "abandoned"
 
 
 def _queue_state(run: Any) -> tuple[str, str]:
     """One run's state chip, and the progress bar variant that goes with it."""
     status = str(run.get("status") or "").lower()
+    if status == ABANDONED_STATUS:
+        return "ABANDONED", "queued"
     if run.collected:
         if status in FAILED_STATUSES:
             error = run.get("error") or {}

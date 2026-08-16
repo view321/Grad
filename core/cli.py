@@ -94,13 +94,29 @@ class Cli:
         self._handlers: dict[str, Handler] = {}
 
     def command(
-        self, name: str, help: str, *, setup: Setup | None = None, description: str | None = None
+        self,
+        name: str,
+        help: str | None,
+        *,
+        setup: Setup | None = None,
+        description: str | None = None,
     ) -> Callable[[Handler], Handler]:
+        """Register a subcommand. `help=None` hides it from the command list.
+
+        Hidden rather than absent, because some commands exist for the tool to
+        call and not for a person to type: `tools/task.py`'s supervisor is the
+        first, and it has to be reachable by name because it is spawned as
+        `python -m tools.task _supervise`. `argparse.SUPPRESS` does not do this
+        for a subparser -- it renders as the literal string `==SUPPRESS==` in the
+        listing -- and the only mechanism that works is not passing `help` at all.
+        """
+
         def decorate(fn: Handler) -> Handler:
+            listing = {} if help is None else {"help": help}
             p = self.sub.add_parser(
                 name,
-                help=help,
-                description=description or fn.__doc__ or help,
+                **listing,
+                description=description or fn.__doc__ or help or name,
                 formatter_class=argparse.RawDescriptionHelpFormatter,
             )
             p.set_defaults(_parser=p)

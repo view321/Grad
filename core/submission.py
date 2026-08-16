@@ -194,6 +194,17 @@ class Submission:
     extra_hash_paths: list[Path] = field(default_factory=list)
     target: dict[str, Any] = field(default_factory=dict)
     estimate: dict[str, Any] = field(default_factory=dict)
+    #: `[execution]` -- how this job may be run alongside others. Currently one
+    #: key, `max_concurrent`, read by `gates.check_concurrency`.
+    #:
+    #: Deliberately **not** in the hash. `resolved()` covers what can change the
+    #: outcome of the job, and how many siblings it was submitted beside cannot:
+    #: a run submitted with `max_concurrent = 1` and the same run submitted with
+    #: `max_concurrent = 4` produce the same numbers, so putting this in the hash
+    #: would invalidate a perfectly good preflight for a scheduling preference.
+    #: That is the same argument the module docstring makes about a directory
+    #: hash being simultaneously too broad and too narrow.
+    execution: dict[str, Any] = field(default_factory=dict)
     metrics_file: str = "metrics.json"
     warnings: list[str] = field(default_factory=list)
     _files: list[Path] = field(default_factory=list)
@@ -274,6 +285,7 @@ class Submission:
             extra_hash_paths=extra,
             target=dict(spec.get("target", {})),
             estimate=dict(spec.get("estimate", {})),
+            execution=dict(spec.get("execution", {})),
             metrics_file=spec.get("metrics_file", "metrics.json"),
             warnings=warnings,
             _files=files,
@@ -309,12 +321,10 @@ class Submission:
         }
 
     def hash(self) -> str:
-        canonical = json.dumps(self.resolved(), sort_keys=True, separators=(",", ":"), default=str)
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:HASH_LEN]
+        return hash_resolved(self.resolved())
 
     def full_hash(self) -> str:
-        canonical = json.dumps(self.resolved(), sort_keys=True, separators=(",", ":"), default=str)
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return hash_resolved(self.resolved(), length=None)
 
     def estimated_cost_usd(self) -> float:
         """Cost estimate from the spec. Used by the ceiling gates; the actual
@@ -329,6 +339,23 @@ class Submission:
         if "duration_s" in self.estimate:
             return float(self.estimate["duration_s"])
         return float(self.estimate.get("hours", 0.0)) * 3600.0
+
+
+def hash_resolved(resolved: dict[str, Any], *, length: int | None = HASH_LEN) -> str:
+    """The submission hash of an already-resolved document.
+
+    A module function as well as a method because the *resolved document* and the
+    `Submission` that produced it have different lifetimes. `core/experiments.py`
+    stores the document in the archive and re-derives the hash from it later,
+    possibly on another machine, with the spec file long since edited -- so it
+    needs the hashing rule without needing a `Submission` to hold it. Keeping one
+    implementation is what makes that check mean anything: two spellings of "the
+    canonical form" that drifted apart would make the verifier report a mismatch
+    for every archived run.
+    """
+    canonical = json.dumps(resolved, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest if length is None else digest[:length]
 
 
 def _digest_file(path: Path | None) -> str:

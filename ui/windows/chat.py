@@ -217,9 +217,26 @@ def render(workspace: Any) -> None:
         scroller.props('id="grad-transcript"')
         scroller.style("flex: 1 1 auto; overflow-y: auto; min-height: 0")
         with scroller:
+            # `flex: 0 0 auto` on both, and it is not decoration. The scroller is
+            # a *flex column*, so these two are flex items and arrive with
+            # `flex-shrink: 1`; `kit.column` then sets `min-height: 0`, which is
+            # what a nested scroll container needs and which also removes the
+            # automatic minimum size that otherwise stops a flex item shrinking
+            # below its own content.
+            #
+            # So once the conversation grew past the pane, the browser did not
+            # scroll it -- it shrank these two boxes to fit and let their
+            # messages spill out, one turn painted over the next, with no
+            # scrollbar to say anything had overflowed. It showed up "sometimes
+            # while moving a tile around" because that is what changes the pane's
+            # height: the same transcript overlaps at one pane size and is fine
+            # at another. Refusing to shrink makes the overflow the scroller's,
+            # which is the one element here equipped to have any.
             transcript = kit.column("", gap=0)
+            transcript.style("flex: 0 0 auto")
             tail_root = kit.column("", gap=0)
             tail_root.props('id="grad-tail"')
+            tail_root.style("flex: 0 0 auto")
         tail = _Tail(tail_root)
 
         with transcript:
@@ -312,11 +329,42 @@ class _Statusline:
             # when nothing is running.
             self.context = kit.text("", "context", tag="span")
             self.clock = kit.text("", "clock", tag="span")
+            # Its own click, and `stopPropagation` is what keeps it separate:
+            # the whole strip is one button, so without it every change of
+            # effort would also toggle the reasoning panel. NiceGUI has no Vue
+            # modifier passthrough -- `on("click.stop")` is camel-cased into an
+            # event name nothing fires -- so the stop happens in `js_handler`,
+            # which then emits to the Python handler as usual.
+            self.effort = kit.text("", "effort", tag="span")
+            self.effort.props('title="how hard the agent thinks -- click to change"')
+            self.effort.on(
+                "click",
+                self.cycle_effort,
+                js_handler="(e) => { e.stopPropagation(); emit(); }",
+            )
             self.reasoning = kit.text("", "reasoning", tag="span")
         self.bar = bar
         self._context_mark: tuple[Any, ...] | None = None
         self._paint_reasoning()
+        self._paint_effort()
         self.sync_context()
+
+    def cycle_effort(self) -> None:
+        self.workspace.cycle_effort()
+        self._paint_effort()
+
+    def _paint_effort(self) -> None:
+        from core import effort as effort_mod  # noqa: PLC0415
+
+        level = effort_mod.current()
+        kit.set_text(self.effort, effort_mod.label(level))
+        # `auto` is the absence of a choice, and the chip says so by staying
+        # dashed. Without the distinction the strip reads as though someone had
+        # deliberately selected "auto", which is the one level nobody selects.
+        if level == effort_mod.AUTO:
+            self.effort.classes(remove="set")
+        else:
+            self.effort.classes(add="set")
 
     def toggle(self) -> None:
         showing = self.workspace.toggle_reasoning()

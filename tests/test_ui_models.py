@@ -257,6 +257,22 @@ def test_a_collected_run_reads_done_and_costs_its_actual(workspace):
     assert row["tone"] == "done"
 
 
+def test_an_abandoned_run_does_not_read_as_done(workspace):
+    """`ledger abandon` finalises the run -- that is how it stops holding the
+    ceiling -- so it is collected in the fold's sense and would have fallen into
+    the DONE branch. A run that never started, labelled DONE, sends whoever
+    reads the queue looking for metrics that do not exist."""
+    from core import submit as submit_lib
+
+    _run("run-1", None, None, None)
+    submit_lib.abandon("run-1", reason="the submitter was killed mid-submit")
+
+    row = models.queue_model()["rows"][0]
+    assert row["state"] == "ABANDONED"
+    assert row["accent"] == "dashed"
+    assert row["cost"] == "$0.00"
+
+
 def test_a_failed_run_names_the_error_in_its_chip(workspace):
     ls.append_run_event(
         {"type": ls.T_RUN_SUBMITTED, "id": "run-1", "task": "t", "status": "in_flight",

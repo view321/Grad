@@ -275,8 +275,11 @@ if (-not $NoShortcut) {
 
     New-Item -ItemType Directory -Force -Path $AppData | Out-Null
     $IconPath = Join-Path $AppData "grad.ico"
-    # Drawn by the app itself, so the shortcut and the notification area cannot
-    # show two different marks. See ui/desktop.py:write_icon.
+    # Drawn by the app itself, so the shortcut, the notification area and the
+    # taskbar button cannot show three different marks. See
+    # ui/desktop.py:write_icon; the app renders this same path on demand when it
+    # is missing, which is what makes a dev checkout and a failed icon step here
+    # recoverable rather than permanent.
     & $VenvPython -c "from ui import desktop; desktop.write_icon(r'$IconPath')" 2>$null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $IconPath)) {
         Write-Warn "could not render the icon; the shortcut will use Python's"

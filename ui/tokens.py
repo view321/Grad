@@ -647,10 +647,19 @@ def _chat() -> str:
     opacity: 1; border: 1.5px solid var(--grad-ink); }
 .grad-statusline .context.attention {
     opacity: 1; background: var(--grad-attention); color: var(--grad-ink); }
-/* The one part of the bar that is a control rather than a report, so it is the
-   one part drawn as one. */
-.grad-statusline .reasoning { flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
-                              padding: 1px 7px; letter-spacing: 0.08em; }
+/* The two parts of the bar that are controls rather than reports, so they are
+   the parts drawn as such. Effort sits to the left of the reasoning switch:
+   both are about the agent's thinking, and this one changes what it does while
+   that one changes what you see. */
+.grad-statusline .reasoning, .grad-statusline .effort {
+    flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
+    padding: 1px 7px; letter-spacing: 0.08em; }
+/* Dashed until it is set, because "auto" is the absence of a choice rather than
+   a level -- a solid chip reading `effort auto` looks like a setting someone
+   picked. */
+.grad-statusline .effort { cursor: pointer; border-style: dashed; opacity: 0.62; }
+.grad-statusline .effort.set { border-style: solid; opacity: 1; }
+.grad-statusline .effort:hover { background: var(--grad-paper-raised); }
 .grad-chat.reasoning-on .grad-statusline .reasoning {
     background: var(--grad-ink); color: var(--grad-paper); }
 

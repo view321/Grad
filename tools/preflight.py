@@ -19,6 +19,7 @@ import argparse
 import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,19 @@ def _run_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="re-run checks that already passed for this hash",
     )
+    p.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "local checks to run at once (default from [execution] default_jobs). "
+            "`smoke` never runs concurrently with anything -- see --smoke-anyway."
+        ),
+    )
+    p.add_argument(
+        "--smoke-anyway",
+        action="store_true",
+        help="run the smoke check even if a local check failed (it costs a real remote job)",
+    )
 
 
 @cli.command("run", "run the checks and write the preflight record", setup=_run_args)
@@ -130,11 +144,48 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     #: is a check this run has nothing to say about.
     computed: dict[str, Any] = {}
 
+    todo = []
     for name in wanted:
         if not args.force and results.get(name, {}).get("ok"):
             results[name]["skipped_because"] = "already passing for this hash"
             continue
-        results[name] = computed[name] = _run_check(name, sub, cfg, spec_checks)
+        todo.append(name)
+
+    # `smoke` is separated from the rest, and it is the only check that is. Two
+    # reasons, and neither is about speed:
+    #
+    # * it is a *paid remote job*, and the others are local processes. Running it
+    #   alongside them would put a GPU on a queue while the tests that decide
+    #   whether the code is worth running are still going.
+    # * it depends on them. Before this, a spec whose tests failed still went on
+    #   to submit a smoke run -- money spent to learn something the first check
+    #   had already said. It now runs only if the local checks passed, and
+    #   `--smoke-anyway` is there for the case where the remote environment is
+    #   precisely what you are debugging.
+    local = [n for n in todo if n != "smoke"]
+    smoke_wanted = "smoke" in todo
+    jobs = args.jobs if args.jobs is not None else int(cfg.get("execution", "default_jobs", 4))
+
+    for name, result in _run_checks(local, sub, cfg, spec_checks, jobs=jobs).items():
+        results[name] = computed[name] = result
+
+    local_failed = [
+        n for n in local if not (isinstance(results.get(n), dict) and results[n].get("ok") is True)
+    ]
+    smoke_skipped = None
+    if smoke_wanted:
+        if local_failed and not args.smoke_anyway:
+            # Deliberately *not* written into the record as a failing check. A
+            # check that did not run is not a check that failed -- the same
+            # distinction `submit.compute_deviations` makes about `in_range` --
+            # and the gate refusing with "no result for check: smoke" is both
+            # true and the more useful message.
+            smoke_skipped = (
+                f"not run: {', '.join(local_failed)} failed first, and a smoke check is a "
+                "real remote job. Fix those and re-run, or --smoke-anyway."
+            )
+        else:
+            results["smoke"] = computed["smoke"] = _run_check("smoke", sub, cfg, spec_checks)
 
     # Merged under the lock rather than written over the top. The smoke path
     # writes its own result through `record_check_result` while the checks
@@ -168,8 +219,21 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         "record": str(paths.preflight_record(h)),
         "checks": {n: {k: v for k, v in r.items() if k != "output"} for n, r in results.items()},
         "failing": failing,
+        "not_run": {"smoke": smoke_skipped} if smoke_skipped else {},
         "warnings": sub.warnings,
     }
+    if smoke_skipped and not failing:
+        # Only reachable with `--only smoke` plus a stale failing local result in
+        # the record, but the alternative is reporting a clean run for a spec the
+        # gate will refuse -- which is the exact thing the `is not True` check
+        # below exists to prevent.
+        raise GradError(
+            "preflight_incomplete",
+            smoke_skipped,
+            exit_code=EXIT_CHECK_FAILED,
+            fix="python -m tools.preflight run --spec <spec> --json   # runs the local checks first",
+            detail=payload,
+        )
     if failing:
         first = results[failing[0]]
         raise GradError(
@@ -180,6 +244,36 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             detail=payload,
         )
     return payload
+
+
+def _run_checks(
+    names: list[str],
+    sub: Submission,
+    cfg: config_mod.Config,
+    declared: dict[str, Any],
+    *,
+    jobs: int,
+) -> dict[str, Any]:
+    """Run the local checks, at most `jobs` at once, and return them by name.
+
+    Threads rather than processes: every check is a `subprocess.run` and the
+    thread spends its life blocked in `wait`, so the GIL never enters into it.
+
+    These are genuinely independent -- `tests` runs the suite, `dry_run` runs the
+    entrypoint on a tiny config, and a declared check is whatever the spec says.
+    None of them reads another's result, and each writes its own log path. The
+    one check that is *not* independent is `smoke`, which is why it is not here.
+
+    Results come back keyed by name rather than in completion order, so the record
+    is identical whatever order they finish in.
+    """
+    if not names:
+        return {}
+    if jobs <= 1 or len(names) == 1:
+        return {name: _run_check(name, sub, cfg, declared) for name in names}
+    with ThreadPoolExecutor(max_workers=min(jobs, len(names)), thread_name_prefix="grad-pre") as pool:
+        futures = {name: pool.submit(_run_check, name, sub, cfg, declared) for name in names}
+        return {name: future.result() for name, future in futures.items()}
 
 
 def _declared_checks(sub: Submission) -> dict[str, Any]:
@@ -313,12 +407,19 @@ def _check_smoke(sub: Submission, cfg: config_mod.Config) -> dict[str, Any]:
         from tools import jobs as submitter
     elif platform in ("ssh", "gpu"):
         from tools import gpu as submitter  # type: ignore[no-redef]
+    elif platform == "kaggle":
+        from tools import kaggle as submitter  # type: ignore[no-redef]
     else:
         return {
             "ok": False,
             "reason": f"target.platform is {platform!r}; cannot smoke without a real target",
-            "fix": 'set [target] platform = "hf" or "ssh" in the submission spec',
+            "fix": 'set [target] platform = "hf", "ssh", or "kaggle" in the submission spec',
         }
+    # Positionally, with no backend-specific arguments. That is the contract this
+    # dispatch rests on and the reason every `run_smoke` resolves its own target
+    # from the spec: a backend whose smoke needed a parameter from here could be
+    # submitted but never preflighted, and gate 1 would then refuse every one of
+    # its jobs for a reason that had nothing to do with the job.
     return submitter.run_smoke(sub, cfg)
 
 
