@@ -215,9 +215,20 @@ def replace_blocks(source: str, replacements: list[str]) -> str:
     region and move real code across the boundary. That check is the one thing
     this cannot do for itself, because at this point the marker text is data.
     """
-    if len(replacements) != source.count(BLOCK_START):
+    starts, ends = source.count(BLOCK_START), source.count(BLOCK_END)
+    if starts != ends:
+        # Before the count check, because an unbalanced baseline breaks the
+        # splice below in silence: `in_block` never comes back down, so every
+        # line after an unclosed marker is dropped and the result is a truncated
+        # program that still parses as one. The count check cannot see this --
+        # the number of regions looks right either way.
         raise ValueError(
-            f"the baseline has {source.count(BLOCK_START)} mutable region(s) but "
+            f"the baseline has {starts} {BLOCK_START} marker(s) and {ends} "
+            f"{BLOCK_END} marker(s); every mutable region needs both"
+        )
+    if len(replacements) != starts:
+        raise ValueError(
+            f"the baseline has {starts} mutable region(s) but "
             f"{len(replacements)} replacement(s) were given"
         )
     out: list[str] = []

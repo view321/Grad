@@ -336,11 +336,31 @@ class _Statusline:
             # event name nothing fires -- so the stop happens in `js_handler`,
             # which then emits to the Python handler as usual.
             self.effort = kit.text("", "effort", tag="span")
-            self.effort.props('title="how hard the agent thinks -- click to change"')
+            self.effort.props(
+                'title="how hard the agent thinks -- click to change" '
+                # Still a span, deliberately: the strip around it is itself a
+                # click target, and a real <button> nested inside one is invalid
+                # markup that browsers resolve by unnesting it -- which moves the
+                # control out of the strip it belongs to. So the semantics are
+                # spelled out instead, and the keyboard handler below is what
+                # makes them true rather than merely announced.
+                'role="button" tabindex="0"'
+            )
             self.effort.on(
                 "click",
                 self.cycle_effort,
                 js_handler="(e) => { e.stopPropagation(); emit(); }",
+            )
+            self.effort.on(
+                "keydown",
+                self.cycle_effort,
+                # Enter and Space, which is what `role="button"` promises. The
+                # same `stopPropagation` as the click, and for the same reason:
+                # the strip would otherwise toggle the reasoning panel too.
+                js_handler=(
+                    "(e) => { if (e.key === 'Enter' || e.key === ' ') {"
+                    " e.preventDefault(); e.stopPropagation(); emit(); } }"
+                ),
             )
             self.reasoning = kit.text("", "reasoning", tag="span")
         self.bar = bar

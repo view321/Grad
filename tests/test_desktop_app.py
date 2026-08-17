@@ -509,7 +509,11 @@ def test_the_icon_carries_every_size_windows_asks_for(workspace):
     """Windows picks a size per context -- 16px on the taskbar, 32px on the
     desktop, 256px in the large-icon view -- and an `.ico` carrying one of them
     gets the others by scaling."""
-    from PIL import Image
+    # Skipped, not errored, without Pillow. It is in the `ui` extra rather than
+    # the base install, and `write_icon` already treats its absence as a warning
+    # and falls back -- so a suite that errors here reports a missing optional
+    # dependency as a broken icon.
+    Image = pytest.importorskip("PIL.Image")
 
     path = desktop.icon_path(refresh=True)
     with Image.open(path) as image:

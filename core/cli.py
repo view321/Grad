@@ -96,12 +96,16 @@ class Cli:
     def command(
         self,
         name: str,
-        help: str | None,
+        summary: str | None,
         *,
         setup: Setup | None = None,
         description: str | None = None,
     ) -> Callable[[Handler], Handler]:
-        """Register a subcommand. `help=None` hides it from the command list.
+        """Register a subcommand. `summary=None` hides it from the command list.
+
+        Named `summary` rather than `help`: every call site passes it
+        positionally, so the builtin it used to shadow bought nothing and cost a
+        reader of this file the word `help` inside it.
 
         Hidden rather than absent, because some commands exist for the tool to
         call and not for a person to type: `tools/task.py`'s supervisor is the
@@ -112,7 +116,7 @@ class Cli:
         """
 
         def decorate(fn: Handler) -> Handler:
-            listing = {} if help is None else {"help": help}
+            listing = {} if summary is None else {"help": summary}
             p = self.sub.add_parser(
                 name,
                 **listing,

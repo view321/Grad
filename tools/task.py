@@ -545,16 +545,40 @@ def _kill_tree(pid: int | None) -> str | None:
         return None if "not found" in first.lower() else f"taskkill: {first[:200]}"
     import signal  # noqa: PLC0415
 
-    try:
-        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-        return None
-    except (ProcessLookupError, PermissionError, OSError):
+    def _signal(sig: int) -> tuple[bool, str | None]:
+        """Send `sig` to the group if there is one, else to the process.
+
+        Returns `(delivered, trouble)`. The group is tried first and the pid is
+        the fallback, so a detached child in its own group takes the whole tree
+        and a process that never got one still gets signalled -- and neither
+        path can reach this process's own group, which `os.killpg(0, ...)` would.
+        """
         try:
-            os.kill(int(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            return None
-        except OSError as exc:
-            return f"could not signal pid {pid}: {exc}"
+            os.killpg(os.getpgid(int(pid)), sig)
+            return True, None
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(int(pid), sig)
+            except ProcessLookupError:
+                return False, None
+            except OSError as exc:
+                return False, f"could not signal pid {pid}: {exc}"
+        return True, None
+
+    delivered, trouble = _signal(signal.SIGTERM)
+    if trouble or not delivered:
+        return trouble
+    # SIGTERM is a request, and the Windows branch above does not make one --
+    # `taskkill /F` is not asking. A process that ignores the request was
+    # therefore stopped on Windows and left running on POSIX, which is the same
+    # command meaning two different things depending on where it ran.
+    if _await_pid_gone(pid, KILL_GRACE_S):
+        return None
+    _, trouble = _signal(signal.SIGKILL)
+    if trouble:
+        return trouble
+    if not _await_pid_gone(pid, KILL_GRACE_S):
+        return f"pid {pid} survived SIGKILL"
     return None
 
 

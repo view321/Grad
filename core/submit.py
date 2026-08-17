@@ -332,7 +332,14 @@ def parse_samples(path: Path) -> dict[str, list[Any]]:
             if not isinstance(rec, dict):
                 continue
             if "quantity" in rec and "value" in rec:
-                _add(rec["quantity"], rec["value"])
+                # Through the same filter as the flat form, for the reason
+                # `_measurement` gives: the question is about the key, not about
+                # the shape the pipeline wrote it in. Without this a run that
+                # names its seed explicitly -- `{"quantity": "seed", ...}` --
+                # gets it averaged as a measurement, and a non-scalar value
+                # reaches `stats.summarise`, which has no answer for a list.
+                if _measurement(str(rec["quantity"]), rec["value"]):
+                    _add(rec["quantity"], rec["value"])
             else:
                 for key, value in rec.items():
                     if _measurement(key, value):
@@ -478,7 +485,12 @@ def compute_deviations(
         midpoint = low
     elif high is not None:
         midpoint = high
-    if midpoint and centre is not None:
+    # `not in (None, 0)` rather than a bare truth test. The behaviour is the same
+    # -- a zero midpoint has no ratio either way -- but the two reasons for
+    # refusing are different: there is no interval to compare against, and there
+    # is one but it is centred on zero. A prediction of `low=-x, high=x` is the
+    # second, and reading `if midpoint` there suggests the interval was missing.
+    if midpoint not in (None, 0) and centre is not None:
         dev["ratio"] = round(centre / midpoint, 4)
     return [dev]
 
@@ -650,7 +662,12 @@ def abandon(run_id: str, *, reason: str) -> dict[str, Any]:
         status="abandoned",
         results={},
         cost_usd_actual=0.0,
-        artifacts_dir=artifacts_dir(r.id),
+        # `paths.run_artifacts`, not `artifacts_dir`: `finish` only writes the
+        # path into the record, and the helper would *create* the directory --
+        # so every abandoned run left an empty folder behind, for a run defined
+        # by having produced nothing. The path is still recorded, because where
+        # the artifacts would have been is a fact about the run either way.
+        artifacts_dir=paths.run_artifacts(r.id),
         # No expectation, so `compute_deviations` writes none. The prediction was
         # never tested -- inventing a deviation for a run that produced nothing
         # would put a row in the unjudged list that no verdict can honestly

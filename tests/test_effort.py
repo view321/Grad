@@ -52,7 +52,7 @@ def test_the_cycle_wraps_and_reaches_auto_again(workspace):
     for _ in range(len(effort.CYCLE)):
         level = effort.cycle(level)
         seen.append(level)
-    assert seen == list(effort.LEVELS) + [effort.AUTO]
+    assert seen == [*effort.LEVELS, effort.AUTO]
 
 
 def test_an_unknown_level_is_refused_rather_than_stored(workspace):
@@ -94,10 +94,17 @@ def test_an_sdk_without_the_field_gets_nothing(workspace):
 # ---------------------------------------------------------------------------
 # when it applies
 # ---------------------------------------------------------------------------
+#: Stands in for a live SDK client. Module-level rather than `object()` in the
+#: signature below, where it would be evaluated once at class-definition time
+#: anyway -- so the default was already shared, and only looked as though a
+#: fresh one arrived per instance.
+_A_CLIENT = object()
+
+
 class _FakeSession:
     """The two methods `apply_effort` drives, and a record of the calls."""
 
-    def __init__(self, *, client=object(), sdk_session_id="sdk-1", client_effort="auto"):
+    def __init__(self, *, client=_A_CLIENT, sdk_session_id="sdk-1", client_effort="auto"):
         self.client = client
         self.sdk_session_id = sdk_session_id
         self.client_effort = client_effort

@@ -93,7 +93,12 @@ def test_a_champion_is_not_migrated_to_an_island_it_is_already_on():
     """Otherwise a strong candidate writes one redundant event per interval for
     the rest of the campaign."""
     migrated = [dict(c, migrated_to=[1]) if c["candidate_id"] == "a" else c for c in POPULATION]
-    assert all(cid != "a" for cid, _, to in ev.migrate(migrated, islands=2))
+    # The list itself, not `all(...)` over it: `all` is vacuously true on an
+    # empty result *and* on a result full of other candidates, so it would have
+    # passed whether or not `migrate` had stopped emitting the redundant event
+    # this test is named for. Nothing is eligible to move here, so the answer is
+    # no moves at all.
+    assert ev.migrate(migrated, islands=2) == []
 
 
 def test_migration_happens_on_the_interval_and_never_at_generation_zero():

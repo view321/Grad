@@ -569,7 +569,27 @@ def _data() -> str:
 
 def _chat() -> str:
     return """
-.grad-msg { padding: 9px 14px; }
+/* `content-visibility` is here for the composer, which is nowhere near it.
+ *
+ * The textarea autogrows, and Quasar spells that: set `height: 1px`, read
+ * `scrollHeight`, put the height back. The write dirties the layout tree to the
+ * root and the read forces it clean again -- a full-document synchronous layout,
+ * on every keystroke, whose cost is the size of the transcript above it. A
+ * settled research conversation is tens of thousands of nodes once KaTeX has
+ * expanded the maths, and measured in the browser that is 30-40ms per key. At
+ * that point the typing is behind the typist by a whole word, which is the
+ * symptom this file is fixing and the composer is not where it was fixable.
+ *
+ * Skipping the layout of messages scrolled out of view roughly halves it. The
+ * `auto` in `contain-intrinsic-size` is the load-bearing half: it makes the
+ * browser remember each message's real height once it has been rendered once,
+ * so `scrollHeight` stays honest and `gradStickBottom` keeps pinning to a
+ * bottom that does not move underneath it. A bare placeholder height would make
+ * every scroll past an unrendered message a small jump.
+ *
+ * `auto` and not `hidden`: these have to render when scrolled to, and be found
+ * by the browser's own find-in-page. */
+.grad-msg { padding: 9px 14px; content-visibility: auto; contain-intrinsic-size: auto 140px; }
 .grad-msg .role { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.5;
                   text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 4px; }
 .grad-msg.user { display: flex; flex-direction: column; align-items: flex-end; }

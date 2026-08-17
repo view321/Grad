@@ -314,6 +314,15 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
         per_query = max(5, ceiling // max(1, len(queries) * 2 * len(tier1)))
         budget = _Budget(float(cfg.get("retrieval", "stage1_budget_s", 300)))
         jobs = args.jobs if args.jobs is not None else int(cfg.get("execution", "default_jobs", 4))
+        if jobs < 1:
+            # Refused rather than clamped. `_discover` reads `jobs <= 1` as
+            # "serial", so a configured 0 or -1 ran and looked like it worked --
+            # and a `--jobs 0` typed on the command line meant the opposite of
+            # what anyone typing it intended.
+            raise UsageError(
+                f"--jobs must be at least 1, not {jobs}",
+                fix="drop the flag for the configured default, or set [execution] default_jobs",
+            )
         found, dropped, searched = _discover(
             queries, tier1, per_query=per_query, budget=budget, jobs=jobs
         )

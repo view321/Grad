@@ -866,7 +866,7 @@ def _render_bib(entries: dict[str, dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 @cli.command("check", "the gate: refuses on an unresolved claim or an unjudged run", setup=_project_arg)
 def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
-    """Four rules, in order. It refuses; it does not warn."""
+    """Five rules, in order. It refuses; it does not warn."""
     project_id = _project(args)
     files = report_lib.paths_for(project_id)
     if not files["tex"].exists():

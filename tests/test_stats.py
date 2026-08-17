@@ -239,7 +239,12 @@ def test_samples_are_only_recorded_when_there_is_replication(workspace):
 # ---------------------------------------------------------------------------
 # rule 5
 # ---------------------------------------------------------------------------
-def _cited_run(workspace, *, samples, expectation=_expectation()):
+def _cited_run(workspace, *, samples, expectation=None):
+    # Built per call, not once at import. A mutable default is shared by every
+    # test that takes it, so one that edited the dict it was handed would change
+    # what the next test was asserting against -- from a line that does not
+    # mention the dict at all.
+    expectation = _expectation() if expectation is None else expectation
     run_id = ls.new_id("run")
     ls.append_run_event(
         {

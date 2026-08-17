@@ -777,7 +777,7 @@ def test_a_smoke_check_runs_end_to_end(workspace, monkeypatch):
     assert "delete" in verbs
 
     # And it landed on the ledger as a smoke run holding its actual hours.
-    run = [r for r in ls.runs() if r.id == result["run_id"]][0]
+    run = next(r for r in ls.runs() if r.id == result["run_id"])
     assert run.is_smoke and run.collected
     assert run.get(kaggle_quota.F_ACTUAL) == pytest.approx(42.0 / 3600.0, abs=1e-4)
 

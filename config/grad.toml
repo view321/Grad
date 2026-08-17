@@ -72,6 +72,16 @@ triage   = "claude-haiku-4-5"   # funnel stage 3 (§5)
 report   = "claude-opus-5"      # prose synthesis (§22)
 cite     = "claude-haiku-4-5"   # citation resolution -- mechanical matching (§22)
 
+[evolve]
+# Wall clock for one mutation proposal's whole turn. This is a deadlock guard,
+# not a performance budget: a `full` rewrite of a long block is legitimately a
+# slow turn, and killing a working operator costs a candidate. What it is here
+# to stop is a `claude` that stops yielding without ending its turn -- which,
+# unbounded, holds a `--jobs` slot for the rest of the campaign and takes every
+# remaining generation with it. A proposal that hits this is recorded as one
+# failed candidate, and its tokens are still metered.
+propose_timeout_s = 900
+
 [retrieval]
 # rerank_model and embed_model stay here on purpose: a different provider on a
 # different billing rail. Voyage costs credits, Haiku costs subscription quota,

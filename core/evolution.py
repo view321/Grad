@@ -229,7 +229,11 @@ def weighted_choice(items: Sequence[Any], weights: Sequence[float], rng: random.
         return items[0]
     draw = rng.random() * total
     upto = 0.0
-    for item, weight in zip(items, weights):
+    # `strict`: the two sequences come from `rank_weights(len(items))` at every
+    # call site, so a length mismatch is a caller bug and silently dropping the
+    # tail of the population is how it would otherwise show up -- as a selection
+    # policy that never picks the last candidate.
+    for item, weight in zip(items, weights, strict=True):
         upto += weight
         if draw < upto:
             return item
@@ -454,14 +458,31 @@ def bandit_select(
     total = sum(pulls_of(arm) for arm in available)
     log_total = math.log(max(total, 1.0))
 
+    def measured_mean(arm: str) -> float | None:
+        """This arm's mean over *measured* pulls, or None before its first one."""
+        node = stats.get(arm) or {}
+        pulls = float(node.get("pulls", 0.0))
+        return float(node.get("reward", 0.0)) / pulls if pulls > 0 else None
+
+    # What an arm is worth before anything has come back from it. `unpulled`
+    # above catches an arm with no pulls at all, so what reaches here with no
+    # *measured* pulls is an arm already drawn once in this batch and not yet
+    # evaluated -- and the old arithmetic scored it `0 / 1`, the worst mean
+    # available. That is the pending pull being read as a failure, which is
+    # exactly what the comment below says it must not be: an arm drawn once in a
+    # generation was then the least likely to be drawn again in it, however
+    # promising it was. Optimism in the face of uncertainty is the rule this
+    # bandit is built on, so an unmeasured arm gets the best mean anyone has.
+    observed = [m for m in (measured_mean(a) for a in available) if m is not None]
+    optimistic = max(observed) if observed else 1.0
+
     def value(arm: str) -> float:
-        node = stats.get(arm) or {"pulls": 0.0, "reward": 0.0}
-        pulls = max(pulls_of(arm), 1.0)
         # The mean is over *measured* pulls only; the confidence term is over all
         # of them. A pending pull says "this arm is already being tried", not
         # "this arm scored zero".
-        measured = max(node["pulls"], 1.0)
-        return node["reward"] / measured + UCB_C * math.sqrt(log_total / pulls)
+        mean = measured_mean(arm)
+        pulls = max(pulls_of(arm), 1.0)
+        return (optimistic if mean is None else mean) + UCB_C * math.sqrt(log_total / pulls)
 
     return max(available, key=value)
 

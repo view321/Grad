@@ -70,7 +70,7 @@ def test_a_task_with_no_exit_event_is_running(workspace):
 
 
 def test_an_exit_code_decides_ok_or_failed(workspace):
-    for tid, code, expected in (("a", 0, tasklib.OK), ("b", 3, tasklib.FAILED)):
+    for tid, code in (("a", 0), ("b", 3)):
         tasklib.record_started(tid, label=tid, argv=[], pid=1, halt=None, cwd=str(workspace))
         tasklib.record_exited(tid, code)
     folded = tasklib.tasks()

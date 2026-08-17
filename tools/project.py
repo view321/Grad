@@ -54,18 +54,33 @@ def _resolve(args: argparse.Namespace) -> str:
 
 
 # ---------------------------------------------------------------------------
-@cli.command("init", "create the memory directory and render the ledger views", setup=_project_arg)
+def _init_args(p: argparse.ArgumentParser) -> None:
+    _project_arg(p)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite a generated file that has been edited by hand",
+    )
+
+
+@cli.command("init", "create the memory directory and render the ledger views", setup=_init_args)
 def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
     """Scaffold the three authored files and generate the three derived ones.
 
     Idempotent, and safe on a project that already has notes: `scaffold` never
     overwrites an authored file, so this is also the command that adds a file
     introduced by a later release to a project that predates it.
+
+    `--force` forwards to `sync`, and it is what makes the sentence above true
+    for a project whose generated files have been edited: without it the sync
+    half refuses, *after* the scaffold half has already written -- so a command
+    documented as idempotent failed on its second run, having done part of its
+    work, and named a `sync --force` the caller then had to run by hand.
     """
     project_id = _resolve(args)
     paths.ensure_workspace()
     created = projects.scaffold(project_id)
-    synced = projects.sync(project_id)
+    synced = projects.sync(project_id, force=args.force)
     return {
         **created,
         "generated": synced["written"],
@@ -108,8 +123,13 @@ def cmd_show(args: argparse.Namespace) -> dict[str, Any]:
             for name in projects.DOCS
         },
         "expectations": len(state["expectations"]),
+        # `.get` on both sides. The filter already tolerated a record with no
+        # id and the projection did not, so the one shape that reached here --
+        # an expectation the ledger wrote without one -- passed the test and
+        # then raised `KeyError` building the answer. Same accessor as
+        # `core/projects.py:_render_expectations`.
         "open_expectations": [
-            e["id"] for e in state["expectations"]
+            e.get("id") for e in state["expectations"]
             if e.get("id") not in state["bound_to"] and e.get("id") not in state["falsified"]
         ],
         "runs": len(state["runs"]),
@@ -146,7 +166,11 @@ def cmd_memory(args: argparse.Namespace) -> dict[str, Any]:
         "path": str(path),
         "present": path.is_file(),
         "chars": len(raw),
-        "truncated": len(raw) > projects.MEMORY_MAX_CHARS,
+        # Against the same text `memory_text` measures -- stripped -- because
+        # this flag is a claim about the block in `text` below. Measured on the
+        # raw file, a memory ending in a run of blank lines reported itself
+        # truncated while the block it returned was whole.
+        "truncated": len(raw.strip()) > projects.MEMORY_MAX_CHARS,
         "limit_chars": projects.MEMORY_MAX_CHARS,
         "text": raw if args.raw else block,
     }

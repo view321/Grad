@@ -485,20 +485,48 @@ def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
         items.append(pystray.MenuItem("Quit Grad", lambda: request_quit()))
         return pystray.Menu(*items)
 
+    def _serve() -> None:
+        """`icon.run`, plus what happens when it stops.
+
+        It can stop two ways: `request_quit` tears the icon down, or the backend
+        fails. Either way the flag has to come back down -- left true, it tells
+        the window process that hiding is recoverable when there is no longer
+        anything in the notification area to bring the window back, which is a
+        window that vanishes with no way to reach it.
+
+        Guarded by `_tray is icon`, because a later `start_tray` may already have
+        installed its own. A dying thread must retract its own promise and not
+        its successor's.
+        """
+        global _tray
+        try:
+            icon.run()
+        except Exception:  # noqa: BLE001 - a tray thread must not die silently
+            log.exception("the tray icon stopped")
+        finally:
+            if _tray is icon:
+                _tray = None
+                set_tray_flag(False)
+
     try:
         icon = pystray.Icon("grad", _icon_image(), "Grad", _menu())
+        # Both set before the thread starts, and that is the whole point of the
+        # ordering: the menu is live the instant `run` does, so a `_tray` still
+        # None at that moment is `has_tray()` answering False about an icon that
+        # is already on screen -- and `hide_to_tray` refusing to hide into a tray
+        # that exists. The icon the flag promises is the object above, which
+        # exists by here; `run` makes it visible, it does not make it real.
+        _tray = icon
+        set_tray_flag(True)
         # `run_detached` would be the tidier call, but it is not implemented on
         # every backend; a daemon thread around `run` works on all of them and
         # dies with the process either way.
-        threading.Thread(target=icon.run, name="grad-tray", daemon=True).start()
+        threading.Thread(target=_serve, name="grad-tray", daemon=True).start()
     except Exception:  # noqa: BLE001 - see the docstring
         log.exception("could not start the tray icon")
+        _tray = None
         set_tray_flag(False)
         return None
-    _tray = icon
-    # Only now: the flag is what tells the window process that hiding is
-    # recoverable, and it must never be true earlier than the icon it promises.
-    set_tray_flag(True)
     return icon
 
 

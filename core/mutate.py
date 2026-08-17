@@ -152,6 +152,22 @@ class NoToolCall(RuntimeError):
     """The turn ended without calling the tool. Retried once, then reported."""
 
 
+class ProposalTimeout(RuntimeError):
+    """The operator ran past its wall clock. One wasted candidate, not a stop.
+
+    Deliberately not a `GradError`: `propose` re-raises those, and a campaign
+    that abandoned the generation because one `claude` hung would turn a
+    recoverable stall into the end of the run.
+    """
+
+
+#: Wall clock for one proposal's whole turn, when the driver names none.
+#: Generous, because a `full` rewrite of a long block is a slow turn and killing
+#: a working operator is worse than waiting for it -- this is a deadlock guard,
+#: not a performance budget.
+PROPOSE_TIMEOUT_S = 900.0
+
+
 # ---------------------------------------------------------------------------
 # schemas and validation
 # ---------------------------------------------------------------------------
@@ -410,6 +426,7 @@ async def _call_once(
     block_count: int,
     model: str,
     project: str | None,
+    timeout_s: float,
 ) -> tuple[dict[str, Any], str]:
     sdk = _sdk()
     patch_type = str(plan.get("patch_type") or evolution.PATCH_FULL)
@@ -440,7 +457,9 @@ async def _call_once(
     transcript: list[str] = []
     usage: Any = None
     unauthenticated = False
-    try:
+
+    async def _drain() -> None:
+        nonlocal usage, unauthenticated
         async for message in sdk.query(prompt=user_prompt, options=options):
             if getattr(message, "error", None) == "authentication_failed":
                 unauthenticated = True
@@ -448,6 +467,26 @@ async def _call_once(
             if text:
                 transcript.append(text)
             usage = getattr(message, "usage", None) or usage
+
+    try:
+        # The whole drain, not the first message. `sdk.query` yields until the
+        # turn ends, and a `claude` that stops yielding without ending it is a
+        # coroutine that never returns -- holding a `propose_all` semaphore slot
+        # for the rest of the campaign, with `asyncio.gather` waiting on it and
+        # every remaining generation behind that. Cancelling the iteration is
+        # also what closes the subprocess; there is nothing else here that would.
+        await asyncio.wait_for(_drain(), timeout_s)
+    except TimeoutError as exc:
+        # Metered before it is raised, for the same reason the settled path is:
+        # a proposal that ran into the timeout spent its tokens, and this is the
+        # one loop in the system with nobody watching it spend them.
+        _meter(usage, plan, patch_type, model=model, project=project, captured=captured)
+        # Not a `GradError`. `propose` re-raises those to stop the campaign, and
+        # one operator that hung is one wasted candidate, not a reason to
+        # abandon the generation -- the same judgement `NoToolCall` gets.
+        raise ProposalTimeout(
+            f"the operator produced nothing within {timeout_s:g}s"
+        ) from exc
     except Exception as exc:  # noqa: BLE001 - re-raised unless we know better
         if unauthenticated:
             raise ConfigError(credentials.NOT_AUTHENTICATED, fix=credentials.AUTH_FIX) from exc
@@ -459,6 +498,28 @@ async def _call_once(
     # produce a payload. A proposal that ended without calling the tool spent its
     # tokens, and `hooks.stop`'s docstring is about exactly what happens when the
     # accounting misses the calls most worth accounting for.
+    _meter(usage, plan, patch_type, model=model, project=project, captured=captured)
+    joined = "".join(transcript)
+    if not captured:
+        raise NoToolCall("the operator ended its turn without calling submit_mutation")
+    return captured[-1], joined
+
+
+def _meter(
+    usage: Any,
+    plan: dict[str, Any],
+    patch_type: str,
+    *,
+    model: str,
+    project: str | None,
+    captured: list[dict[str, Any]],
+) -> None:
+    """One proposal's token usage, on the ledger.
+
+    Extracted so the timeout path records what it spent through the same call as
+    the settled one. Two spellings of this would be two chances for the one that
+    fires when something has gone wrong to be the one that forgets to account.
+    """
     quota_log.from_sdk_usage(
         quota_log.STAGE_EVOLVE,
         usage,
@@ -474,10 +535,6 @@ async def _call_once(
             "captured": bool(captured),
         },
     )
-    joined = "".join(transcript)
-    if not captured:
-        raise NoToolCall("the operator ended its turn without calling submit_mutation")
-    return captured[-1], joined
 
 
 def _text_of(message: Any) -> str:
@@ -500,6 +557,7 @@ async def propose(
     project: str | None = None,
     log_dir: Path | None = None,
     metric: str = evolution.METRIC,
+    timeout_s: float = PROPOSE_TIMEOUT_S,
 ) -> dict[str, Any]:
     """One proposal. Never raises for a per-candidate failure.
 
@@ -539,6 +597,7 @@ async def propose(
                 block_count=block_count,
                 model=model,
                 project=project,
+                timeout_s=timeout_s,
             )
             break
         except NoToolCall as exc:
@@ -655,7 +714,10 @@ async def propose_all_async(
     settled = await asyncio.gather(*(one(plan) for plan in plans), return_exceptions=True)
     out: list[dict[str, Any]] = []
     fatal: BaseException | None = None
-    for plan, item in zip(plans, settled):
+    # `strict`: `gather` returns one result per awaitable, so these are equal
+    # length by construction -- and a generation quietly short of a candidate is
+    # the failure mode that would otherwise hide here.
+    for plan, item in zip(plans, settled, strict=True):
         if isinstance(item, BaseException):
             # A campaign-level failure stops the campaign, but only after every
             # sibling has settled -- `gather` with `return_exceptions` is what

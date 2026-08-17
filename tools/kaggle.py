@@ -255,17 +255,40 @@ def _payload_b64(sub: Submission) -> tuple[str, list[str]]:
     and "it ran on the other backend" is the least useful bug report there is.
     """
     base = sub.spec_path.parent
+    eligible: list[Path] = []
+    raw_bytes = 0
+    for path in sorted(base.rglob("*")):
+        if any(part in _EXCLUDE_DIRS for part in path.relative_to(base).parts):
+            continue
+        if not path.is_file():
+            continue
+        eligible.append(path)
+        try:
+            raw_bytes += path.stat().st_size
+        except OSError:  # counted as nothing; the pack below will raise on it
+            continue
+    # Refused on the way in, not after packing. The check used to run on the
+    # finished base64 string, which meant a spec directory with a 4 GB
+    # checkpoint in it was gzipped and base64-encoded *entirely in memory*
+    # before anything said no -- a refusal that costs more than the run would
+    # have. Uncompressed size is the wrong unit for the real limit and the right
+    # one for this: if the raw bytes already fit, the blob certainly does.
+    if raw_bytes > MAX_PAYLOAD_B64:
+        raise UsageError(
+            f"the pipeline directory holds {raw_bytes:,} bytes of files, past the "
+            f"{MAX_PAYLOAD_B64:,} a Kaggle kernel source can carry even before packing",
+            fix=(
+                "move the bulk out of the spec directory and reference it as a Kaggle dataset "
+                "in the spec's [target] dataset_sources -- kernel sources are for code"
+            ),
+        )
     packed: list[str] = []
     buffer = io.BytesIO()
     # `gzip` rather than `tar` alone, and deterministically: mtime=0 keeps the
     # blob byte-identical between two pushes of an unchanged directory, which is
     # what makes a re-push diffable.
     with tarfile.open(fileobj=buffer, mode="w:gz", compresslevel=9) as tar:
-        for path in sorted(base.rglob("*")):
-            if any(part in _EXCLUDE_DIRS for part in path.relative_to(base).parts):
-                continue
-            if not path.is_file():
-                continue
+        for path in eligible:
             rel = path.relative_to(base).as_posix()
             info = tar.gettarinfo(str(path), arcname=rel)
             info.mtime = 0
@@ -324,7 +347,18 @@ def _notebook_for(sub: Submission, command: list[str], *, payload: str) -> dict[
         *[f"    {chunk!r}\n" for chunk in chunks],
         ")\n",
         "with tarfile.open(fileobj=io.BytesIO(base64.b64decode(blob))) as t:\n",
-        "    t.extractall('/kaggle/working')\n",
+        # `filter='data'` explicitly. Python 3.14 made it the default and 3.12
+        # warns without it, but the kernel runs on Kaggle's image and not on this
+        # machine's interpreter -- so the version that matters is one this
+        # process cannot see. Named rather than inherited, and guarded by
+        # `hasattr` rather than by catching `TypeError`: a bare except there
+        # would also swallow a real error from inside the extraction and fall
+        # back to the unfiltered behaviour, which is the one outcome worth
+        # avoiding. On a 3.11 without the filter this extracts as it always did.
+        "    if hasattr(tarfile, 'data_filter'):\n",
+        "        t.extractall('/kaggle/working', filter='data')\n",
+        "    else:\n",
+        "        t.extractall('/kaggle/working')\n",
         "    print('unpacked', len(t.getnames()), 'files')\n",
     ]
     source_run = [

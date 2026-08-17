@@ -469,7 +469,9 @@ def _config(workspace, text: str):
     path = workspace / "config" / "grad.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    config_mod._cache.clear()
+    # `reload=True` is the contract: it skips the cache and overwrites this
+    # path's entry. Reaching into `_cache` as well was a test depending on a
+    # private attribute to do what the public argument already does.
     return config_mod.load(path, reload=True)
 
 

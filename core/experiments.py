@@ -514,9 +514,26 @@ def _dumps(obj: Any) -> str | None:
     return None if obj is None else json.dumps(obj, ensure_ascii=False, default=str)
 
 
+def _older_than(derived: Path, source: Path) -> bool:
+    """Is `derived` behind `source`? False when either cannot be stated.
+
+    An unreadable mtime is not a reason to rebuild: the rebuild would fail on
+    the same file, and answering from the index that exists beats refusing.
+    """
+    try:
+        return source.exists() and derived.stat().st_mtime < source.stat().st_mtime
+    except OSError:
+        return False
+
+
 def query_index(sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
     db = index_path()
-    if not db.exists():
+    # Rebuilt when the index is missing *or* older than the JSONL it indexes.
+    # `experiments.jsonl` is the authoritative store and the SQLite file is a
+    # derived view of it, so an archive appended by another workspace since this
+    # one last built the index is a query answered from a stale copy -- silently,
+    # and with the newest experiments being exactly the ones missing from it.
+    if not db.exists() or _older_than(db, archive_path()):
         rebuild_index(db)
     con = sqlite3.connect(db)
     con.row_factory = sqlite3.Row

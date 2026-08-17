@@ -689,7 +689,12 @@ def _background_rows() -> list[dict[str, Any]]:
         # lists are still worth drawing.
         return []
     rows = []
-    for task in reversed(list(found.values())):
+    # Bounded before `summarise`, not after. A terminal task whose envelope was
+    # not folded into the registry sends `summarise` to `last_envelope`, which
+    # opens that task's log -- so an unbounded history is a file read per
+    # finished task, on the poll, forever, to build rows the window then throws
+    # away. The registry is never cleared unless someone runs `task clear`.
+    for task in list(reversed(list(found.values())))[:RECENT]:
         running = task["state"] == core_tasks.RUNNING
         summary = core_tasks.summarise(task)
         rows.append(
@@ -1550,7 +1555,16 @@ def queue_model() -> dict[str, Any]:
     rows = []
     for run in reversed(runs or []):
         state, tone = _queue_state(run)
-        progress = 1.0 if run.collected else (0.5 if tone == "running" else 0.0)
+        # Off the variant, not off `run.collected`. An abandoned run *is*
+        # collected -- that is how it stops holding the ceiling -- so reading the
+        # flag directly drew a full bar for a run that never produced anything,
+        # which is precisely the "DONE beside a run with no result" reading that
+        # `ABANDONED`'s own chip exists to prevent. `_queue_state` has already
+        # made the judgement; this follows it.
+        if tone == "queued":
+            progress = 0.0
+        else:
+            progress = 1.0 if run.collected else (0.5 if tone == "running" else 0.0)
         rows.append(
             {
                 "job": run.id,

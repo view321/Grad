@@ -257,7 +257,9 @@ def test_the_prompt_block_names_the_other_files_without_including_them(workspace
 # ---------------------------------------------------------------------------
 def test_init_scaffolds_and_generates_in_one_command(workspace):
     project_id = _project(workspace)
-    payload = project_cli.cmd_init(argparse.Namespace(project=project_id, json=True))
+    payload = project_cli.cmd_init(
+        argparse.Namespace(project=project_id, json=True, force=False)
+    )
     assert set(payload["created"]) == set(projects.AUTHORED)
     assert set(payload["generated"]) == set(projects.GENERATED)
     for name in projects.DOCS:

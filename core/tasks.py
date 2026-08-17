@@ -159,8 +159,15 @@ def alive_pids(pids: Iterable[int], *, max_age_s: float = 0.0) -> set[int]:
                 everything.add(int(fields[1].strip()))
             except ValueError:
                 continue
-        if everything:
-            _liveness = (time.monotonic(), everything)
+        if not everything:
+            # `tasklist` failed, is missing, or printed something this cannot
+            # parse. That is not the same as "no process on this machine is
+            # alive", and the difference decides whether every running task in
+            # the registry is about to be folded to `exited`. Nothing is known,
+            # so nothing is reported: the caller's unknown-result handling keeps
+            # each task in the state it was already in.
+            return set(wanted)
+        _liveness = (time.monotonic(), everything)
         return wanted & everything
     # POSIX: `kill(pid, 0)` is cheap enough that there is nothing to cache, and
     # enumerating every process to build a snapshot would cost more than the
@@ -169,11 +176,17 @@ def alive_pids(pids: Iterable[int], *, max_age_s: float = 0.0) -> set[int]:
     for pid in wanted:
         try:
             os.kill(pid, 0)
-        except (ProcessLookupError, PermissionError):
+        except PermissionError:
+            # The signal was refused, which means there was something there to
+            # refuse it: a pid owned by another user is running, not missing.
+            # Treating it as gone is the same mistake as an empty `tasklist`,
+            # and it is the likelier one -- a task started under `sudo`, or one
+            # whose pid has been reused by a process this user does not own.
+            live.add(pid)
+        except (ProcessLookupError, OSError):
             continue
-        except OSError:
-            continue
-        live.add(pid)
+        else:
+            live.add(pid)
     return live
 
 

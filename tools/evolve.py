@@ -956,12 +956,14 @@ class ClaudeMutator:
         model: str,
         jobs: int,
         project: str | None,
+        timeout_s: float = mutate.PROPOSE_TIMEOUT_S,
     ) -> None:
         self.task_dir = task_dir
         self.campaign_id = campaign_id
         self.model = model
         self.jobs = max(1, jobs)
         self.project = project
+        self.timeout_s = timeout_s
 
     def _brief(self) -> str:
         for name in ("TASK.md", "README.md"):
@@ -992,6 +994,7 @@ class ClaudeMutator:
             source_of=candidate_source,
             model=self.model,
             project=self.project,
+            timeout_s=self.timeout_s,
         )
 
 
@@ -1097,19 +1100,34 @@ class ShinkaMutator:
                 "tokens": "not reported by shinka-evolve; this row counts the call only",
             },
         )
-        return [
-            {
-                "patch_type": plan.get("patch_type"),
-                "island": plan.get("island"),
-                "index": plan.get("index"),
-                "generation": generation,
-                "parent_id": (plan.get("parent") or {}).get("candidate_id"),
-                "source": str(source),
-                "rationale": "",
-                "error": None,
-            }
-            for plan, source in zip(plans, sources)
-        ]
+        # One record per *plan*, never per source. `zip` truncated to the shorter
+        # of the two, so an upstream runner that returned three sources for a
+        # population of four produced a generation of three -- with nothing
+        # anywhere saying a slot had gone missing. The plan is what the budget
+        # gate counted and what `plan_generation` decided; a source that never
+        # arrived is a failed proposal, which is a record this already knows how
+        # to write.
+        out: list[dict[str, Any]] = []
+        for index, plan in enumerate(plans):
+            source = sources[index] if index < len(sources) else None
+            out.append(
+                {
+                    "patch_type": plan.get("patch_type"),
+                    "island": plan.get("island"),
+                    "index": plan.get("index"),
+                    "generation": generation,
+                    "parent_id": (plan.get("parent") or {}).get("candidate_id"),
+                    "source": "" if source is None else str(source),
+                    "rationale": "",
+                    "error": (
+                        None
+                        if source is not None
+                        else f"{MUTATOR_SHINKA} returned {len(sources)} source(s) "
+                        f"for {len(plans)} plan(s); this slot got none"
+                    ),
+                }
+            )
+        return out
 
 
 def _models(cfg: config_mod.Config, overrides: list[str]) -> tuple[str, ...]:
@@ -1143,6 +1161,7 @@ def _make_mutator(
         model=cfg.model_for("evolve"),
         jobs=args.jobs,
         project=project_id,
+        timeout_s=float(cfg.get("evolve", "propose_timeout_s", mutate.PROPOSE_TIMEOUT_S)),
     )
 
 

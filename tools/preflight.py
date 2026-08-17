@@ -169,8 +169,21 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
     for name, result in _run_checks(local, sub, cfg, spec_checks, jobs=jobs).items():
         results[name] = computed[name] = result
 
+    # Over the record, not only over what this invocation ran. `local` is empty
+    # under `--only smoke`, which made the one check that costs money the one
+    # check that could run after `tests` had already failed for this very hash --
+    # the exact spend the separation above exists to prevent.
+    #
+    # A check with no recorded result is still not a failure: `results` is keyed
+    # by submission hash, so "never run" and "ran and failed" are different
+    # facts, and the missing one is `check_preflight`'s refusal to make.
+    prerequisites = [
+        n for n in dict.fromkeys([*configured, *spec_checks, *local]) if n != "smoke"
+    ]
     local_failed = [
-        n for n in local if not (isinstance(results.get(n), dict) and results[n].get("ok") is True)
+        n
+        for n in prerequisites
+        if isinstance(results.get(n), dict) and results[n].get("ok") is not True
     ]
     smoke_skipped = None
     if smoke_wanted:

@@ -258,12 +258,20 @@ def concurrency_ceiling(sub: Submission | None, cfg: Config) -> int:
     if declared is None:
         declared = cfg.get("execution", "max_concurrent_runs", 2)
     try:
-        return max(1, int(declared))
+        # Via `float` first, so a fractional value is refused rather than
+        # truncated. `int(2.7)` is 2 and raises nothing, which made a ceiling
+        # typed as 2.7 mean 2 -- a number nobody wrote, arrived at silently, in
+        # the one place whose whole job is refusing to proceed on a number it
+        # does not trust.
+        exact = float(declared)
     except (TypeError, ValueError):
+        exact = float("nan")
+    if not exact.is_integer():
         raise ConfigError(
             f"max_concurrent must be a whole number, not {declared!r}",
             fix="fix [execution] max_concurrent in the spec, or max_concurrent_runs in config/grad.toml",
-        ) from None
+        )
+    return max(1, int(exact))
 
 
 def check_concurrency(cfg: Config, *, sub: Submission | None = None) -> dict[str, Any]:
@@ -292,7 +300,20 @@ def check_concurrency(cfg: Config, *, sub: Submission | None = None) -> dict[str
         return {"in_flight": len(live), "ceiling": ceiling}
     from core import submit as submit_lib  # noqa: PLC0415 - avoids an import cycle
 
-    oldest = live[0]
+    # The oldest run that can actually be collected, not simply the oldest. A
+    # submitter killed between writing its in-flight record and receiving the
+    # backend's job id leaves a run with no handle, and `collect` refuses that
+    # one ("no_handle") -- so naming it here sends the reader to a command that
+    # cannot work on the run it names. `ledger abandon` is that run's exit, and
+    # it is the same distinction `cmd_abandon` makes in the other direction.
+    collectable = [r for r in live if r.get("handle")]
+    if collectable:
+        fix = submit_lib.collect_command(collectable[0])
+    else:
+        fix = (
+            f'python -m tools.ledger abandon {live[0].id} --reason "..." --json'
+            "   # none of these reached a backend, so none can be collected"
+        )
     raise GateRefusal(
         "too_many_in_flight",
         (
@@ -304,7 +325,7 @@ def check_concurrency(cfg: Config, *, sub: Submission | None = None) -> dict[str
         EXIT_CONCURRENCY,
         # The oldest, because it is the one most likely to be finished and is
         # certainly the one closest to going stale.
-        fix=submit_lib.collect_command(oldest),
+        fix=fix,
         detail={
             "in_flight": [r.id for r in live],
             "ceiling": ceiling,

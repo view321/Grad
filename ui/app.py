@@ -905,6 +905,10 @@ def build() -> None:
 #: first prompt on a fresh install dying mid-connect.
 RELEASE_GRACE_S = 10.0
 
+#: The grace tasks currently in flight, held so the event loop's weak reference
+#: is not the only one. Entries remove themselves when they finish.
+_RELEASES: set[Any] = set()
+
 
 def _release_when_gone(client: Any, session: Session) -> None:
     """Hand the session back only if this client's socket stays gone.
@@ -923,11 +927,19 @@ def _release_when_gone(client: Any, session: Session) -> None:
         await session.release()
 
     try:
-        asyncio.get_running_loop().create_task(_check())
+        task = asyncio.get_running_loop().create_task(_check())
     except RuntimeError:
         # No loop to wait on (tests, teardown). Nothing to grace; the direct
         # release is what the handler did before the grace existed.
         asyncio.run(session.release())
+    else:
+        # Held for the length of the sleep. The loop keeps only a weak reference
+        # to a task, so a `create_task` whose result nobody keeps can be
+        # collected before it resumes -- and this one spends ten seconds
+        # suspended, which is ten seconds of being the only thing that would
+        # ever hand the session back.
+        _RELEASES.add(task)
+        task.add_done_callback(_RELEASES.discard)
 
 
 def _serve_static(nicegui_app: Any) -> None:

@@ -238,14 +238,21 @@ def prompt_block(project_id: str | None, *, max_chars: int = MEMORY_MAX_CHARS) -
     """
     if not project_id:
         return ""
-    directory = _relative(resolve_dir(project_id))
+    try:
+        directory = _relative(resolve_dir(project_id))
+    except UsageError:
+        # The same contract `memory_text` states and keeps: this builds a system
+        # prompt, and an unusable project id is a session without project notes
+        # rather than a session that will not start. The id reaches here from a
+        # selection file, so it can be wrong without anyone having just typed it.
+        return ""
     memory = memory_text(project_id, max_chars=max_chars)
     lines = [
         "## This project",
         "",
         f"You are working in project `{project_id}`. Its notes are in `{directory}/`:",
         "",
-        f"* `MEMORY.md` -- durable facts, included below. **Keep it current**: when you "
+        "* `MEMORY.md` -- durable facts, included below. **Keep it current**: when you "
         "settle a convention, abandon an approach, or learn something about the data or "
         "the hardware that you would want to know next session, write it there.",
         "* `PLAN.md`, `TODO.md` -- the argument and the next actions. Yours to edit.",
@@ -510,7 +517,9 @@ def _predicted(predicted: dict[str, Any]) -> str:
         return f">= {low}"
     if high is not None:
         return f"<= {high}"
-    return f"*{direction}*" if direction else "--"
+    # `direction` is free text off the expectation record, and it is the only
+    # branch here that is not a number this function formatted itself.
+    return f"*{_cell(direction)}*" if direction else "--"
 
 
 def _render_results(snapshot: dict[str, Any]) -> str:
@@ -547,7 +556,14 @@ def _render_results(snapshot: dict[str, Any]) -> str:
         results = r.get("results") or {}
         if results:
             lines += ["| quantity | value |", "|---|---|"]
-            lines += [f"| `{k}` | {v} |" for k, v in sorted(results.items())]
+            # Both halves through `_cell`. These are ledger-derived: the key is a
+            # quantity name the pipeline chose and the value is whatever it
+            # reported, so either can carry a pipe or a newline and take the
+            # table with it -- in the one file whose job is to be readable when
+            # a run has gone wrong.
+            lines += [
+                f"| `{_cell(k)}` | {_cell(v)} |" for k, v in sorted(results.items())
+            ]
             lines.append("")
         else:
             lines += ["*The run reported no metrics.*", ""]
