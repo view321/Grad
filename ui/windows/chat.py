@@ -42,6 +42,7 @@ import html
 import time
 from typing import Any
 
+from core import rewind
 from ui import katex, kit, models
 from ui.state import FLUSH_HZ
 
@@ -145,6 +146,32 @@ async def _switch(workspace: Any, session_id: str) -> None:
     workspace.rebuild_chat()
 
 
+async def _rewind(workspace: Any, index: int) -> None:
+    """Take the conversation back to before one prompt, and offer it again.
+
+    The whole transcript is rebuilt rather than surgically edited. A rewind
+    changes the index of nothing above the cut and removes everything below it,
+    so the click handlers bound to the removed elements are exactly what must not
+    survive -- and `rebuild_chat` is already the tested path for replacing a
+    transcript wholesale, which is what a session switch does.
+
+    The scroll position goes with it, which is a real cost the session switch
+    pays for the same reason. Here it lands where it should anyway: the rewind
+    point is the new end of the conversation.
+    """
+    outcome = await workspace.session.rewind_to(index)
+    workspace.say(outcome.get("message"))
+    if not outcome.get("ok"):
+        return
+    # Back in the box rather than re-sent. See `Session.rewind_to`.
+    workspace.chat_draft = outcome.get("prompt") or ""
+    # A gate that was awaiting a decision may have been part of what was just
+    # dropped, and a titlebar left claiming GATE would be asking about a turn
+    # that no longer exists.
+    workspace.set_agent_state("idle")
+    workspace.rebuild_chat()
+
+
 def _draw_session_menu(workspace: Any, body: Any, menu: Any) -> None:
     """Every stored conversation, and what opening it would actually do."""
     model = workspace.sessions()
@@ -241,8 +268,13 @@ def render(workspace: Any) -> None:
         tail = _Tail(tail_root)
 
         with transcript:
-            for message in session.settled:
-                _message(message, workspace)
+            for index, message in enumerate(session.settled):
+                # The index is the position in `settled`, which is what a rewind
+                # cuts at. Passed rather than recomputed at the click because the
+                # click handler has no way back to the list it was drawn from --
+                # and `rewind.plan` re-validates it anyway, since a transcript
+                # can be rebuilt underneath a handler that is still bound.
+                _message(message, workspace, index=index)
 
         statusline = _Statusline(workspace, root)
         _composer(ui, workspace, transcript, tail, statusline)
@@ -612,6 +644,56 @@ def _has_gate(record: dict[str, Any]) -> bool:
     return False
 
 
+def _rewind_control(workspace: Any, index: int) -> Any:
+    """The ⟲ on a prompt: drop it and everything after it.
+
+    On every prompt rather than only on the ones that failed. The turn worth
+    undoing is not always the one that errored -- a question that sent the agent
+    down a forty-minute path is the expensive case -- and a control that appeared
+    only after a failure would be one nobody knew existed until something broke.
+
+    No confirmation step. The action is recoverable by construction: the dropped
+    turns are kept in the marker it leaves (`core/rewind.py`), so the worst a
+    mis-click costs is a rebuilt prompt cache, and the status bar says exactly
+    what happened. A modal on every one of these would make undoing three dead
+    turns after an API error six clicks instead of three.
+    """
+    control = kit.text("⟲", "grad-rewind", tag="button")
+    control.props(
+        'title="rewind to here — drop this and everything after it, from the '
+        'transcript and from what the agent remembers"'
+    )
+    control.on("click", lambda _=None: workspace.spawn(_rewind(workspace, index), "rewind"))
+    return control
+
+
+def _rewound(ui: Any, record: dict[str, Any], workspace: Any) -> None:
+    """The line across the transcript where turns were taken back.
+
+    The same shape as a compaction and for the same reason: both are boundaries
+    rather than turns, both mean the conversation above is not what the agent is
+    now working from, and a transcript that lost messages with no mark would read
+    as one that never had them.
+
+    What is behind the disclosure is the difference. A compaction keeps a summary
+    of what it discarded; a rewind keeps the turns themselves, whole, because it
+    has them -- so the exchange that was rewound past is still readable, with its
+    tool calls, by anyone asking later what actually went wrong. They are drawn
+    without a rewind control of their own: they are not in the conversation any
+    more, so there is no position left to cut at.
+    """
+    with kit.el("div", "grad-compaction rewound"):
+        with kit.row("head", gap=8):
+            kit.text("⟲", "mark", tag="span")
+            ui.markdown(record.get("text") or "rewound")
+        dropped = rewind.dropped_of(record)
+        if dropped:
+            label = "message" if len(dropped) == 1 else "messages"
+            with ui.expansion(f"the {len(dropped)} {label} this took back").classes("note"):
+                for entry in dropped:
+                    _message(entry, workspace)
+
+
 def _compaction(ui: Any, record: dict[str, Any]) -> None:
     """The line across the transcript where the agent's memory was replaced.
 
@@ -667,8 +749,16 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
             workspace.say("a turn is still running — stop it first (Esc)")
             return
         entry.value = ""
+        # The draft is the composer's state across a rebuild, so it has to be
+        # cleared where the box is -- otherwise the next redraw would put the
+        # sent prompt back in.
+        workspace.chat_draft = ""
         with transcript:
-            _message({"role": "user", "text": prompt}, workspace)
+            # The index this prompt is about to take in `settled`: `ask` appends
+            # it, so it lands exactly at the current length. Computed here rather
+            # than after the turn because the element is drawn now, and a control
+            # bound to the wrong index would cut in the wrong place.
+            _message({"role": "user", "text": prompt}, workspace, index=len(session.settled))
         workspace.set_agent_state("running")
         # The prompt goes to the agent exactly as it was typed. There was once a
         # mode chip here that prefixed it with `[plan]` or `[run]`, but nothing
@@ -708,7 +798,13 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
                 # removed this prop is written down. Quasar's version reads
                 # `scrollHeight` back inside the input handler, and that read is
                 # a full-document layout whose cost is the transcript's size.
-                ui.textarea(placeholder="ask, or paste a result to interrogate")
+                # Seeded from the workspace rather than left empty: a rewind puts
+                # the prompt it dropped back here to be edited, and this window
+                # is rebuilt between the two.
+                ui.textarea(
+                    placeholder="ask, or paste a result to interrogate",
+                    value=workspace.chat_draft,
+                )
                 .props("borderless dense")
                 .classes("field")
                 .style("flex: 1 1 auto; padding: 0 8px")
@@ -739,23 +835,35 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
 # ---------------------------------------------------------------------------
 # message anatomy
 # ---------------------------------------------------------------------------
-def _message(record: dict[str, Any], workspace: Any) -> None:
+def _message(record: dict[str, Any], workspace: Any, index: int | None = None) -> None:
     """One settled message: a user's prompt, or a turn with its calls in it.
 
     A record carries `blocks` when the stream produced them and only `text` when
     it did not -- an older transcript, or a user's own message -- so the fallback
     is the whole message as one run of prose, which is exactly what this drew
     before tool calls were captured at all.
+
+    `index` is the record's position in `session.settled`, and passing it is what
+    makes a prompt rewindable. It is absent for the two kinds of message that are
+    not a rewind point: an answer, and anything drawn inside a rewind marker's
+    own disclosure -- those turns are already gone, and offering to drop them
+    again would cut at a position they no longer occupy.
     """
     from nicegui import ui
 
     text = record.get("text") or ""
     if record.get("role") == "system":
-        _compaction(ui, record)
+        if record.get("kind") == rewind.MARK_KIND:
+            _rewound(ui, record, workspace)
+        else:
+            _compaction(ui, record)
         return
     if record.get("role") == "user":
         with kit.el("div", "grad-msg user"):
-            kit.text("you", "role")
+            with kit.row("role", gap=6):
+                kit.text("you", "", tag="span")
+                if index is not None:
+                    _rewind_control(workspace, index)
             with kit.el("div", "bubble"):
                 ui.markdown(text)
         return

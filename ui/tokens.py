@@ -904,6 +904,29 @@ def _chat() -> str:
 .grad-compaction .head .q-markdown, .grad-compaction .head p { margin: 0; opacity: 0.75; }
 .grad-compaction .note { margin-top: 6px; font-size: 11px;
                          background: var(--grad-paper-sunk); border: var(--grad-secondary); }
+/* A rewind is the same kind of boundary as a compaction -- the conversation
+   above is not what the agent is working from -- so it is the same rule with a
+   solid border: what is above a rewind *is* still solid, it is simply shorter.
+   The messages it took back are drawn inside the disclosure, so their own
+   margins are pulled in to keep them within the note rather than beside it. */
+.grad-compaction.rewound { border-top: 1.5px solid var(--grad-rule-mid); }
+.grad-compaction.rewound .note .grad-msg { padding: 6px 8px; }
+.grad-compaction.rewound .note .grad-card { margin-left: 0; margin-right: 0; }
+
+/* The ⟲ on a prompt, drawn inside the role label and as quiet as it is. Always
+   there rather than revealed on hover: a control nobody can see is one nobody
+   knows exists, and the alternative -- fading it in -- is the easing curve the
+   design rules out. Pointing at the message lifts the whole label instead,
+   which is an instant swap and needs nothing on the button itself.
+
+   The lift is on `.role` and not on the button because opacity on a parent caps
+   its children: `.grad-msg .role` is already 0.5, and no rule on something
+   inside it can paint above that. */
+.grad-rewind { border: 0; background: none; padding: 0 3px; cursor: pointer;
+               font-family: var(--grad-font-mono); font-size: 11px; line-height: 1;
+               color: var(--grad-ink); }
+.grad-msg.user:hover .role { opacity: 0.85; }
+.grad-rewind:focus-visible { outline: 1.5px solid var(--grad-ink); outline-offset: 1px; }
 
 /* Reasoning is drawn either way and painted only when it is switched on: a
    toggle that rebuilt the transcript would take its scroll position with it,
