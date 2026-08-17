@@ -781,10 +781,225 @@ def test_a_damaged_ledger_line_degrades_to_an_error_not_a_crash(workspace):
     assert model["entries"] == []
 
 
+# ---------------------------------------------------------------------------
+# the projects window
+# ---------------------------------------------------------------------------
+def test_a_project_with_no_ceilings_is_reported_as_unbounded(workspace):
+    """It passes every gate that reads a ceiling, silently. `tools/budget.py`
+    says so once at creation and nothing carried it further; the window puts it
+    on the row it is true of, for as long as it stays true."""
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-open", title="no ceilings", budget={})
+    budget_mod.create("proj-bound", title="bounded", budget={"gpu_usd": 10.0})
+
+    rows = {r["id"]: r for r in models.projects_model()["rows"]}
+    assert rows["proj-open"]["unbounded"] is True
+    assert rows["proj-bound"]["unbounded"] is False
+    assert models.projects_model()["unbounded"] == ["proj-open"]
+
+
+def test_a_closed_project_is_not_counted_as_unbounded(workspace):
+    """Nothing will be charged to it, so an UNBOUNDED chip on a closed project is
+    a warning about a thing that cannot happen."""
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-done", title="finished", budget={})
+    budget_mod.close("proj-done")
+
+    model = models.projects_model()
+    assert model["unbounded"] == []
+    assert model["open_count"] == 0
+    assert model["rows"][0]["status"] == "closed"
+
+
+def test_every_project_carries_its_own_ceilings(workspace):
+    """The reason this window exists. The menu's raise controls addressed the
+    selected project only, so reading what bounded any other one meant switching
+    to it -- which reloads every window in the app to answer a question about a
+    number."""
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-a", title="A", budget={"gpu_usd": 10.0})
+    budget_mod.create("proj-b", title="B", budget={"quota_tokens": 5_000_000})
+    budget_mod.set_current("proj-a")
+
+    rows = {r["id"]: r for r in models.projects_model()["rows"]}
+    by_resource = {c["resource"]: c for c in rows["proj-b"]["ceilings"]}
+    assert by_resource["quota_tokens"]["set"] is True
+    assert by_resource["gpu_usd"]["set"] is False
+    # Not the selected one, and its ceiling is readable anyway.
+    assert rows["proj-b"]["current"] is False
+
+
+def test_tokens_are_counted_and_dollars_are_priced(workspace):
+    """4.2M subscription tokens rendered as `$4,200,000.00` is the specific
+    thing the per-resource formatter separates."""
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-a", title="A", budget={"quota_tokens": 4_200_000, "gpu_usd": 12.0})
+    row = models.projects_model()["rows"][0]
+    by_resource = {c["resource"]: c for c in row["ceilings"]}
+    assert "4.2M" in by_resource["quota_tokens"]["label"]
+    assert "$" not in by_resource["quota_tokens"]["label"]
+    assert "$12.00" in by_resource["gpu_usd"]["label"]
+
+
+def test_a_project_whose_spend_will_not_compute_does_not_take_the_list_down(workspace, monkeypatch):
+    """`status` folds the whole run ledger for one project. It is caught per row
+    so the broken one says so in its own row."""
+    from core import budget as budget_mod
+
+    budget_mod.create("proj-a", title="A", budget={})
+    budget_mod.create("proj-b", title="B", budget={})
+
+    real_status = budget_mod.status
+
+    def explode(project_id):
+        if project_id == "proj-a":
+            raise RuntimeError("this ledger is a lie")
+        return real_status(project_id)
+
+    monkeypatch.setattr(budget_mod, "status", explode)
+
+    rows = {r["id"]: r for r in models.projects_model()["rows"]}
+    assert "this ledger is a lie" in rows["proj-a"]["error"]
+    assert rows["proj-b"]["error"] is None
+
+
+def test_scaffolded_but_empty_is_not_the_same_as_never_scaffolded(workspace):
+    """`budget new` guards the scaffold step so it cannot fail the creation. This
+    is where that consequence becomes visible instead of being discovered by
+    `project sync` weeks later."""
+    from core import budget as budget_mod, projects as projects_mod
+
+    budget_mod.create("proj-a", title="A", budget={})
+    assert models.projects_model()["rows"][0]["memory"]["scaffolded"] is False
+
+    projects_mod.scaffold("proj-a")
+    memory = models.projects_model()["rows"][0]["memory"]
+    assert memory["scaffolded"] is True
+    assert "MEMORY.md" in memory["present"]
+
+
+# ---------------------------------------------------------------------------
+# the setup window
+# ---------------------------------------------------------------------------
+def test_a_token_in_the_environment_is_ready_but_not_durable(workspace, monkeypatch):
+    """The distinction that only bites the installed app: a shell that exported
+    the token has it, and the desktop shortcut launches from Explorer with
+    whatever was made persistent -- usually nothing."""
+    from core import credentials
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-test")
+    monkeypatch.setattr(credentials, "status", lambda: dict.fromkeys(credentials.ALL, False))
+
+    token = models.setup_model()["token"]
+    assert token["state"] == "environment"
+    assert token["ready"] is True
+    assert token["durable"] is False
+
+
+def test_a_stored_token_is_durable(workspace, monkeypatch):
+    from core import credentials
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        credentials,
+        "status",
+        lambda: {**dict.fromkeys(credentials.ALL, False), credentials.CLAUDE_TOKEN: True},
+    )
+    token = models.setup_model()["token"]
+    assert token["state"] == "stored"
+    assert token["durable"] is True
+
+
+def test_with_nothing_configured_the_first_step_is_the_one_that_blocks(workspace, monkeypatch):
+    from core import credentials
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(credentials, "status", lambda: dict.fromkeys(credentials.ALL, False))
+
+    model = models.setup_model()
+    steps = {s["id"]: s for s in model["steps"]}
+    assert steps["token"]["ready"] is False
+    assert steps["backends"]["ready"] is False
+    # Neither of these can be "unanswered": there are defaults for all six roles,
+    # and an optional key is optional.
+    assert steps["models"]["ready"] is True
+    assert steps["extras"]["ready"] is True
+    assert model["complete"] is False
+
+
+def test_the_models_step_reports_where_each_role_resolved_from(workspace):
+    from core import settings
+
+    settings.set_models({"evolve": "claude-opus-5"})
+    roles = {r["role"]: r for r in models.setup_model()["roles"]}
+    assert roles["evolve"]["model"] == "claude-opus-5"
+    assert roles["evolve"]["source"] == "setup"
+    assert roles["evolve"]["overridden"] is True
+    assert roles["cite"]["source"] in ("config", "default")
+    assert roles["cite"]["overridden"] is False
+
+
+def test_setup_is_needed_only_when_the_agent_cannot_authenticate(workspace, monkeypatch):
+    """Narrow on purpose. An unconfigured backend means no remote training,
+    which is a real limitation and not a reason to put a wizard in front of
+    someone who opened the app to read a ledger."""
+    from core import credentials
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(credentials, "present", lambda _name: False)
+    assert models.setup_needed() is True
+
+    monkeypatch.setattr(credentials, "present", lambda _name: True)
+    assert models.setup_needed() is False
+
+
+def test_an_unreachable_credential_store_does_not_decide_the_app_is_broken(workspace, monkeypatch):
+    """`setup_needed` runs on the startup path. It must answer, not raise."""
+    from core import credentials
+    from core.errors import ConfigError
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def boom(_name):
+        raise ConfigError("no keyring here", fix="pip install keyring")
+
+    monkeypatch.setattr(credentials, "present", boom)
+    assert models.setup_needed() is True  # nothing configured is the same answer
+
+
+def test_a_backend_credential_is_not_reported_as_unconditionally_required(workspace, monkeypatch):
+    """`hf_token` used to be marked required, so a user who had chosen Kaggle --
+    the free backend -- saw a red MISSING for a token they will never need. What
+    is true is that HF Jobs needs it, which is a fact about a backend."""
+    from core import credentials
+
+    monkeypatch.setattr(credentials, "status", lambda: dict.fromkeys(credentials.ALL, False))
+    rows = {r["name"]: r for r in models.credentials_model()["rows"]}
+    assert rows["hf_token"]["required"] is False
+    assert rows["hf_token"]["group"] == "backend"
+    assert rows["hf_token"]["tone"] != "broken"
+    # The one that genuinely is.
+    assert rows["claude_oauth_token"]["required"] is True
+    assert rows["claude_oauth_token"]["tone"] == "broken"
+
+
+def test_the_header_carries_the_folder_basename_and_its_whole_path(workspace):
+    """The appbar cell cannot hold an absolute path, and the tooltip has to."""
+    model = models.header_model()
+    assert model["root"] == str(paths.root())
+    assert model["root_name"] == paths.root().name
+
+
 def test_every_model_survives_a_completely_empty_workspace(workspace):
     """Eleven windows over eight ledgers is eight chances per refresh for one
     bad file to take the workspace down. None of them may raise."""
     for builder in (
+        models.setup_model,
+        models.projects_model,
         models.ledger_model,
         models.quota_model,
         models.preflight_model,

@@ -613,3 +613,121 @@ def test_the_stop_hook_no_longer_writes_a_usage_row(workspace):
 
     asyncio.run(hooks.stop({"session_id": "s-1"}, None, None))
     assert [r for r in quota_log.entries() if r["stage"] == quota_log.STAGE_MAIN] == []
+
+
+# ---------------------------------------------------------------------------
+# a stored token that authenticated everything except the agent
+# ---------------------------------------------------------------------------
+TOKEN = "sk-ant-oat-test"
+
+
+def test_the_stored_token_reaches_the_main_loop(monkeypatch):
+    """The gap: the main loop authenticates from the ambient variable, `sdk_env`
+    reads the store, and nothing joined them. A token stored through the app's
+    credentials panel ran the funnel and the mutation operator and left the
+    agent's own loop with no credentials -- panel says STORED, first turn fails."""
+    import os
+
+    from core import credentials
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        credentials, "get", lambda name, **k: TOKEN if name == credentials.CLAUDE_TOKEN else None
+    )
+
+    assert credentials.hydrate_environment() == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+
+
+def test_a_token_exported_by_hand_outranks_the_stored_one(monkeypatch):
+    """A token exported in a terminal is a deliberate choice -- a second account,
+    a token being tested -- and the store must not quietly outrank it. Same
+    precedence `sdk_env` uses."""
+    import os
+
+    from core import credentials
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ambient")
+    monkeypatch.setattr(credentials, "get", lambda *a, **k: TOKEN)
+
+    assert credentials.hydrate_environment() is None
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "ambient"
+
+
+def test_an_unreachable_credential_store_does_not_stop_the_start(monkeypatch):
+    """A missing `keyring` is not a reason to refuse to start: the SDK still
+    gives its own auth error if the token was the only thing that could help."""
+    import os
+
+    from core import credentials
+    from core.errors import ConfigError
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def boom(*_a, **_k):
+        raise ConfigError("credential store unavailable", fix="install keyring")
+
+    monkeypatch.setattr(credentials, "get", boom)
+
+    assert credentials.hydrate_environment() is None
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in os.environ
+
+
+def test_preflight_hydrates_and_reports_where_the_token_came_from(monkeypatch):
+    """Both entry points reach `preflight_environment` -- `run_session` and the
+    UI's client start -- which is why the bridge lives there. The source is
+    reported because "why is it using that account?" is otherwise unanswerable."""
+    import os
+
+    import agent
+    from core import credentials
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        credentials, "get", lambda name, **k: TOKEN if name == credentials.CLAUDE_TOKEN else None
+    )
+
+    report = agent.preflight_environment()
+
+    assert report["oauth_token_present"] is True
+    assert report["oauth_token_source"] == "credential store"
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+
+
+def test_the_scrub_runs_before_the_hydrate(monkeypatch):
+    """ANTHROPIC_API_KEY outranks the OAuth token in the SDK's credential chain.
+    Hydrating first would set a variable the scrub had not yet cleared the way
+    for: a session billing the Developer Platform while reporting a subscription
+    token present."""
+    import os
+
+    import agent
+    from core import credentials
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        credentials, "get", lambda name, **k: TOKEN if name == credentials.CLAUDE_TOKEN else None
+    )
+
+    report = agent.preflight_environment()
+
+    assert "ANTHROPIC_API_KEY" in report["removed_env"]
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
+
+
+# ---------------------------------------------------------------------------
+# a credential row that said nothing about itself
+# ---------------------------------------------------------------------------
+def test_every_credential_the_store_knows_has_a_purpose_in_the_panel():
+    """`kaggle_key` was in `credentials.ALL` and not in `CREDENTIAL_NOTES`, so
+    the panel drew it with an empty purpose column. Asserted against `ALL`
+    rather than by name, because the hole was drift between two hand-written
+    lists and a test naming the eighth entry would not catch the ninth."""
+    from core import credentials
+    from ui import models
+
+    for name in credentials.ALL:
+        purpose, _required = models.CREDENTIAL_NOTES.get(name, ("", False))
+        assert purpose.strip(), f"{name} has no purpose text in the credentials panel"

@@ -185,6 +185,56 @@ def sdk_env() -> dict[str, str]:
     return {"CLAUDE_CODE_OAUTH_TOKEN": token}
 
 
+def hydrate_environment() -> str | None:
+    """Put the stored subscription token into *this* process's environment.
+
+    The complement of `scrub_environment`, and the fix for a gap between two
+    things that were each individually right. The main loop authenticates from
+    the ambient `CLAUDE_CODE_OAUTH_TOKEN` (`agent.preflight_environment`), while
+    `sdk_env` reads the credential store because the Bash hop strips that
+    variable from child processes. Nothing joined them up -- so a token stored
+    through the app's credentials panel authenticated the funnel and the
+    mutation operator, and left the agent's own loop with no credentials at all.
+    That is the worst shape for this to fail in: the panel says STORED, and the
+    first turn fails anyway.
+
+    It bit the installed app rather than the terminal, which is why it survived.
+    `claude setup-token` is run in a shell, and a shell that exported the result
+    has it -- but the desktop shortcut launches `pythonw.exe` from Explorer,
+    which inherits whatever the user made persistent and usually that is
+    nothing.
+
+    Three constraints, all of them load-bearing:
+
+    **Ambient wins.** A token exported in a terminal is a deliberate choice --
+    a second account, a token being tested -- and this must not quietly outrank
+    it. Same precedence `sdk_env` uses, for the same reason.
+
+    **After the scrub, never before.** `ANTHROPIC_API_KEY` outranks this token
+    in the SDK's credential chain, so hydrating first would set a variable the
+    scrub had not yet cleared the way for, and the session would bill the
+    Developer Platform while reporting a subscription token present.
+
+    **It never raises.** A missing `keyring`, a Credential Manager that will not
+    open for this user -- neither is a reason to refuse to start. The caller
+    reports what happened; the SDK still gives its own auth error if the token
+    was the only thing that could have helped.
+    """
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return None
+    try:
+        token = get(CLAUDE_TOKEN, required=False)
+    except ConfigError:
+        # The store is unreachable. `status()` already reports that condition to
+        # the credentials panel, and there is nothing useful to do about it on
+        # the startup path.
+        return None
+    if not token:
+        return None
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return "CLAUDE_CODE_OAUTH_TOKEN"
+
+
 def scrub_environment() -> list[str]:
     """Remove credential-shaped variables from the agent's own environment.
 

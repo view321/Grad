@@ -69,7 +69,7 @@ def layout_path(project: str | None) -> Path:
 
 
 def load_layout(project: str | None) -> layout_mod.Layout:
-    """The saved arrangement, or the mock's opening one.
+    """The saved arrangement, or the one a workspace with no history opens with.
 
     Unknown window ids are dropped rather than raised on, so a layout written by
     a version with a window this one does not have still opens.
@@ -78,7 +78,28 @@ def load_layout(project: str | None) -> layout_mod.Layout:
     restored = layout_mod.Layout.from_dict(data, known=registry.ids())
     if restored.columns:
         return restored
-    return layout_mod.Layout.default(registry.defaults())
+    return layout_mod.Layout.default(opening_windows())
+
+
+def opening_windows() -> tuple[str, ...]:
+    """What opens when this workspace has never been arranged.
+
+    The mock's four -- unless the agent has no credentials, in which case those
+    four windows are four windows that cannot do anything, and the first thing
+    on screen should be the one that fixes it.
+
+    Only reached when there is no saved layout, so this costs a credential-store
+    read once per fresh workspace and nothing thereafter. And only the *token* is
+    checked (`models.setup_needed`): an unconfigured backend means no remote
+    training, which is a real limitation and not a reason to put a wizard in
+    front of someone who opened the app to read a ledger.
+    """
+    try:
+        if models.setup_needed():
+            return ("setup", *registry.defaults())
+    except Exception:  # noqa: BLE001 - never the reason a workspace will not open
+        log.debug("could not decide the opening arrangement", exc_info=True)
+    return registry.defaults()
 
 
 def save_layout(project: str | None, value: layout_mod.Layout) -> None:
@@ -94,6 +115,8 @@ def save_layout(project: str | None, value: layout_mod.Layout) -> None:
 # `chat` is absent on purpose: its state is the live SDK session, not a file, so
 # it redraws from its own stream rather than from the poll.
 MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
+    "setup": lambda w: models.setup_model(),
+    "projects": lambda w: models.projects_model(),
     "notebook": lambda w: models.notebook_model(),
     "ledger": lambda w: models.ledger_model(),
     "quota": lambda w: models.quota_model(),
@@ -533,21 +556,129 @@ class Workspace:
         self.reload()
         self.say(f"workspace: {chosen}")
 
-    async def create_project(self, project_id: str, title: str) -> None:
+    async def create_project(
+        self,
+        project_id: str,
+        title: str,
+        *,
+        ceilings: dict[str, str] | None = None,
+        payer: str = "",
+    ) -> None:
         """Create a project and select it, by running the same command the agent
-        would (§10) -- so it lands in the same ledger and reads back the same."""
-        payload = await run_tool(
-            "tools.budget", "new", "--id", project_id, "--title", title, "--use", "--json"
-        )
+        would (§10) -- so it lands in the same ledger and reads back the same.
+
+        The ceilings go in *here*, on `budget new`, and not as a raise
+        afterwards. A raise appends a `project_budget_raised` event carrying a
+        `previous` value, so setting the first ceiling through one would record
+        that a project's GPU allowance moved from nothing to $50 -- which is not
+        what happened, and the history is the reason that module is append-only
+        at all. Creating with them is one record saying what the project was
+        allowed from the start.
+
+        This is also the fix for the hole the old form left: it created with no
+        ceilings and put "set them below once it is selected" in a caption. A
+        project with no ceilings bounds nothing and every gate that reads one
+        passes silently.
+        """
+        argv = ["tools.budget", "new", "--id", project_id, "--title", title, "--use"]
+        for flag, value in (ceilings or {}).items():
+            if (value or "").strip():
+                argv += [f"--{flag}", str(value).strip()]
+        if (payer or "").strip():
+            argv += ["--payer", payer.strip()]
+        payload = await run_tool(*argv, "--json")
         self.say(envelope_message(payload))
-        if payload.get("ok"):
-            self.reload()
+        if not payload.get("ok"):
+            return
+        self.reload()
+        # The machine half, and only when there is something in it left to
+        # answer. A wizard that opened on every project creation would ask a user
+        # with six projects for their Claude token six times; one that never
+        # opens leaves a fresh install with a project it cannot run.
+        try:
+            if models.setup_needed():
+                self.open("setup")
+                self.say("no credentials yet — setup is open beside it")
+        except Exception:  # noqa: BLE001 - never the reason a create is reported as failed
+            log.debug("could not decide whether to open setup", exc_info=True)
 
     async def use_project(self, project_id: str) -> None:
         payload = await run_tool("tools.budget", "use", project_id, "--json")
         self.say(envelope_message(payload))
         if payload.get("ok"):
             self.reload()
+
+    async def configure_project(
+        self,
+        project_id: str,
+        *,
+        role: str = "",
+        model: str = "",
+        backend: str = "",
+    ) -> None:
+        """Set or clear one of this project's overrides.
+
+        An empty `model` for a named role clears it, which is what the ✕ beside
+        each role sends -- `--clear` rather than an empty value, because an
+        override stored as empty resolves as falsy everywhere and is therefore
+        present, wrong and invisible.
+
+        The rebuild this may need is not done here. `Session.apply_model` does it
+        lazily, immediately before the next turn, for the reason `apply_effort`
+        is lazy: dropping and respawning the SDK subprocess is seconds, and
+        paying it at the click would make idly comparing two projects cost more
+        than using either.
+        """
+        argv = ["tools.budget", "configure", "--project", project_id]
+        if role and model:
+            argv += [f"--{role}", model]
+        elif role:
+            argv += ["--clear", role]
+        if backend:
+            argv += ["--backend", backend]
+        if len(argv) == 4:
+            self.say("nothing to change — pick a model or a backend")
+            return
+        await self.run_and_reload(*argv, "--json")
+
+    # -- setup ---------------------------------------------------------------
+    # Every one of these runs the same command a terminal would (§10), so the
+    # window cannot grow a second way to write a setting. They reload rather
+    # than invalidate: a model role or a host changes what `config.load()`
+    # answers, and that is read by every window and by the agent's own tools.
+    async def set_model(self, role: str, model: str) -> None:
+        if not (model or "").strip():
+            self.say("no model given — paste an id or pick one of the buttons")
+            return
+        await self.run_and_reload("tools.setup", "models", f"--{role}", model.strip(), "--json")
+
+    async def clear_model(self, role: str) -> None:
+        await self.run_and_reload("tools.setup", "models", "--clear", role, "--json")
+
+    async def set_backend(self, name: str) -> None:
+        await self.run_and_reload("tools.setup", "backend", "--default", name, "--json")
+
+    async def add_host(self, name: str, hostname: str, user: str, rate: str) -> None:
+        if not name or not hostname:
+            self.say("a host needs a name and a hostname")
+            return
+        await self.run_and_reload(
+            "tools.setup", "host", "add",
+            "--name", name,
+            "--hostname", hostname,
+            "--user", user,
+            "--rate", rate or "0",
+            "--json",
+        )
+
+    async def remove_host(self, name: str) -> None:
+        await self.run_and_reload("tools.setup", "host", "remove", "--name", name, "--json")
+
+    async def set_kaggle_account(self, username: str) -> None:
+        if not (username or "").strip():
+            self.say("no username given")
+            return
+        await self.run_and_reload("tools.kaggle", "account", "--set", username.strip(), "--json")
 
     async def run_and_reload(self, *argv: str) -> None:
         """Run a CLI, report it, and re-read everything derived from it.
@@ -563,6 +694,15 @@ class Workspace:
 
     def workspaces(self) -> dict[str, Any]:
         return models.workspaces_model()
+
+    def projects(self) -> dict[str, Any]:
+        """A fresh read for the `project ▾` switcher.
+
+        Not `model("projects")`: that is the poll's cached copy, and the window
+        it feeds may not even be open. A menu is redrawn on open precisely
+        because what it lists changes because of what it does.
+        """
+        return models.projects_model()
 
     def update(self) -> dict[str, Any]:
         return models.update_model()

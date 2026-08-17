@@ -179,10 +179,16 @@ Then authenticate against the subscription, not the API:
 claude setup-token
 ```
 
-Export the result as `CLAUDE_CODE_OAUTH_TOKEN` and make sure `ANTHROPIC_API_KEY`
-is **not** set — it outranks the OAuth token in the credential chain and will
-silently bill the Developer Platform instead. `python agent.py --check` removes
-it from the process environment and reports what it removed.
+Export the result as `CLAUDE_CODE_OAUTH_TOKEN`, **or** store it as
+`claude_oauth_token` below and skip the export — the two are equivalent for the
+agent's own loop, and the stored copy is the one that works from the desktop
+shortcut, which inherits whatever Explorer had and usually that is nothing. An
+exported token wins over a stored one, so a terminal that set one deliberately
+keeps it. `python agent.py --check` reports which of the two it is using.
+
+Make sure `ANTHROPIC_API_KEY` is **not** set — it outranks the OAuth token in
+the credential chain and will silently bill the Developer Platform instead.
+`--check` removes it from the process environment and reports what it removed.
 
 Store credentials once; they never enter the agent's environment:
 
@@ -219,12 +225,19 @@ directory rather than in `config/grad.toml`: that file is hand-annotated and
 reformat it and drop every comment in it. `[kaggle] username` is still read as a
 fallback, and `account` says when a stored selection is shadowing one.
 
-Or store them from the app: the workspace menu (`project ▾`) has a credentials
-panel, which is the same command with `--stdin` instead of the `getpass` prompt.
-That exists because the prompt needs a terminal, and needing one for this was
-the only thing that forced a shell open beside the app on a fresh machine. The
-value goes down a pipe rather than in an argument — an argv is visible to
-anything that can list processes.
+Or store them from the app, which is the shorter route: the **setup** window
+asks for the subscription token first, then which model runs which role, then
+which backends this machine can reach — and it is the same commands underneath,
+with `--stdin` instead of the `getpass` prompt. That prompt needs a terminal, and
+needing one for this was the only thing that forced a shell open beside the app
+on a fresh machine. The value goes down a pipe rather than in an argument — an
+argv is visible to anything that can list processes.
+
+A workspace that has never been arranged and has no subscription token opens on
+that window, because the four windows it would otherwise open are four windows
+that cannot do anything. Nothing else forces it: an unconfigured backend means
+no remote training, which is a real limitation and not a reason to put a wizard
+in front of someone who opened the app to read a ledger.
 
 ## Update
 
@@ -687,7 +700,8 @@ that carry the literal next command.
 | `tools/kaggle.py` | the same verbs on Kaggle's free GPU/TPU, plus `account` / `quota` / `accelerators` |
 | `tools/ledger.py` | `expect` / `query` / `verdict` / `falsify` / `abandon` / `verify` / `reindex` |
 | `tools/quota.py` | measured token and credit usage, summarised by stage, role, and project |
-| `tools/budget.py` | projects and their ceilings: `new` / `use` / `status` / `raise` / `close` |
+| `tools/budget.py` | projects, their ceilings and their own models: `new` / `use` / `status` / `raise` / `configure` / `close` |
+| `tools/setup.py` | the writable half of the configuration: `show` / `models` / `backend` / `host` / `check` |
 | `tools/docs.py` | is this library call current? introspection first, then Context7 |
 | `tools/evolve.py` | evolutionary search as a budgeted campaign, over our own operator |
 | `tools/task.py` | run a CLI in the background: `start` / `list` / `status` / `output` / `wait` / `stop` |
@@ -790,7 +804,8 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   traces.py           a session as tags a later query can slice on  -- pure, tested
   submission.py       the resolved submission and its hash
   gates.py            the submit gates and the smoke carve-out
-  budget.py           the project dimension and its three ceilings
+  budget.py           the project dimension, its ceilings and its own models
+  settings.py         the writable overlay: what setup may change, and what it shadows
   kaggle_quota.py     the weekly accelerator allowance, folded like rolling spend
   ledger_store.py     event-folded runs, rolling spend, staleness, derived index
   submit.py           shared submitter machinery: record, collect, deviations

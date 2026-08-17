@@ -145,6 +145,12 @@ class Session:
         #: change means a new client. Recorded here so `apply_effort` can tell a
         #: real change from a click that landed on the level already running.
         self.client_effort: str | None = None
+        #: The `research` model the live client was *built* with, for the same
+        #: reason and with the same consequence. A project may override it
+        #: (`core/budget.py:configure`), so switching to one that does while a
+        #: session is live would otherwise leave the previous model answering --
+        #: silently, and while the projects window shows the new one.
+        self.client_model: str | None = None
         #: Held across `start` and `close`, so one can never run inside the
         #: other. The SDK's `connect` is not safe against a concurrent
         #: `disconnect`: disconnect nulls the client's transport while connect
@@ -176,6 +182,7 @@ class Session:
             # does not leave this claiming a level nothing is running at -- which
             # would have `apply_effort` decide there was nothing to rebuild.
             self.client_effort = effort.current(cfg)
+            self.client_model = cfg.model_for("research")
 
     # -- named sessions -----------------------------------------------------
     def adopt(self) -> None:
@@ -301,6 +308,7 @@ class Session:
         # and reopened at a different level would compare the new selection
         # against the old client's and decide no rebuild was needed.
         self.client_effort = None
+        self.client_model = None
         # The reading belongs to the client that answered it. Keeping it across a
         # close would leave the meter reporting the context of a conversation
         # that no longer exists -- and every path that drops a client (a session
@@ -360,6 +368,11 @@ class Session:
             # client and doing that under a turn is what `_stop_turn` exists to
             # clean up after.
             await self.apply_effort()
+            # And the model, which a project switch can have changed underneath
+            # this session since the last turn. Both are lazy for the same
+            # reason: a rebuild is seconds, and doing it at the click would make
+            # idly switching between two projects cost more than using either.
+            await self.apply_model()
             await self.start()
         except Exception:
             self.busy = False
@@ -624,6 +637,36 @@ class Session:
             # turn.
             log.info("effort change deferred: no sdk session id to resume yet")
             return False
+        await self.close()
+        await self.start()
+        return True
+
+    async def apply_model(self) -> bool:
+        """Rebuild the client if the `research` model is not the one it is
+        running. `apply_effort`'s sibling, and every line of its reasoning
+        applies unchanged.
+
+        What makes it necessary is Stage 5: a project may override `research`
+        (`core/budget.py:configure`), and switching project is a thing that
+        happens *while a session is live*. Without this the previous model goes
+        on answering while the projects window and the ledger both say
+        otherwise -- which is the worst shape for it, because every surface
+        agrees on a claim that is false.
+
+        Deliberately not folded into `apply_effort`. The two are checked
+        together at the same call site, but a rebuild that could have been
+        caused by either is a rebuild whose reason cannot be logged, and the log
+        line is what makes a mysterious reconnect explicable.
+        """
+        if self.client is None:
+            return False
+        chosen = config_mod.load().model_for("research")
+        if chosen == self.client_model:
+            return False
+        if self.sdk_session_id is None:
+            log.info("model change deferred: no sdk session id to resume yet")
+            return False
+        log.info("rebuilding the client: %s -> %s", self.client_model, chosen)
         await self.close()
         await self.start()
         return True

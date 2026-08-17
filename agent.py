@@ -211,15 +211,30 @@ def preflight_environment() -> dict[str, Any]:
     ANTHROPIC_API_KEY outranks CLAUDE_CODE_OAUTH_TOKEN in the credential chain,
     so a stray export silently bills the Developer Platform instead of the
     subscription. It is removed here rather than warned about.
+
+    Then the complement, and the order between the two is the point: the scrub
+    takes out what must not be there, and `hydrate_environment` supplies the one
+    thing that must -- the subscription token, from the credential store, for
+    the app that was launched from a shortcut and never saw an `export`. Both
+    entry points reach this function (`run_session` and `ui/app.py`'s client
+    start), which is why the bridge belongs here rather than in either one.
     """
     from core import budget  # noqa: PLC0415
 
     removed = credentials.scrub_environment()
+    # Read before hydrating, so the report can distinguish a token someone
+    # exported from one this just fetched. They authenticate identically; they
+    # are very different answers to "why is it using that account?".
+    ambient = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    hydrated = credentials.hydrate_environment()
     cfg = config_mod.load()
     project_id = budget.current_project()
     return {
         "removed_env": removed,
         "oauth_token_present": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+        "oauth_token_source": (
+            "environment" if ambient else ("credential store" if hydrated else "absent")
+        ),
         "workspace": str(paths.root()),
         "models": cfg.models(),
         # Read from ledger/.current_project, not from the environment -- the

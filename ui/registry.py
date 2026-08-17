@@ -1,9 +1,9 @@
 """The window registry: the one list the whole shell is derived from.
 
 The `⋯` menu, the persisted layout's validation and the status bar's count all
-read this tuple. Adding a thirteenth window is adding one `WindowSpec` and one
-module -- if it is ever more than that, something has grown a second list and
-the two will drift.
+read this tuple. Adding a window is adding one `WindowSpec` and one module -- if
+it is ever more than that, something has grown a second list and the two will
+drift.
 
 `module` is resolved with `importlib` at first render rather than imported here,
 for the reason the rest of the app imports lazily: `ui.registry` has to stay
@@ -37,6 +37,8 @@ class WindowSpec:
 
 
 WINDOWS: tuple[WindowSpec, ...] = (
+    WindowSpec("setup", "setup", "ui.windows.setup", "token, models, backends — what this machine is wired to"),
+    WindowSpec("projects", "projects", "ui.windows.projects", "what the research is divided into, and what bounds it"),
     WindowSpec("chat", "chat", "ui.windows.chat", "the agent session", default=True, persistent=True),
     WindowSpec("notebook", "notebook", "ui.windows.notebook", "JupyterLab, and the verify banner", default=True, persistent=True),
     WindowSpec("ledger", "ledger", "ui.windows.ledger", "expectations against outcomes", default=True),

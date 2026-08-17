@@ -212,6 +212,62 @@ def cmd_raise(args: argparse.Namespace) -> dict[str, Any]:
     return {"raised": record, "status": budget.status(project_id)}
 
 
+def _configure_args(p: argparse.ArgumentParser) -> None:
+    _project_arg(p)
+    from core import config as config_mod, settings as settings_mod
+
+    for role in config_mod.MODEL_ROLES:
+        p.add_argument(
+            f"--{role}",
+            metavar="MODEL",
+            help=f"the model this project uses for the {role} role",
+        )
+    p.add_argument(
+        "--clear",
+        action="append",
+        default=[],
+        metavar="ROLE",
+        help="drop this project's override, so the role resolves as the workspace's does",
+    )
+    p.add_argument(
+        "--backend",
+        choices=settings_mod.BACKENDS,
+        help="the backend this project reaches for when nothing more specific applies",
+    )
+    p.add_argument("--reason", default="", help="why. it ages badly without one")
+
+
+@cli.command("configure", "what this project overrides about how it is run", setup=_configure_args)
+def cmd_configure(args: argparse.Namespace) -> dict[str, Any]:
+    """A project's own models, as a logged event.
+
+    The model chosen per role is the main lever on both cost and quality, and it
+    is exactly the thing that should differ between a cheap exploratory project
+    and one being written up. It is recorded rather than set, because the model a
+    candidate was mutated by is part of what produced the numbers in the ledger
+    beside it.
+    """
+    from core import config as config_mod
+
+    project_id = budget.resolve_or_fail(args.project, what="configure")
+    models: dict[str, str | None] = {
+        role: getattr(args, role) for role in config_mod.MODEL_ROLES if getattr(args, role, None)
+    }
+    for role in args.clear:
+        models[role] = None
+    record = budget.configure(
+        project_id, models=models, backend=args.backend, reason=args.reason
+    )
+    return {
+        "configured": record,
+        "overrides": budget.project_overrides(project_id),
+        # What the project actually resolves to now, across every layer. The
+        # override alone does not answer "which model will this use", and that is
+        # the question anyone runs this command to settle.
+        "models": config_mod.load(reload=True).models(),
+    }
+
+
 @cli.command(
     "close",
     "close a project (its records stay; nothing is deleted)",

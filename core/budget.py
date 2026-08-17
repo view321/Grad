@@ -42,6 +42,15 @@ from core.errors import EXIT_PROJECT_BUDGET, GateRefusal, NotFound, UsageError
 T_PROJECT = "project"
 T_PROJECT_RAISED = "project_budget_raised"
 T_PROJECT_CLOSED = "project_closed"
+#: A project choosing its own models, or the backend it reaches for.
+#:
+#: An event rather than a field, for the same reason a raise is one: the model a
+#: campaign ran under is part of what produced its numbers, and "which model was
+#: this project on in March" is a question the ledger should be able to answer
+#: rather than one that only the current value can be guessed from. It also
+#: means changing a model is recorded beside the ceiling changes, in one
+#: append-only file, in order.
+T_PROJECT_CONFIGURED = "project_configured"
 
 # Records that predate the dimension fold as this, per §23 item 6: specified as
 # left alone rather than retrofitted, and cheap to change while the ledger is
@@ -160,6 +169,11 @@ def projects() -> dict[str, dict[str, Any]]:
                 "budget": dict(rec.get("budget") or {}),
                 "status": rec.get("status", "open"),
                 "raises": [],
+                # What this project overrides about how it is run. Empty is the
+                # common case and means "whatever the workspace says".
+                "models": {},
+                "backend": None,
+                "configured": [],
             }
         elif pid in folded and kind == T_PROJECT_RAISED:
             node = folded[pid]
@@ -167,6 +181,27 @@ def projects() -> dict[str, dict[str, Any]]:
                 node["budget"][resource] = value
             node["raises"].append(
                 {"at": rec.get("at"), "budget": rec.get("budget"), "reason": rec.get("reason")}
+            )
+        elif pid in folded and kind == T_PROJECT_CONFIGURED:
+            node = folded[pid]
+            # `None` clears rather than sets. Folding it as a value would leave a
+            # role overridden to nothing, which resolves as falsy everywhere and
+            # is therefore an override that is present, wrong and invisible --
+            # `settings.clear_models` refuses the same shape for the same reason.
+            for role, value in (rec.get("models") or {}).items():
+                if value is None:
+                    node["models"].pop(role, None)
+                else:
+                    node["models"][role] = str(value)
+            if "backend" in rec:
+                node["backend"] = rec["backend"]
+            node["configured"].append(
+                {
+                    "at": rec.get("at"),
+                    "models": rec.get("models"),
+                    "backend": rec.get("backend"),
+                    "reason": rec.get("reason"),
+                }
             )
         elif pid in folded and kind == T_PROJECT_CLOSED:
             folded[pid]["status"] = "closed"
@@ -260,6 +295,102 @@ def raise_ceiling(project_id: str, *, budget: dict[str, float], reason: str = ""
     }
     jsonl.append(projects_path(), record)
     return record
+
+
+def configure(
+    project_id: str,
+    *,
+    models: dict[str, str | None] | None = None,
+    backend: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Record what this project overrides about how it is run.
+
+    Appends, like `raise_ceiling`, and for a stronger reason than tidiness: the
+    model a candidate was mutated by is part of what produced the numbers in the
+    ledger beside it. A field that could be edited in place would let a project's
+    history claim it had always been on the model it is on today.
+
+    `None` for a role clears it. The vocabulary is checked here rather than
+    trusted from the caller, because an unknown role stored in the ledger is a
+    setting nothing will ever read and nothing will ever mention again.
+    """
+    from core import config as config_mod, settings as settings_mod  # noqa: PLC0415
+
+    project(project_id)  # refuses an unknown id before anything is appended
+    changed = dict(models or {})
+    unknown = [r for r in changed if r not in config_mod.MODEL_ROLES]
+    if unknown:
+        raise UsageError(
+            f"unknown model role(s): {', '.join(sorted(unknown))}",
+            fix=f"roles are: {', '.join(config_mod.MODEL_ROLES)}",
+        )
+    for role, value in changed.items():
+        if value is not None and not str(value).strip():
+            raise UsageError(
+                f"model for role {role!r} is empty",
+                fix=f"pass a model id, or clear the override for {role}",
+            )
+    if backend is not None and backend not in settings_mod.BACKENDS:
+        raise UsageError(
+            f"unknown backend {backend!r}",
+            fix=f"backends are: {', '.join(settings_mod.BACKENDS)}",
+        )
+    if not changed and backend is None:
+        raise UsageError(
+            "nothing to configure",
+            fix="pass a model for a role, or a backend",
+        )
+    record: dict[str, Any] = {
+        "type": T_PROJECT_CONFIGURED,
+        "id": project_id,
+        "at": now_iso(),
+        "models": {r: (None if v is None else str(v).strip()) for r, v in changed.items()},
+        "reason": reason,
+    }
+    if backend is not None:
+        record["backend"] = backend
+    jsonl.append(projects_path(), record)
+    return record
+
+
+def project_overrides(project_id: str | None) -> dict[str, Any]:
+    """What one project overrides, or empty. Never raises.
+
+    Read on the config path, so an unknown id, an unreadable ledger or no
+    selection at all has to mean "nothing overridden" rather than an exception
+    from inside `config.load()` -- which every surface in the app calls, most of
+    them while rendering.
+    """
+    if not project_id:
+        return {"models": {}, "backend": None}
+    try:
+        found = projects().get(project_id)
+    except Exception:  # noqa: BLE001 - see the docstring
+        return {"models": {}, "backend": None}
+    if not found:
+        return {"models": {}, "backend": None}
+    return {
+        "models": dict(found.get("models") or {}),
+        "backend": found.get("backend"),
+    }
+
+
+def selection_stamp() -> tuple[int, int]:
+    """A cheap marker for "the project layer may have changed".
+
+    `core/config.py` folds this into its cache key: which project is selected,
+    and whether the ledger that project's overrides live in has been written.
+    Two `stat` calls, and they are what make `budget configure` in a child
+    process visible to a parent that has already loaded a `Config`.
+    """
+    out = []
+    for path in (current_project_path(), projects_path()):
+        try:
+            out.append(path.stat().st_mtime_ns)
+        except OSError:
+            out.append(0)
+    return (out[0], out[1])
 
 
 def close(project_id: str) -> dict[str, Any]:

@@ -82,9 +82,20 @@ def attr(value: Any) -> str:
     has no reason to complain. That matters because these values are not all
     constants: a preflight remedy and a lineage bar's candidate id are ledger
     text, and ledger text can hold a quote. Newlines go for the same reason.
+
+    **And the backslash, which is worse than the quote.** NiceGUI parses a props
+    string and hands each value to `ast.literal_eval`, so the text is read as a
+    Python string literal and a backslash is an escape character in it. On
+    Windows that is not a curiosity: `C:\\Users\\...` in a tooltip contains `\\U`,
+    which begins a unicode escape, and `literal_eval` raises a SyntaxError from
+    inside `element.props()` -- taking down not the tooltip but whatever was
+    being built. It surfaced the first time a control put a *path* in a tooltip,
+    which is to say the first time the appbar had to say which folder this is.
     """
     collapsed = " ".join(str("" if value is None else value).split())
-    return collapsed.replace('"', "'")
+    # Backslashes first: doing it after the quote swap would also escape the
+    # apostrophes this puts in.
+    return collapsed.replace("\\", "\\\\").replace('"', "'")
 
 
 def el(tag: str, classes: str = "", *, style: str = "") -> Any:
@@ -360,6 +371,90 @@ def menu(draw: Callable[[Any, Any], None], *, width: int = 460) -> Menu:
     with ui.dialog() as dialog, el("div", "grad-app"):
         body = el("div", "grad-card", style=f"background: var(--grad-paper); min-width: {width}px")
     return Menu(dialog, lambda m: draw(body, m))
+
+
+def steps(
+    items: Sequence[dict[str, Any]],
+    active: str,
+    on_pick: Callable[[str], Any],
+) -> Any:
+    """A row of numbered steps, each one a way back to itself.
+
+    Not a wizard that marches forward: every step stays reachable, because a
+    setup that has to be restarted to change the answer to question two is a
+    setup people abandon at question three. The mark is the step's state -- a
+    tick when it is satisfied, its number when it is not -- so "what is left"
+    is answerable without opening anything.
+
+    `items` are `setup_model`'s steps; each needs `id`, `caption`, `ready`.
+    """
+    with el("div", "grad-steps") as element:
+        for index, item in enumerate(items, start=1):
+            current = item["id"] == active
+            classes = "grad-step" + (" open" if current else "")
+            step = el("button", classes)
+            step.props(f'title="{attr(item.get("hint", ""))}"')
+            step.on("click", lambda _=None, sid=item["id"]: on_pick(sid))
+            with step:
+                text("✓" if item.get("ready") else str(index), "mark", tag="span")
+                text(item["caption"], "name", tag="span")
+                text(item.get("detail", ""), "hint", tag="span")
+    return element
+
+
+class Confirm:
+    """A yes/no dialog, built once and reused for every question.
+
+    Built during the page and only *opened* later, for `_install_quit_guard`'s
+    reason: a NiceGUI element belongs to the client whose slot context created
+    it, and the handler that wants to ask is running long after that context has
+    gone. So the shell constructs one of these while there is a client, and the
+    control that needs an answer awaits `ask`.
+
+    It exists because exactly one control in the app is destructive enough to
+    need it. Switching *project* changes what spend is charged to; switching
+    *workspace folder* replaces the ledger, the project list, the notebooks and
+    the config under every open window at once. Those two sat six rows apart in
+    one dialog, styled identically, and the difference was discoverable only by
+    doing it.
+    """
+
+    def __init__(self, dialog: Any, card: Any) -> None:
+        self._dialog = dialog
+        self._card = card
+
+    async def ask(
+        self,
+        title: str,
+        body: str,
+        *,
+        confirm: str = "CONTINUE",
+        cancel: str = "CANCEL",
+        tone: str = "danger",
+        note_text: str = "",
+    ) -> bool:
+        self._card.clear()
+        with self._card:
+            text(title, "grad-label")
+            text(body)
+            if note_text:
+                note(note_text)
+            with row("", gap=9):
+                button(cancel, tone="primary", on_click=lambda: self._dialog.submit(False))
+                button(confirm, tone=tone, on_click=lambda: self._dialog.submit(True))
+        self._dialog.open()
+        return bool(await self._dialog)
+
+
+def confirm() -> Confirm:
+    """A `Confirm` over the app's own paper. Call this during the page build."""
+    ui = _ui()
+    dialog = ui.dialog().props("persistent")
+    with dialog, el("div", "grad-app"):
+        card = column("grad-pad", gap=9).style(
+            "background: var(--grad-paper); border: var(--grad-border); min-width: 440px"
+        )
+    return Confirm(dialog, card)
 
 
 def menu_row(
