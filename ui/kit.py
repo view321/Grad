@@ -128,8 +128,46 @@ def label(value: Any, classes: str = "") -> Any:
     return text(value, f"grad-label {classes}".strip())
 
 
+def sublabel(value: Any, classes: str = "") -> Any:
+    """A 10px lowercase mono name for something *inside* a component.
+
+    `label` shouts, which is right over a section of a window and wrong on the
+    word `output` repeated once per tool call down a transcript. Kept as a
+    separate primitive rather than a flag on `label` so the choice is visible at
+    the call site.
+    """
+    return text(value, f"grad-sublabel {classes}".strip())
+
+
 def caption(value: Any, classes: str = "") -> Any:
     return text(value, f"grad-caption {classes}".strip())
+
+
+def shorten_path(value: str, *, keep: int = 2) -> str:
+    """A path with its leading directories dropped, for a head that must fit.
+
+    `C:\\Users\\vovas\\Grad\\projects\\proj-marl-agents\\MEMO.md` in a 410px pane
+    is `C:\\Users\\vovas\\Grad\\projects\\proj-marl-…` once CSS has ellipsised it,
+    which is every character except the informative ones. CSS can only truncate
+    at the end, and for a path the end is the answer -- so the trimming has to
+    happen here, where the separators are still legible as separators.
+
+    Not applied to everything: a tool subject is a path for `Edit` and a *command*
+    for `Bash`, and a command's first words are the informative ones. Whitespace
+    is the test rather than the tool name, because it is a property of the string
+    rather than of a caller's table -- `export PYTHONIOENCODING=utf-8; python -m
+    pytest` keeps its head, `./scripts/run.sh` loses a leading `./` nobody reads.
+
+    The full value belongs in a `title=` beside the call to this; nothing here
+    should be the only place a path was written down.
+    """
+    if not value or any(c.isspace() for c in value):
+        return value
+    separator = "\\" if value.count("\\") >= value.count("/") else "/"
+    parts = [p for p in value.split(separator) if p]
+    if len(parts) <= keep:
+        return value
+    return "…" + separator + separator.join(parts[-keep:])
 
 
 def mono(value: Any, classes: str = "") -> Any:
@@ -269,12 +307,26 @@ def empty(message: str, fix: str | None = None) -> Any:
     with el("div", "grad-pad") as element:
         text(message, "grad-empty")
         if fix:
-            pre(fix)
+            # A command you are meant to run is a command you are meant to read.
+            pre(fix, wrap=True)
     return element
 
 
-def pre(value: Any, tone: str = "neutral") -> Any:
-    return text(value, f"grad-pre {_tone_class(tone)}".strip(), tag="pre")
+def pre(value: Any, tone: str = "neutral", *, wrap: bool = False) -> Any:
+    """A bordered mono block. `wrap` for prose-shaped machine text.
+
+    Off by default because the default content is *aligned*: a table, a diff, a
+    dataframe, a traceback with an indent that means something. Mono is assigned
+    by the handoff to "anything the machine produced or that must align", and
+    wrapping the second kind at the pane edge destroys the reason it is monospaced.
+
+    On for the other kind -- a shell command, a URL, a one-line fix -- where the
+    alternative is a horizontal scrollbar inside a card inside a scrolling pane,
+    to read a line that was already there. Passed at the call site rather than
+    inferred, because only the caller knows which kind it has.
+    """
+    classes = f"grad-pre {_tone_class(tone)} {'wrap' if wrap else ''}"
+    return text(value, " ".join(classes.split()), tag="pre")
 
 
 def error_strip(message: str | None) -> None:

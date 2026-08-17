@@ -222,6 +222,77 @@ def test_a_windows_path_in_a_tooltip_does_not_raise_out_of_props(rendered):
     assert "switch folder" in element.props["title"]
 
 
+def test_a_path_in_a_card_head_keeps_the_end_that_identifies_it():
+    """CSS truncates at the end, and for a path the end is the answer.
+
+    A call card's subject in a 410px pane was
+    `C:\\Users\\vovas\\Grad\\projects\\proj-marl-…` -- every character except the
+    informative ones. The full value goes in the tooltip beside the call.
+    """
+    from ui import kit
+
+    assert (
+        kit.shorten_path(r"C:\Users\vovas\Grad\projects\proj-marl-agents\MEMO.md")
+        == r"…\proj-marl-agents\MEMO.md"
+    )
+    assert kit.shorten_path("/home/v/grad/notes/funnel/q.json") == "…/funnel/q.json"
+
+
+def test_a_command_keeps_its_head_because_that_is_where_the_verb_is():
+    """The same field holds a path for `Edit` and a command for `Bash`, and the
+    two want opposite ends kept. Whitespace decides, which is a property of the
+    string rather than of a caller's table of tool names."""
+    from ui import kit
+
+    command = "export PYTHONIOENCODING=utf-8; python -m pytest tests/test_slate.py"
+    assert kit.shorten_path(command) == command
+    # Nothing to shorten, and nothing invented.
+    assert kit.shorten_path("MEMO.md") == "MEMO.md"
+    assert kit.shorten_path("") == ""
+
+
+def test_a_funnel_stage_draws_its_fill_at_the_width_of_its_count(rendered, workspace):
+    """The other half of `test_the_funnel_bars_are_the_counts_and_not_a_silhouette`.
+
+    That one holds the model honest; this one holds the *element* honest, because
+    a width the renderer never applies is the same lie by a different route -- and
+    the label is a sibling of the fill rather than its content precisely so a stage
+    that kept 4% still says which stage it was.
+    """
+    import json
+
+    from core import paths
+
+    directory = paths.notes_dir() / "funnel"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "q.json").write_text(
+        json.dumps(
+            {
+                "question": "does depth help at fixed compute?",
+                "stages": {
+                    "1_retrieve": {"candidates": 400, "corpus_chunks": 12483},
+                    "2_rerank": {"out": 50},
+                    "3_triage": {"returned": 15},
+                },
+                "survivors": [{"id": "a", "title": "A", "rerank_score": 0.9}],
+                "dropped": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client, _ = rendered(["funnel"])
+    stages = [e for e in client.elements.values() if "grad-stage" in getattr(e, "classes", [])]
+    fills = [e for e in client.elements.values() if "fill" in getattr(e, "classes", [])]
+
+    assert len(stages) == 4
+    # The corpus row is the frame, not a bar, so three fills for four rows.
+    assert [f.style.get("width") for f in fills] == ["100.00%", "12.50%", "3.75%"]
+    assert not [s for s in stages if "rerank" in s.classes or "context" in s.classes], (
+        "a funnel stage is not a state and may not wear a state accent"
+    )
+
+
 def test_a_handle_sits_between_every_pair_of_columns(rendered):
     client, space = rendered(["chat", "ledger", "quota"])
     handles = [e for e in client.elements.values() if "grad-handle" in getattr(e, "classes", [])]

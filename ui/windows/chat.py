@@ -842,7 +842,10 @@ def _tool_card(block: dict[str, Any]) -> dict[str, Any]:
             if block.get("name"):
                 kit.text(block["name"], "", tag="span")
             if block.get("title"):
-                kit.text(block["title"], "subject", tag="span")
+                # Shortened for the head, whole in the tooltip -- see `_call` in
+                # ui/windows/tasks.py, which shows the same subject.
+                subject = kit.text(kit.shorten_path(block["title"]), "subject", tag="span")
+                subject.props(f'title="{kit.attr(block["title"])}"')
             kit.spacer()
             state = kit.el("span", "state")
         with kit.el("div", "body"):
@@ -882,7 +885,7 @@ def _paint_output(handles: dict[str, Any], block: dict[str, Any]) -> None:
     handles["output"].clear()
     if result:
         with handles["output"]:
-            kit.text("OUTPUT", "grad-label")
+            kit.sublabel("output")
             kit.pre(result, "broken" if block.get("status") == "error" else "neutral")
     handles["result"] = block.get("result")
 

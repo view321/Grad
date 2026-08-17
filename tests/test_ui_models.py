@@ -423,12 +423,47 @@ def _trace(workspace, name="q", **extra):
     (directory / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_the_funnel_bars_narrow_stage_by_stage(workspace):
+def test_the_funnel_bars_are_the_counts_and_not_a_silhouette(workspace):
+    """They were the literals 1.0, 0.82, 0.64 and 0.46: the same four bars whether
+    a stage kept everything or nothing, in the window that exists to show which.
+
+    Scaled to the 400 candidates the first stage retrieved rather than to the
+    12,000 chunks in the index -- both are honest denominators and only one is
+    legible, since against the corpus every bar below the first is a fraction of a
+    pixel wide.
+    """
     _trace(workspace)
+    trace = models.funnel_model()["trace"]
+    bars = trace["bars"]
+    assert bars[0]["label"].startswith("CORPUS · 12000")
+    # The index is the frame around the measurement, not a stage inside it.
+    assert bars[0]["width"] is None
+    assert [b["width"] for b in bars[1:]] == [1.0, 50 / 400, 15 / 400]
+    assert [b["share"] for b in bars[1:]] == ["", "13%", "4%"]
+    # A proportion whose base is unnamed is a decoration again.
+    assert "400 candidates" in trace["scale"]
+
+
+def test_a_stage_that_kept_nothing_draws_no_bar(workspace):
+    """The screenshot that prompted this showed three stages reading `-> 0` at
+    decorative width. Zero is the count this window is opened to look at."""
+    _trace(workspace, stages={
+        "1_retrieve": {"candidates": 400, "corpus_chunks": 12000},
+        "2_rerank": {"out": 0},
+        "3_triage": {"returned": 0},
+    }, survivors=[])
     bars = models.funnel_model()["trace"]["bars"]
-    assert [b["label"] for b in bars][0].startswith("CORPUS · 12000")
-    assert [b["width"] for b in bars] == sorted((b["width"] for b in bars), reverse=True)
-    assert bars[-1]["tone"] == "context"
+    assert bars[2]["width"] is None and bars[2]["tone"] == "empty"
+    # And the last stage is the failure rather than a quiet grey row: nothing
+    # reached the model.
+    assert bars[3]["tone"] == "broken"
+
+
+def test_retrieving_nothing_leaves_no_scale_to_draw_against(workspace):
+    _trace(workspace, stages={"1_retrieve": {"candidates": 0}}, survivors=[])
+    trace = models.funnel_model()["trace"]
+    assert [b["width"] for b in trace["bars"]] == [None, None, None, None]
+    assert "no scale" in trace["scale"]
 
 
 def test_dropped_chunks_survive_with_their_reason(workspace):

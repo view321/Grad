@@ -68,6 +68,26 @@ STATE_ACCENT: dict[str, str] = {
     "neutral": COLOUR["ink"],
 }
 
+# Chart series colours, which are emphatically *not* states.
+#
+# The rule above governs one axis and left the other unguarded. A spend segment,
+# a lineage generation and a funnel stage each answer "which one is this", not
+# "how is this going" -- and the only fills in the palette were the state
+# accents, so the charts borrowed them. The result was `attention` meaning five
+# things at once (the brand mark, a primary action, an open-window count, chat
+# spend, a new best candidate) and `verified` meaning two (a passing check, and
+# GPU spend). A colour that means everything means nothing, which is the whole
+# reason the accent rule exists in the first place.
+#
+# None of these three are chromatic accents, so a chart can be read as a chart
+# and a yellow fill can go back to meaning "this needs you".
+# `test_ui_tokens.py` holds the two mappings disjoint.
+SERIES: dict[str, str] = {
+    "base": COLOUR["ink"],
+    "alt": COLOUR["muted"],
+    "third": COLOUR["link"],
+}
+
 # ---------------------------------------------------------------------------
 # type
 # ---------------------------------------------------------------------------
@@ -110,6 +130,7 @@ BLINK = "gradblink 1.1s steps(1) infinite"
 def css_variables() -> str:
     """`:root` block. Everything else in the stylesheet reads from here."""
     lines = [f"    --grad-{name}: {value};" for name, value in COLOUR.items()]
+    lines += [f"    --grad-series-{name}: {value};" for name, value in SERIES.items()]
     lines += [
         f"    --grad-font-sans: {FONT_SANS};",
         f"    --grad-font-mono: {FONT_MONO};",
@@ -192,6 +213,16 @@ html, body { height: 100%; overflow: hidden; }
 .grad-label {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
     text-transform: uppercase; letter-spacing: 0.14em;
+}
+/* The label's quiet sibling, for a name *inside* a component rather than over a
+   section of one. All-caps letterspaced mono is a spice: it earns its shout on
+   `CHAT` and `SURVIVORS, IN RANK ORDER`, and spends it on the word `output`
+   repeated once per tool call down a transcript. Lowercase mono at half ink
+   reads calmer and, for machine chrome, more honestly -- a terminal does not
+   shout the word `stdout` at you either. */
+.grad-sublabel {
+    font-family: var(--grad-font-mono); font-size: 10px; font-weight: 400;
+    letter-spacing: 0.06em; opacity: 0.5;
 }
 .grad-caption { font-family: var(--grad-font-mono); font-size: 10px; letter-spacing: 0.08em; }
 .grad-blink { animation: gradblink 1.1s steps(1) infinite; }
@@ -321,9 +352,14 @@ def _shell() -> str:
     height: 30px; flex: 0 0 auto; border-top: var(--grad-border);
 }
 .grad-statusbar .dim { opacity: 0.55; }
+/* How many windows are open. Outlined rather than filled: a count is not a
+   state, and this one was wearing `attention` -- the colour that means "this
+   needs you" -- to report a number that needs nothing. Inverting it to a paper
+   fill would have been no quieter (paper is *brighter* than the yellow it
+   replaced, 0.89 relative luminance against 0.69); what makes it recede is
+   dropping the fill, and with it the hue's claim on the eye. */
 .grad-statusbar .count {
-    background: var(--grad-attention); color: var(--grad-ink);
-    padding: 2px 7px; font-weight: 700;
+    border: 1.5px solid var(--grad-paper); padding: 1px 6px; font-weight: 700;
 }
 """
 
@@ -486,6 +522,9 @@ def _controls() -> str:
 }
 .grad-pre.broken { background: var(--grad-broken-tint); border-color: var(--grad-broken);
                    color: var(--grad-broken-ink); }
+/* See `kit.pre`. A command or a URL has no columns to keep, so it wraps rather
+   than growing the scrollbar that made a one-line fix into a two-axis gesture. */
+.grad-pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
 .grad-hr { height: 0; border: 0; border-top: var(--grad-secondary); margin: 12px 0; }
 """
 
@@ -493,15 +532,24 @@ def _controls() -> str:
 def _data() -> str:
     """Bars, tables, stripes -- the shapes the ten data windows share."""
     return """
+/* Segmented meters. Every segment here names a *kind of spend* -- chat against
+   tools, sonnet against opus against GPU -- so all of them draw from `SERIES`
+   and none from the state accents. `broken` is the exception and the proof: a
+   resource over its ceiling is a state, and it is the only fill in a meter that
+   still gets an accent.
+
+   `muted` carries ink text rather than paper: at 0.24 relative luminance it is
+   5.5:1 against ink and 3.2:1 against paper, and the segment labels are 10px. */
 .grad-bar { display: flex; border: 2px solid var(--grad-ink); background: var(--grad-paper-raised);
             height: 22px; overflow: hidden; }
 .grad-bar .seg { display: flex; align-items: center; justify-content: center;
                  font-family: var(--grad-font-mono); font-size: 10px; font-weight: 700;
                  overflow: hidden; white-space: nowrap; }
-.grad-bar .seg.chat { background: var(--grad-attention); color: var(--grad-ink); }
-.grad-bar .seg.tool { background: var(--grad-verified); color: var(--grad-verified-ink); }
-.grad-bar .seg.ink  { background: var(--grad-ink); color: var(--grad-paper); }
-.grad-bar .seg.opus { background: var(--grad-link); color: #fff; }
+.grad-bar .seg.base { background: var(--grad-series-base); color: var(--grad-paper); }
+.grad-bar .seg.chat { background: var(--grad-series-base); color: var(--grad-paper); }
+.grad-bar .seg.tool { background: var(--grad-series-alt); color: var(--grad-ink); }
+.grad-bar .seg.opus { background: var(--grad-series-third); color: #fff; }
+.grad-bar .seg.broken { background: var(--grad-broken); color: #fff; }
 .grad-bar.thin { height: 12px; border-width: 1.5px; }
 
 .grad-table { width: 100%; border-collapse: collapse; font-family: var(--grad-font-mono);
@@ -554,22 +602,67 @@ def _data() -> str:
                     font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.6;
                     margin-top: 3px; }
 
-/* Funnel: stage bars, progressively indented and narrowed. */
+/* Funnel: a stage per row, each a full-width track holding a fill whose length
+   is the count.
+ *
+ * It was four bars at hardcoded widths -- 1.0, 0.82, 0.64, 0.46 -- indented to
+ * suggest a funnel. A decorative bar chart is a strange thing to put in the one
+ * window whose docstring calls itself "the debugging surface for retrieval": it
+ * drew the same shape whether a stage kept everything or nothing, and the
+ * screenshot that prompted this showed three stages reading `-> 0` at
+ * full width.
+ *
+ * The track is drawn rather than implied, because the empty part of it is the
+ * information the window exists for: what this stage threw away. So the funnel
+ * still narrows down the rows, but the silhouette is now the data and the gap to
+ * the right of each fill is the loss.
+ *
+ * The label sits *over* the fill instead of inside it. A fill can be a few
+ * pixels wide -- 15 chunks against 300 candidates is 5% -- and a label inside it
+ * would be clipped at exactly the moment it matters most. That is what rules the
+ * fill out of the accents and into a 30% ink wash: over `paper-raised` it
+ * resolves to about #B6B6B1, which carries ink text at 9.6:1, so one label
+ * style reads across the boundary at any width.
+ *
+ * A stage is `absolute` inside a `relative` track and both label spans are
+ * `relative`, so DOM order alone paints them above the fill. */
 .grad-stage { height: 34px; border: var(--grad-border); display: flex; align-items: center;
               padding: 0 11px; font-family: var(--grad-font-mono); font-size: 11px;
               font-weight: 700; letter-spacing: 0.08em; margin-bottom: 6px;
-              background: var(--grad-paper-sunk); text-transform: uppercase; }
-.grad-stage.rerank { background: var(--grad-attention); }
-.grad-stage.context { background: var(--grad-verified); color: var(--grad-verified-ink); }
+              background: var(--grad-paper-raised); text-transform: uppercase;
+              position: relative; overflow: hidden; }
+.grad-stage .fill { position: absolute; left: 0; top: 0; bottom: 0;
+                    background: var(--grad-rule-mid); }
+.grad-stage .name { position: relative; min-width: 0; overflow: hidden;
+                    white-space: nowrap; text-overflow: ellipsis; }
+.grad-stage .share { position: relative; margin-left: auto; padding-left: 9px;
+                     opacity: 0.55; letter-spacing: 0; flex: 0 0 auto; }
+/* The corpus is the index the funnel drew from, not a stage it passed through --
+   there is no survival rate to draw for it. Sunk paper marks it as the frame
+   around the measurement rather than a bar in it. */
+.grad-stage.corpus { background: var(--grad-paper-sunk); }
+/* Nothing came out of this stage. No fill, because zero is zero, and dimmed
+   because a stage that ran and returned nothing is not the row you should be
+   reading first. */
+.grad-stage.empty { opacity: 0.45; }
+/* Except when it is the last one. "Nothing reached the context" is the failure
+   this whole window is opened to look at, and a grey row is the wrong way to
+   report it. */
+.grad-stage.broken { background: var(--grad-broken-tint); border-color: var(--grad-broken);
+                     color: var(--grad-broken-ink); opacity: 1; }
 .grad-dropped { opacity: 0.45; }
 
-/* Evolve lineage bars. */
+/* Evolve lineage bars. Ordinary generation, then a new best, then the current
+   champion: an *ordinal* distinction rather than three categories, so it reads
+   as one ramp getting darker -- sunk paper, `muted`, ink -- instead of as two
+   borrowed accents. Yellow said "this needs you" of a generation that needs
+   nothing, and teal said "verified" of a champion nothing has verified. */
 .grad-lineage { display: flex; align-items: flex-end; gap: 4px; height: 190px;
                 padding: 10px 0; }
 .grad-lineage .bar { flex: 1 1 0; border: 1.5px solid var(--grad-ink);
                      background: var(--grad-paper-sunk); min-width: 6px; }
-.grad-lineage .bar.best { background: var(--grad-attention); }
-.grad-lineage .bar.champion { background: var(--grad-verified); }
+.grad-lineage .bar.best { background: var(--grad-series-alt); }
+.grad-lineage .bar.champion { background: var(--grad-series-base); }
 
 /* Unified diff. */
 .grad-diff { font-family: var(--grad-font-mono); font-size: 12px; line-height: 1.65;
@@ -689,10 +782,63 @@ def _chat() -> str:
                                    white-space: nowrap; text-overflow: ellipsis; }
 .grad-card.tool > .head .state { flex: 0 0 auto; }
 /* Output is clipped by `agent.clip` at capture, but a 40-line result is still
-   taller than the card should be in a transcript you are scrolling. */
-.grad-card.tool > .body .grad-pre { max-height: 240px; overflow: auto; }
+   taller than the card should be in a transcript you are scrolling.
+ *
+ * Borderless, and on sunk paper instead. The card already carries a 2px ink rule
+ * and the head above it is a solid ink bar; a third bordered rectangle inside
+ * that costs a run of high-frequency edges to say something the background shift
+ * says on its own. Edge density is most of what makes a dense UI feel busy, and
+ * a transcript is a column of these.
+ *
+ * **Wrapped, and this is the half that removes an interaction rather than a
+ * line.** `.grad-pre` is `white-space: pre; overflow: auto`, so every call whose
+ * output ran past the pane -- which is most of them, in a 410px column -- grew a
+ * chunky horizontal scrollbar *inside* a card inside a scrolling transcript.
+ * Three nested scroll axes to read a log line is the worst interaction in the
+ * window, and the line was already there.
+ *
+ * Scoped to the tool card on purpose. `.grad-pre` elsewhere holds notebook
+ * output, tables and the shell command an empty state tells you to run, and the
+ * handoff gives mono to "anything the machine produced *or that must align*":
+ * wrapping a 200-column dataframe at the pane edge destroys the alignment that
+ * is the reason it is monospaced. Here the content is log lines, where a wrapped
+ * line is strictly better than a clipped one. `overflow-wrap: anywhere` is for
+ * the case the wrap cannot help with -- one unbroken 300-character path or
+ * base64 blob, which would otherwise still force the scrollbar. */
+.grad-card.tool > .body .grad-pre {
+    max-height: 240px; overflow-x: hidden; overflow-y: auto;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    border: 0; background: var(--grad-paper-sunk);
+}
+/* The exception, and the reason the rule above is not simply "no borders in
+   cards": a failed call is the one you opened the window for. It keeps its
+   frame while the twenty successful ones above it lose theirs. */
+.grad-card.tool > .body .grad-pre.broken {
+    border: 1.5px solid var(--grad-broken); background: var(--grad-broken-tint);
+}
 .grad-card.tool > .body .out { margin-top: 9px; }
-.grad-card.tool > .body .out .grad-label { opacity: 0.5; margin-bottom: 4px; }
+.grad-card.tool > .body .out .grad-sublabel { display: block; margin-bottom: 4px; }
+/* A task's tail is one `pre` *per line*, so it is a stack of blocks rather than
+   one block of lines. The 11px each carried was box padding when each had a
+   border; with the borders gone it is 22px of gap between consecutive log lines.
+   Tightened to the same 1px/9px the diff rows use, which is what a run of
+   adjacent rows wants. `.broken` keeps its frame, so a stderr line still stands
+   out of the stdout around it. */
+.grad-card.tool > .body .tail .grad-pre { padding: 1px 9px; }
+.grad-card.tool > .body .tail .grad-pre.broken { padding: 1px 8px; }
+/* `OK` is the boring outcome, so it is the quietest mark on the card.
+ *
+ * It was a filled `verified` chip -- correct as a state, wrong as a *frequency*.
+ * Every settled call carries one, so a column of twenty of them glowed harder
+ * than the single crimson `FAILED` that is the only row anybody is scanning for.
+ * Outlined here and filled nowhere else: `.grad-chip.ok` still means passing on
+ * a preflight row or a verify banner, where it appears once and answers the
+ * question the pane was opened to ask. Paper rather than ink, because the chip
+ * sits on the card's ink head. */
+.grad-card.tool > .head .grad-chip.ok {
+    background: transparent; color: var(--grad-paper);
+    border: 1.5px solid var(--grad-paper); opacity: 0.7;
+}
 
 /* The agent statusline: always on screen, and the switch for the reasoning
    below it. The strip it replaced was `.grad-streaming`, which appeared only
@@ -818,9 +964,18 @@ def _chat() -> str:
 }
 .grad-mention { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.55; }
 
-/* Which conversation this is, and the opener for the rest of them. */
+/* Which conversation this is, and the opener for the rest of them.
+ *
+ * A session is named after the first thing asked in it, so this button holds a
+ * sentence somebody wrote -- and it is built by `kit.button`, which means it
+ * arrived carrying `.grad-btn`'s `text-transform: uppercase` and 0.08em tracking.
+ * Those belong to buttons that hold *commands*: `SEND`, `STOP`, `+ NEW`. Applied
+ * to prose they shout it and cost it legibility at the same time, which the
+ * truncated `I WANT TO MAKE AN AGENTIC SYSTEM THAT U…` demonstrated in one line.
+ * Both are undone here rather than in `.grad-btn`, where they are right. */
 .grad-session-btn {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
+    text-transform: none; letter-spacing: 0;
     border: 1.5px solid var(--grad-ink); padding: 5px 9px;
     max-width: 320px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }

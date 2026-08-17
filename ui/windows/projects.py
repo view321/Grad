@@ -165,7 +165,7 @@ def _ceilings(workspace: Any, row: dict[str, Any]) -> None:
                 kit.text(ceiling["label"], "grad-caption", tag="span").style("flex: 1 1 auto")
             else:
                 kit.bar(
-                    [(ceiling["fraction"] or 0.0, "broken" if ceiling["over"] else "ink", "")]
+                    [(ceiling["fraction"] or 0.0, "broken" if ceiling["over"] else "base", "")]
                 ).style("flex: 1 1 auto")
                 kit.text(ceiling["label"], "grad-mono", tag="span")
 

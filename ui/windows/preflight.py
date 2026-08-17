@@ -76,7 +76,7 @@ def _row(workspace: Any, row: dict[str, Any]) -> None:
                 if row.get("output"):
                     kit.pre(str(row["output"])[-3000:], "broken")
                 if row.get("fix"):
-                    kit.pre(row["fix"])
+                    kit.pre(row["fix"], wrap=True)
 
 
 def _footer(workspace: Any, model: dict[str, Any]) -> None:

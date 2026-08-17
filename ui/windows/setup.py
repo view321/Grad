@@ -118,7 +118,7 @@ def _token(workspace: Any, model: dict[str, Any]) -> None:
         kit.text("mint one in a terminal, then paste the result:", "grad-caption").style(
             "margin-top: 10px"
         )
-        kit.pre(token["mint"])
+        kit.pre(token["mint"], wrap=True)
 
         with kit.row("", gap=6).style("margin-top: 8px"):
             value = (

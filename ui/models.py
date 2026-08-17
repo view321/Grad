@@ -1701,9 +1701,11 @@ def quota_model(*, days: int = 1) -> dict[str, Any]:
                 "credits_usd": node.get("credits_usd", 0.0),
                 "tokens": node.get("input_tokens", 0) + node.get("output_tokens", 0),
                 "calls": node.get("calls", 0),
-                # sonnet reads ink, opus reads link, anything gpu-ish reads
-                # teal: three bars that are never the same colour as a state.
-                "tone": "opus" if "opus" in role.lower() else ("tool" if "gpu" in role.lower() else "ink"),
+                # Three series colours, from `tokens.SERIES`. The intent here was
+                # already "never the same colour as a state" -- but `tool` was
+                # wired to `verified`, so GPU spend was drawn in the colour that
+                # means "passing" everywhere else in the app.
+                "tone": "opus" if "opus" in role.lower() else ("tool" if "gpu" in role.lower() else "base"),
             }
         )
 
@@ -1862,6 +1864,75 @@ def funnel_traces() -> list[str]:
     return sorted((p.stem for p in directory.glob("*.json")), reverse=True)
 
 
+def _funnel_bars(
+    corpus: int | None, retrieved: int, reranked: int, kept: int
+) -> tuple[list[dict[str, Any]], str]:
+    """The stage bars, with lengths that are the counts.
+
+    They used to be the literals 1.0, 0.82, 0.64 and 0.46 -- a funnel silhouette
+    drawn regardless of what the funnel did, in the window whose whole job is
+    showing what the funnel did. Retrieval that dropped everything at stage 2 and
+    retrieval that sailed through drew the same four bars.
+
+    **Scaled against the first retrieval stage, not against the corpus.** Both are
+    honest denominators and only one is legible: a local index is 10^4 chunks
+    against 15 in context, so sharing the corpus's scale puts every bar below the
+    first one under half a pixel. What the reader wants from the shape is how much
+    each stage threw away relative to what retrieval had to work with, and the
+    corpus is the *index*, not something the funnel passed through -- so it gets a
+    row that names it and no bar. `scale` states the denominator underneath, since
+    a proportion whose base is unnamed is a decoration again.
+
+    Zero is the case worth being careful with, because it is the case this window
+    is opened for. A stage that returned nothing gets no fill at all rather than a
+    hairline -- and if the *last* stage returned nothing, that is not a quiet grey
+    row, it is the failure: nothing reached the model. `retrieved == 0` leaves
+    every proportion undefined, and undefined is drawn as absent.
+    """
+    base = max(0, int(retrieved or 0))
+
+    def bar(
+        label: str, count: int, *, last: bool = False, reference: bool = False
+    ) -> dict[str, Any]:
+        width = min(1.0, count / base) if base and count > 0 else None
+        tone = "" if count > 0 else "empty"
+        if last and count <= 0:
+            tone = "broken"
+        share = ""
+        if width is not None and not reference:
+            # Half-up rather than `:.0f`, which rounds half to even and would
+            # report 12.5% as 12; and `<1%` rather than `0%`, because a stage that
+            # kept three chunks out of a thousand kept something and a bar this
+            # short is the one place the number has to carry the meaning.
+            percent = int(width * 100 + 0.5)
+            share = f"{percent}%" if percent else "<1%"
+        return {
+            "label": label,
+            "tone": tone,
+            "width": width,
+            # The stage that *is* the denominator does not report its own 100%.
+            "share": share,
+        }
+
+    bars = [
+        {
+            "label": f"CORPUS · {corpus if corpus is not None else '?'} CHUNKS",
+            "tone": "corpus",
+            "width": None,
+            "share": "",
+        },
+        bar(f"BM25 + EMBED → {retrieved}", base, reference=True),
+        bar(f"RERANK → {reranked}", max(0, int(reranked or 0))),
+        bar(f"IN CONTEXT {kept}", max(0, int(kept or 0)), last=True),
+    ]
+    scale = (
+        f"bar lengths are share of the {base:,} candidates the first stage retrieved"
+        if base
+        else "no candidates retrieved — there is no scale to draw against"
+    )
+    return bars, scale
+
+
 def funnel_model(name: str | None = None) -> dict[str, Any]:
     """The four stage bars, the survivors in rank order, and what was dropped.
 
@@ -1888,12 +1959,7 @@ def funnel_model(name: str | None = None) -> dict[str, Any]:
     survivors = trace.get("survivors") or []
     kept = stages.get("3_triage", {}).get("returned", len(survivors))
 
-    bars = [
-        {"label": f"CORPUS · {corpus if corpus is not None else '?'} CHUNKS", "tone": "corpus", "width": 1.0},
-        {"label": f"BM25 + EMBED → {retrieved}", "tone": "corpus", "width": 0.82},
-        {"label": f"RERANK → {reranked}", "tone": "rerank", "width": 0.64},
-        {"label": f"IN CONTEXT {kept}", "tone": "context", "width": 0.46},
-    ]
+    bars, scale = _funnel_bars(corpus, retrieved, reranked, kept)
     dropped = [
         {
             "title": d.get("title") or d.get("id"),
@@ -1908,6 +1974,7 @@ def funnel_model(name: str | None = None) -> dict[str, Any]:
             "name": name,
             "question": trace.get("question", ""),
             "bars": bars,
+            "scale": scale,
             "survivors": [
                 {
                     "rank": i + 1,
