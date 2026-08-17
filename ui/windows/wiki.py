@@ -22,12 +22,29 @@ from __future__ import annotations
 
 from typing import Any
 
-from ui import kit
+from ui import kit, tasks as tasks_mod
 from ui.tasks import start, task_message
 
 #: The rail's label per page kind. The generated titles are long and specific --
 #: `minimamba/model.py` -- so the kind is what makes the list scannable.
 KIND_LABEL = {"overview": "OVERVIEW", "run-path": "RUN PATH", "module": "MODULE"}
+
+
+def _building(project: str | None) -> bool:
+    """Is a wiki build for this project already running?
+
+    Off the task registry rather than a flag on the window: a window is rebuilt
+    whenever its model changes and its subtree is rebuilt on every retile, so a
+    flag held here would be a flag that resets under a background poll. The
+    registry is process-wide and outlives both.
+    """
+    if not project:
+        return False
+    return any(
+        task.argv[:2] == ("tools.projwiki", "build") and "--project" in task.argv
+        and task.argv[task.argv.index("--project") + 1] == project
+        for task in tasks_mod.running()
+    )
 
 
 def subtitle(workspace: Any) -> str:
@@ -65,12 +82,25 @@ def render(workspace: Any) -> None:
         workspace.invalidate("wiki")
         workspace.tick()
 
+    building = _building(model.get("project"))
+
     def build(*, prose: bool = True) -> None:
         """A background task, always. Nine pages is nine model calls, and the
-        rest of the workspace has no reason to wait for them."""
+        rest of the workspace has no reason to wait for them.
+
+        One at a time per project. Two builds racing write the same `pages.json`
+        and `manifest.json`, so the loser's pages are lost -- and they are lost
+        *after* being paid for, which is the part that matters when a page is a
+        model call. The buttons are disabled while one runs; this is the second
+        check, because the poll that disables them is up to two seconds behind
+        the click that starts one.
+        """
         project = model.get("project")
         if not project:
             workspace.say("select a project first — a wiki is written about one")
+            return
+        if _building(project):
+            workspace.say(f"a wiki build for {project} is already running — see the tasks window")
             return
         argv = ["tools.projwiki", "build", "--project", project, "--json"]
         if not prose:
@@ -88,10 +118,16 @@ def render(workspace: Any) -> None:
         if model.get("project"):
             with kit.pad():
                 with kit.row("", gap=9):
-                    kit.button("▶ BUILD", tone="primary", on_click=lambda: build())
+                    kit.button(
+                        "BUILDING…" if building else "▶ BUILD",
+                        tone="primary",
+                        disabled=building,
+                        on_click=lambda: build(),
+                    )
                     kit.button(
                         "FACTS ONLY",
                         tone="neutral",
+                        disabled=building,
                         title="extract the tree, the spec, the symbols and the ledger without calling a model",
                         on_click=lambda: build(prose=False),
                     )
@@ -106,7 +142,7 @@ def render(workspace: Any) -> None:
 
     with kit.row("grad-split", gap=0, align="stretch").style("min-height: 0; flex: 1 1 auto"):
         with kit.column("main grad-pad", gap=10):
-            _header(workspace, model, build)
+            _header(model, build, building)
             if model.get("stale"):
                 _stale(model)
             _page(model.get("page"))
@@ -121,12 +157,19 @@ def render(workspace: Any) -> None:
         _rail(workspace, model)
 
 
-def _header(workspace: Any, model: dict[str, Any], build: Any) -> None:
+def _header(model: dict[str, Any], build: Any, building: bool) -> None:
     with kit.row("", gap=9).style("flex-wrap: wrap"):
-        kit.button("↻ REBUILD", tone="primary", on_click=lambda: build())
+        kit.button(
+            "BUILDING…" if building else "↻ REBUILD",
+            tone="primary",
+            disabled=building,
+            title="a build for this project is already running" if building else "",
+            on_click=lambda: build(),
+        )
         kit.button(
             "FACTS ONLY",
             tone="neutral",
+            disabled=building,
             title="re-extract without calling a model",
             on_click=lambda: build(prose=False),
         )

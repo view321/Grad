@@ -156,8 +156,16 @@ def _scope_paths(root: Path) -> list[str]:
     present = [str(root / name) for name in SCOPE if (root / name).is_dir()]
     if not present:
         raise ConfigError(
-            f"none of {', '.join(SCOPE)} exist under {root}",
-            fix="run this from the workspace root",
+            f"none of {', '.join(SCOPE)} exist under {root}, which is where Grad is installed",
+            # Not "run this from the workspace root" -- that was the advice while
+            # the scope was resolved against `paths.root()`, and following it now
+            # cannot help: this maps the *installation*, and an installation
+            # missing `core/` is one to repair rather than a command to re-run
+            # from somewhere else.
+            fix=(
+                "reinstall or repair the installation at that path "
+                "(pip install -e . from a checkout), then run this again"
+            ),
         )
     return present
 

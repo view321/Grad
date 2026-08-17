@@ -89,15 +89,77 @@ def test_a_404_from_the_cli_reads_as_missing_not_unknown(workspace, monkeypatch)
     assert kaggle_tool._status(config_mod.load(), "u/k")["status"] == kaggle_tool.MISSING
 
 
-def test_an_unreachable_kaggle_stays_unknown(workspace, monkeypatch):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "connection timed out after 120s",
+        # The ones that make a bare `"not found"` substring unsafe. A DNS
+        # failure is the network being down -- exactly the case that must stay
+        # unknown -- and it says "not found" in several of its wordings.
+        "host not found: www.kaggle.com",
+        "Name or service not found",
+        "socket.gaierror: [Errno -2] Name or service not found",
+        "ssl: certificate verify failed",
+        "403 - Forbidden",
+        # A *file* that is missing says nothing about the kernel.
+        "kaggle.json not found in ~/.kaggle",
+    ],
+)
+def test_an_unreachable_kaggle_stays_unknown(workspace, monkeypatch, message):
+    """`unknown` is a refusal and `missing` is a write-off, so the cost of
+    confusing them is asymmetric: a missed deletion is one more command to
+    type, and a false 404 hands a live kernel's hours back to the weekly pool
+    while it is still burning them."""
     def boom(argv, cfg, timeout=None):
-        raise GradError("kaggle_failed", "connection timed out after 120s", exit_code=8)
+        raise GradError("kaggle_failed", message, exit_code=8)
 
     monkeypatch.setattr(kaggle_tool, "_executable", lambda: "kaggle")
     monkeypatch.setattr(kaggle_tool, "_run", boom)
     from core import config as config_mod
 
     assert kaggle_tool._status(config_mod.load(), "u/k")["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "404 - Not Found: kernels/status",
+        "ApiException: (404)\nReason: Not Found",
+        "kernel someone/grad-run not found",
+        "The kernel was not found on Kaggle",
+        "could not find kernel someone/grad-run",
+        "no such kernel",
+        "that kernel no longer exists",
+    ],
+)
+def test_the_wordings_kaggle_actually_uses_read_as_missing(workspace, monkeypatch, message):
+    def boom(argv, cfg, timeout=None):
+        raise GradError("kaggle_failed", message, exit_code=8)
+
+    monkeypatch.setattr(kaggle_tool, "_executable", lambda: "kaggle")
+    monkeypatch.setattr(kaggle_tool, "_run", boom)
+    from core import config as config_mod
+
+    assert kaggle_tool._status(config_mod.load(), "u/k")["status"] == kaggle_tool.MISSING
+
+
+def test_a_404_past_the_truncated_message_is_still_seen(workspace, monkeypatch):
+    """`_run` cuts the CLI's output at 400 characters for the message and keeps
+    2000 in `detail`, so a 404 printed under a stack trace is only in the
+    second one."""
+    def boom(argv, cfg, timeout=None):
+        raise GradError(
+            "kaggle_failed",
+            "kaggle kernels failed (exit 1): " + "Traceback…" * 40,
+            exit_code=8,
+            detail={"output": "Traceback…" * 40 + "\nApiException: (404) Reason: Not Found"},
+        )
+
+    monkeypatch.setattr(kaggle_tool, "_executable", lambda: "kaggle")
+    monkeypatch.setattr(kaggle_tool, "_run", boom)
+    from core import config as config_mod
+
+    assert kaggle_tool._status(config_mod.load(), "u/k")["status"] == kaggle_tool.MISSING
 
 
 def test_a_real_error_status_is_not_mistaken_for_a_missing_kernel(workspace, monkeypatch):
@@ -306,7 +368,28 @@ def test_collect_names_forget_instead_of_saying_still_running(workspace, monkeyp
     assert "kaggle forget" in (exc.value.fix or "")
 
 
-def test_a_wake_on_a_forgotten_run_does_not_go_on_polling_it(workspace):
+def test_a_wake_on_a_forgotten_run_reports_it_as_stopped(workspace, monkeypatch):
+    """A wake armed on a run that has since been written off must fire rather
+    than keep polling: the ledger already knows the run is over, and the point
+    of the wake is to tell the agent so."""
     from core import wakeups
 
-    assert "forgotten" in wakeups.TERMINAL_RUN_STATUSES
+    run_id = submitted()
+    _status_is(monkeypatch, {"status": kaggle_tool.MISSING, "message": "404"})
+    kaggle_tool.cmd_forget(_args(run_id))
+
+    fired, detail = wakeups._check_run(run_id)
+    assert fired is True
+    assert detail.get("status") == "forgotten"
+
+
+def test_a_kernel_kaggle_has_no_record_of_settles_a_wake(workspace):
+    """The other half: before `forget` is run, the wake asks the backend. A
+    `missing` kernel is settled -- it will not acquire a status by being polled
+    again -- so the wake fires and sends the agent to `collect`, which refuses
+    with `kernel_missing` and names `forget`."""
+    from core import wakeups
+
+    assert wakeups._remote_finished({"kernel": {"status": kaggle_tool.MISSING}}) is True
+    assert wakeups._remote_finished({"kernel": {"status": "running"}}) is False
+    assert wakeups._remote_finished({"kernel": {"status": "unknown"}}) is False

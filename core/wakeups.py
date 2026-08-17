@@ -107,9 +107,16 @@ POLL_MAX_S = 30.0
 #: Deliberately a fixed vocabulary rather than "anything that is not running":
 #: `tools/kaggle.py:_parse_status` returns `unknown` for output it cannot read,
 #: and treating unknown as finished is how you collect a kernel mid-run.
+#:
+#: `MISSING` is here on the same argument in reverse: `tools/kaggle.py` infers
+#: it from a confirmed 404, so it is the opposite of "we could not read this" --
+#: a kernel Kaggle has no record of will not acquire one by being polled again,
+#: and a wake left armed on it would poll until its own deadline. Firing sends
+#: the agent to `collect`, which refuses with `kernel_missing` and names
+#: `forget`, which is exactly where that run needs to go.
 TERMINAL_REMOTE = {
     "COMPLETE", "COMPLETED", "DONE", "ERROR", "FAILED", "CANCELED", "CANCELLED",
-    "KILLED", "CANCELACKNOWLEDGED",
+    "KILLED", "CANCELACKNOWLEDGED", "MISSING",
 }
 
 #: Which CLI answers `status` for a run, per `platform`. The sibling of

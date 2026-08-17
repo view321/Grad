@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
-from core import paths
+from core import ledger_store as ls_mod, paths
 
 # What "recent" means in the windows that cap their own lists. Deliberately
 # generous: these are ledgers, not feeds.
@@ -1938,11 +1938,12 @@ QUEUE_STATE_ACCENT = {
     "DONE": "neutral",
     "FAILED": "broken",
     "QUEUED": "neutral",
-    # Neither done nor failed: nothing ran. Its own chip because "DONE" beside a
-    # run that produced no result is the one reading that sends someone looking
-    # for metrics that do not exist, and dashed because that is already what the
-    # rest of the design means by written off.
+    # Neither done nor failed: nothing ran. Their own chips because "DONE"
+    # beside a run that produced no result is the one reading that sends someone
+    # looking for metrics that do not exist, and dashed because that is already
+    # what the rest of the design means by written off.
     "ABANDONED": "dashed",
+    "FORGOTTEN": "dashed",
 }
 
 
@@ -1963,9 +1964,13 @@ QUEUED_STATUSES = ("queued", "submitted", "pending")
 #: one a reader of the queue actually wants: `abandoned` (`ledger abandon`) means
 #: the run never reached a backend, `forgotten` (`kaggle forget`) means it did
 #: and the platform no longer has any record of it.
-ABANDONED_STATUS = "abandoned"
-FORGOTTEN_STATUS = "forgotten"
-WRITTEN_OFF_STATUSES = (ABANDONED_STATUS, FORGOTTEN_STATUS)
+#:
+#: Read from `core/ledger_store.py` rather than spelled again here: the same
+#: vocabulary decides what `DONE.md` counts as established, and two copies of it
+#: is how a run ends up written off in one surface and finished in another.
+ABANDONED_STATUS = ls_mod.ABANDONED
+FORGOTTEN_STATUS = ls_mod.FORGOTTEN
+WRITTEN_OFF_STATUSES = ls_mod.WRITTEN_OFF_STATUSES
 
 
 def _queue_state(run: Any) -> tuple[str, str]:
@@ -2189,7 +2194,7 @@ def diff_lines(before: str, after: str, *, context: int = 3) -> list[dict[str, s
 # ---------------------------------------------------------------------------
 # 8. cited papers
 # ---------------------------------------------------------------------------
-def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
+def papers_model(*, filter_name: str | None = None) -> dict[str, Any]:
     """Papers on disk, annotated with what in the ledger depends on them.
 
     The status chips are the reason this window is not a file listing: "3 claims
@@ -2274,11 +2279,12 @@ def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
         "read": len([r for r in rows if r["read"]]),
         "queued": len([r for r in rows if not r["read"]]),
     }
-    # A chip the user never pressed is not a choice they made, so an empty
-    # default lands on a chip that has something behind it. An explicit
-    # selection is left alone even when it is empty -- pressing CITED and being
-    # moved to READ would be the window arguing with the click.
-    if filter_name not in FILTER_KEYS or (filter_name == "cited" and not counts["cited"]):
+    # A chip the user never pressed is not a choice they made, so `None` lands
+    # on one that has something behind it. An explicit selection is left alone
+    # **even when it is empty** -- pressing CITED and being moved to READ would
+    # be the window arguing with the click, and the caller passes `None` rather
+    # than a default precisely so the two can be told apart.
+    if filter_name not in FILTER_KEYS:
         filter_name = next((k for k in FILTER_KEYS if counts.get(k)), "cited")
 
     if filter_name == "cited":
@@ -2305,12 +2311,21 @@ FILTER_KEYS: tuple[str, ...] = ("cited", "read", "queued")
 
 
 def _corpus_stats() -> dict[str, Any]:
+    """The index's counts, plus one row per document.
+
+    `SELECT *`, not a column list. `corpus.connect` creates the schema with
+    `IF NOT EXISTS`, so a database built before a column was added never gains
+    it -- and naming `authors` on an index that predates it raises
+    `OperationalError: no such column`, which `_safe` would turn into "no titles
+    at all" for a reason that has nothing to do with titles. Every reader below
+    uses `.get`, so a row with fewer columns is a row with fewer answers.
+    """
     from core import corpus
 
     con = corpus.connect(create=False)
     try:
         stats = corpus.stats(con)
-        rows = con.execute("SELECT id, title, authors, year FROM documents").fetchall()
+        rows = con.execute("SELECT * FROM documents").fetchall()
         return {**stats, "documents": [dict(r) for r in rows]}
     finally:
         con.close()

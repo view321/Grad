@@ -343,7 +343,10 @@ def _first_party_imports(source: str, directory: Path) -> list[str]:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
-    local = {p.stem for p in directory.glob(SOURCE_GLOB)}
+    # `rglob`, matching `_modules`: a pipeline that puts anything in a
+    # subdirectory would otherwise have those modules listed as files and never
+    # as anyone's import, which draws a dependency graph with edges missing.
+    local = {p.stem for p in directory.rglob(SOURCE_GLOB) if not SKIP_DIRS & set(p.parts)}
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -532,7 +535,10 @@ def collect(project_id: str) -> dict[str, Any]:
     if not projects.exists(project_id):
         raise NotFound(
             f"no project {project_id!r} in this workspace",
-            fix="python -m tools.budget status --json   # the project ids that exist",
+            # `list`, not `status`: status answers "how is *this* project doing"
+            # and defaults to the selected one, which is no help to someone who
+            # has just been told the id they gave does not exist.
+            fix="python -m tools.budget list --json   # every project id in this workspace",
         )
     directory = projects.resolve_dir(project_id)
     state = projects.state(project_id)

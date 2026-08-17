@@ -252,6 +252,16 @@ def _check_agent(values: dict[str, Any]) -> dict[str, int]:
                 fix=f"settings are: {', '.join(sorted(AGENT_SETTINGS))}",
             )
         low, high = AGENT_SETTINGS[key]
+        # Before `float`, because `bool` is an `int` in Python and both survive
+        # the conversion: `True` became 1 and was refused for being under the
+        # floor -- a confusing message for a wrong *kind* -- while `False` became
+        # 0, which is the documented spelling of "off", so passing a boolean by
+        # mistake silently disabled compaction.
+        if isinstance(value, bool):
+            raise UsageError(
+                f"{key} must be a number of tokens, not {value!r}",
+                fix=f"a whole number between {int(low):,} and {int(high):,}, or 0 to disable",
+            )
         try:
             number = float(value)
         except (TypeError, ValueError):

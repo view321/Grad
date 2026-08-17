@@ -245,11 +245,22 @@ def cmd_context(args: argparse.Namespace) -> dict[str, Any]:
     from core import compaction  # noqa: PLC0415 - one reader, at point of use
 
     threshold = compaction.threshold(cfg)
+    # Three layers, named the way the setup window names them. "config" was
+    # reported for anything not in the overlay, which meant `--clear` on a
+    # machine whose `grad.toml` has no `[agent]` section answered "config" for a
+    # value that came from `DEFAULTS` -- pointing whoever read it at a file that
+    # does not mention the setting.
+    configured = (getattr(cfg, "user", None) or {}).get("agent", {}).get("compact_at_tokens")
+    low, high = settings.AGENT_SETTINGS["compact_at_tokens"]
     return {
         "compact_at_tokens": threshold,
         "enabled": bool(threshold),
-        "source": "setup" if "compact_at_tokens" in settings.agent() else "config",
+        "source": (
+            "setup" if "compact_at_tokens" in settings.agent()
+            else ("config" if configured is not None else "default")
+        ),
         "default": config_mod.DEFAULTS["agent"]["compact_at_tokens"],
+        "bounds": [int(low), int(high)],
         "shadowing": settings.shadowing(cfg),
         "note": (
             "the context window itself belongs to the model; this is where Grad compacts inside it"

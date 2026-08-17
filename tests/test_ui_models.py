@@ -492,6 +492,44 @@ def test_a_workspace_with_no_corpus_is_not_an_error(workspace):
     assert models.papers_model()["error"] is None
 
 
+def test_an_unpressed_filter_lands_on_one_with_rows(workspace):
+    """`cited` is zero until the first expectation is registered, so defaulting
+    to it opened this window on "Nothing matches cited" with every paper in the
+    workspace one unmotivated click away."""
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
+
+    model = models.papers_model(filter_name=None)
+    assert model["counts"] == {"cited": 0, "read": 1, "queued": 0}
+    assert model["filter"] == "read"
+    assert len(model["rows"]) == 1
+
+
+def test_a_filter_the_user_pressed_is_left_alone_even_when_empty(workspace):
+    """The other half, and the one that matters more: being moved to READ after
+    pressing CITED is the window arguing with the click. The builder passes
+    `None` rather than a default precisely so the two can be told apart."""
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
+
+    model = models.papers_model(filter_name="cited")
+    assert model["filter"] == "cited"
+    assert model["rows"] == []
+
+
+def test_the_window_asks_for_no_filter_until_one_is_chosen(workspace):
+    """The state builder has to pass `None`, not `"cited"` -- a default there
+    makes "nobody pressed a chip" and "someone pressed CITED" the same value."""
+    from ui import state as state_mod
+
+    class _Space:
+        selection: dict = {}
+
+    assert state_mod.MODEL_BUILDERS["papers"](_Space())["filter"] in models.FILTER_KEYS
+
+
 # ---------------------------------------------------------------------------
 # evolve
 # ---------------------------------------------------------------------------

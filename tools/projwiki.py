@@ -121,14 +121,12 @@ def cmd_build(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
 
     facts = projwiki.collect(project)
-    out = output_dir(project)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "facts.json").write_text(wikigen.as_json([facts]), encoding="utf-8")
-
-    planned = wikigen.plan(facts)
     if not facts["pipelines"]:
-        # An honest empty state rather than an overview page about nothing. A
-        # project whose code has not been written yet is a normal thing to find.
+        # Refused *before* anything is written. An honest empty state rather
+        # than an overview page about nothing -- a project whose code has not
+        # been written yet is a normal thing to find -- and leaving a facts.json
+        # behind for it would make `show --facts` answer for a wiki that the
+        # very same command had just refused to build.
         raise GradError(
             "no_pipeline",
             f"project {project!r} has no pipeline directory: nothing under pipelines/ shares "
@@ -137,6 +135,11 @@ def cmd_build(args: argparse.Namespace) -> dict[str, Any]:
             fix=f"mkdir {paths.root() / 'pipelines' / project}   # then write a spec.toml in it",
             detail={"project": project, "looked_in": str(paths.root() / "pipelines")},
         )
+
+    out = output_dir(project)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "facts.json").write_text(wikigen.as_json([facts]), encoding="utf-8")
+    planned = wikigen.plan(facts)
 
     existing = {p["id"]: p for p in (_read_pages(project) or [])}
     if args.page:
@@ -160,7 +163,17 @@ def cmd_build(args: argparse.Namespace) -> dict[str, Any]:
             pages.append(existing.get(page["id"], {**page, "sections": [], "summary": ""}))
             continue
         if args.no_prose:
-            pages.append({**page, "summary": "", "sections": [], "prose": False})
+            # Re-extracting the facts is not un-writing the prose. This wrote a
+            # blank page over every existing one, so the FACTS ONLY button sitting
+            # beside REBUILD in the wiki window threw away nine pages that had
+            # each cost a model call -- for a flag whose whole purpose is to be
+            # the free option.
+            kept = existing.get(page["id"])
+            pages.append(
+                {**page, **kept, "prose": False}
+                if kept and kept.get("sections")
+                else {**page, "summary": "", "sections": [], "prose": False}
+            )
             continue
         try:
             pages.append(wikigen.write_page(facts, page, model=model, log_name=log_name))
@@ -219,8 +232,19 @@ def _slug(page_id: str) -> str:
 
 
 def _read_pages(project_id: str) -> list[dict[str, Any]] | None:
+    """The written pages, or None.
+
+    Filtered rather than trusted. `read_json` returns whatever parses, and every
+    caller indexes `page["id"]` -- so a `pages.json` truncated mid-write, or one
+    a hand edit left as a list of strings, would raise `KeyError` or `TypeError`
+    out of a command whose job at that moment is to *rebuild* it. A page with no
+    usable id is a page nothing can address, so it is dropped and the rebuild
+    replaces it.
+    """
     record = jsonl.read_json(output_dir(project_id) / "pages.json")
-    return record if isinstance(record, list) else None
+    if not isinstance(record, list):
+        return None
+    return [p for p in record if isinstance(p, dict) and str(p.get("id") or "").strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +333,12 @@ def cmd_show(args: argparse.Namespace) -> dict[str, Any]:
         return {
             "project": project,
             "pages": [
-                {"id": p["id"], "kind": p["kind"], "title": p["title"], "summary": p.get("summary", "")}
+                {
+                    "id": p["id"],
+                    "kind": p.get("kind", "page"),
+                    "title": p.get("title") or p["id"],
+                    "summary": p.get("summary", ""),
+                }
                 for p in pages
             ],
         }

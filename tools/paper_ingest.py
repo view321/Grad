@@ -226,12 +226,17 @@ def _title_from(tex: str) -> str | None:
     then displayed, forever, because nothing re-reads a title. Counting braces
     is four lines and cannot get that wrong.
 
-    `\title` may also be preceded by `\newcommand` or appear inside a comment,
-    so the search skips commented lines rather than matching the first
-    occurrence in the file.
+    Two things that are not the document's title also look exactly like one, and
+    both occur in real preambles: a `\title{...}` sitting after a `%` on an
+    otherwise ordinary line, and the `\title` in `\newcommand\title[1]{...}`,
+    which is a *definition* of the command rather than a use of it. Comments are
+    stripped (respecting `\%`, which is a literal percent sign and not a
+    comment), and a match introduced by a command-defining macro is skipped.
     """
-    body = "\n".join(line for line in tex.splitlines() if not line.lstrip().startswith("%"))
+    body = _strip_comments(tex)
     for match in re.finditer(r"\\title\s*(?:\[[^\]]*\])?\s*\{", body):
+        if _DEFINES_COMMAND.search(body[max(0, match.start() - 40) : match.start()]):
+            continue
         depth, start = 1, match.end()
         for index in range(start, len(body)):
             char = body[index]
@@ -251,6 +256,37 @@ def _title_from(tex: str) -> str | None:
 #: held one title that began `\LARGE \bf` and another that was three `\\` line
 #: breaks with words between them.
 _TITLE_MACRO = re.compile(r"\\[a-zA-Z@]+\s*")
+
+#: A macro that *defines* a command rather than using one, immediately before a
+#: `\title{`. `\newcommand\title[1]{...}` redefines `\title`, and its body is
+#: not this paper's title. Anchored at the end because it is matched against the
+#: text that precedes the candidate.
+_DEFINES_COMMAND = re.compile(r"\\(?:re)?newcommand\*?\s*\{?\s*$|\\(?:providecommand|def)\*?\s*\{?\s*$")
+
+
+def _strip_comments(tex: str) -> str:
+    r"""LaTeX with its comments removed, `\%` left alone.
+
+    A `\\%` before the `%` is itself an escaped backslash rather than an escape
+    for the percent, so the alternation checks for that case before the simple
+    lookbehind can get it wrong.
+    """
+    out: list[str] = []
+    for line in tex.splitlines():
+        index = 0
+        while True:
+            found = line.find("%", index)
+            if found < 0:
+                out.append(line)
+                break
+            # Count the backslashes immediately before it: an odd number escapes
+            # the percent, an even number (including none) does not.
+            slashes = len(line[:found]) - len(line[:found].rstrip("\\"))
+            if slashes % 2 == 0:
+                out.append(line[:found])
+                break
+            index = found + 1
+    return "\n".join(out)
 
 
 def _clean_title(text: str) -> str:

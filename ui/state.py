@@ -121,7 +121,10 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
     "ledger": lambda w: models.ledger_model(),
     "quota": lambda w: models.quota_model(),
     "wiki": lambda w: models.wiki_model(w.selection.get("wiki.page")),
-    "papers": lambda w: models.papers_model(filter_name=w.selection.get("papers.filter", "cited")),
+    # `None`, not a default: the model has to be able to tell "nobody has
+    # pressed a chip" from "someone pressed CITED", because it falls back to a
+    # chip with rows in the first case and must not in the second.
+    "papers": lambda w: models.papers_model(filter_name=w.selection.get("papers.filter")),
     "evolve": lambda w: models.evolve_model(w.selection.get("evolve.campaign")),
     "editor": lambda w: models.editor_model(w.project),
     "preflight": lambda w: models.preflight_model(),

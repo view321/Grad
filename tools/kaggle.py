@@ -872,19 +872,32 @@ def _parse_status(output: str) -> dict[str, Any]:
 #: error text, which is where the API's 404 ends up: `kaggle kernels status`
 #: exits non-zero and prints the exception rather than emitting a status.
 #:
-#: This list is the difference between "gone" and "we could not tell", and those
+#: This is the difference between "gone" and "we could not tell", and the two
 #: need opposite answers -- one is a run that can be written off, the other is a
-#: run that may be training right now behind a broken network. Kept deliberately
-#: specific for that reason: a pattern like "error" would match a kernel that
-#: *ran* and failed.
-_MISSING_MARKERS: tuple[str, ...] = (
-    "404",
-    "not found",
-    "does not exist",
-    "no kernel",
-    "could not find kernel",
-    "kernel not found",
+#: run that may be training right now behind a network that is down. **The cost
+#: is asymmetric, so the matching is narrow.** A missed deletion degrades to
+#: `unknown`, which refuses and names `--assume-deleted`; a false positive
+#: writes off a live kernel and hands its hours back to the weekly pool while it
+#: is still burning them.
+#:
+#: So: a `404` as its own token, or a not-found phrase that is *about a kernel*.
+#: A bare `"not found"` was too broad to be safe -- "host not found" is a DNS
+#: failure, which is precisely the network-is-down case that must stay unknown,
+#: and it would have been read as a confirmed 404.
+_MISSING_RE = re.compile(
+    r"""
+      \b404\b                                   # the status code, as a token
+    | \bno\s+such\s+kernel\b
+    | \bkernel\b[^.\n]{0,60}?\b(?:not\s+found|does\s+not\s+exist|no\s+longer\s+exists|has\s+been\s+deleted)\b
+    | \b(?:not\s+found|does\s+not\s+exist|could\s+not\s+find)\b[^.\n]{0,60}?\bkernel\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
+
+
+def _reads_as_missing(*texts: str | None) -> bool:
+    """Whether any of these says the kernel does not exist on Kaggle."""
+    return any(_MISSING_RE.search(text) for text in texts if text)
 
 
 def _status(cfg: Config, ref: str) -> dict[str, Any]:
@@ -906,19 +919,21 @@ def _status(cfg: Config, ref: str) -> dict[str, Any]:
             timeout=float(cfg.get("kaggle", "status_timeout_s", 120)),
         )
     except GradError as exc:
-        lowered = (exc.message or "").lower()
-        if any(marker in lowered for marker in _MISSING_MARKERS):
-            return {"status": "missing", "message": exc.message}
+        # Both, because they are not the same text: `_run` truncates the CLI's
+        # output to 400 characters for the message and keeps 2000 in `detail`,
+        # and a traceback that puts the 404 after a stack would lose it in the
+        # message alone.
+        detail = (exc.detail or {}).get("output") if isinstance(exc.detail, dict) else None
+        if _reads_as_missing(exc.message, detail):
+            return {"status": MISSING, "message": exc.message}
         return {"status": "unknown", "message": exc.message}
     state = _parse_status(output)
     # A CLI that exits 0 and still says the kernel is gone -- newer versions
     # print the API error rather than raising. Only consulted when the output
     # carried no status token at all, so a real `error` status is never
     # reinterpreted as a missing kernel.
-    if state["status"] == "unknown" and any(
-        marker in (state.get("message") or "").lower() for marker in _MISSING_MARKERS
-    ):
-        state["status"] = "missing"
+    if state["status"] == "unknown" and _reads_as_missing(state.get("message")):
+        state["status"] = MISSING
     return state
 
 
@@ -1586,7 +1601,11 @@ def cmd_forget(args: argparse.Namespace) -> dict[str, Any]:
 #: means the run never reached a backend, this one means it did and the record
 #: of it was destroyed there. Both stop holding the ceiling; only one of them
 #: says anything about whether the job ran.
-FORGOTTEN_STATUS = "forgotten"
+#:
+#: The word itself lives in `core/ledger_store.py` beside `abandoned`, because
+#: `projects.state` and the queue window both have to know which statuses are
+#: written off and a second spelling here is how one of them stops knowing.
+FORGOTTEN_STATUS = ls.FORGOTTEN
 
 
 def _still_there(r: ls.Run, ref: str, state: dict[str, Any]) -> GradError:

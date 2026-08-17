@@ -435,3 +435,90 @@ def test_the_markdown_marks_citations_that_could_not_be_resolved(project):
 
 def _module(facts, name):
     return next(m for m in facts["pipelines"][0]["modules"] if m["path"] == name)
+
+
+# ---------------------------------------------------------------------------
+# what a half-written file on disk must not do
+# ---------------------------------------------------------------------------
+def test_a_malformed_pages_file_does_not_break_the_rebuild(project, monkeypatch):
+    """`read_json` returns whatever parses, and every caller indexes `["id"]` --
+    so a `pages.json` truncated mid-write would raise out of the one command
+    whose job at that moment is to replace it."""
+    monkeypatch.setattr(wikigen, "write_page", lambda *a, **k: {})
+    _build(project)
+    jsonl.write_json(
+        projwiki_tool.output_dir(project) / "pages.json",
+        ["a bare string", {"no": "id"}, {"id": "", "title": "blank"}, {"id": "overview"}],
+    )
+    out = _build(project)
+    assert out["pages_planned"] >= 3
+
+
+def test_show_survives_a_page_missing_its_optional_fields(project, monkeypatch):
+    monkeypatch.setattr(wikigen, "write_page", lambda *a, **k: {})
+    _build(project)
+    jsonl.write_json(projwiki_tool.output_dir(project) / "pages.json", [{"id": "overview"}])
+    listed = projwiki_tool.cmd_show(
+        argparse.Namespace(project=project, page=None, facts=False, json=True)
+    )["pages"]
+    assert listed == [{"id": "overview", "kind": "page", "title": "overview", "summary": ""}]
+
+
+def test_a_project_with_no_pipeline_leaves_no_facts_behind(workspace):
+    """The refusal comes first. A `facts.json` written for a project the same
+    command just refused to build would make `show --facts` answer for a wiki
+    that does not exist."""
+    budget_mod.create("empty", title="E", budget={})
+    projects.scaffold("empty")
+    with pytest.raises(GradError):
+        _build("empty")
+    assert not (projwiki_tool.output_dir("empty") / "facts.json").exists()
+
+
+def test_imports_from_a_subdirectory_are_first_party_too(project):
+    """`_modules` walks with `rglob` and this used `glob`, so a pipeline with
+    anything in a subdirectory drew a dependency graph with edges missing."""
+    nested = paths.root() / "pipelines" / "demo" / "kernels"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "scan.py").write_text('"""Scan."""\n\n\ndef run():\n    return 1\n', encoding="utf-8")
+    (paths.root() / "pipelines" / "demo" / "train.py").write_text(
+        "import data\nimport scan\n" + TRAIN.split("import data", 1)[1], encoding="utf-8"
+    )
+    facts = projwiki.collect(project)
+    assert "scan" in _module(facts, "train.py")["imports"]
+
+
+def test_the_missing_project_hint_lists_the_ones_that_exist(workspace):
+    """`status` answers "how is *this* project doing" and defaults to the
+    selected one, which is no help to someone just told their id is unknown."""
+    with pytest.raises(NotFound) as exc:
+        projwiki.collect("nope")
+    assert "budget list" in (exc.value.fix or "")
+
+
+def test_facts_only_re_extracts_without_discarding_the_prose(project, monkeypatch):
+    """Re-extracting the facts is not un-writing the pages. This blanked every
+    one of them, so the FACTS ONLY button beside REBUILD in the wiki window
+    threw away nine pages that had each cost a model call -- for the flag whose
+    entire purpose is to be the free option."""
+    monkeypatch.setattr(
+        wikigen, "write_page",
+        lambda facts, page, **k: {**page, "summary": "written", "sections": [
+            {"heading": "h", "body": "b", "refs": ["spec.toml"]}], "open_questions": [],
+            "unverified_refs": []},
+    )
+    projwiki_tool.cmd_build(
+        argparse.Namespace(project=project, no_prose=False, model=None, page=[], json=True)
+    )
+    (paths.root() / "pipelines" / "demo" / "train.py").write_text(
+        TRAIN.replace("3000", "4000"), encoding="utf-8"
+    )
+
+    out = _build(project)  # --no-prose
+
+    pages = {p["id"]: p for p in jsonl.read_json(projwiki_tool.output_dir(project) / "pages.json")}
+    assert pages["overview"]["summary"] == "written"
+    assert pages["overview"]["sections"]
+    # ...and the facts underneath it are the new ones, which is what was asked for.
+    assert out["source_hash"] == projwiki.source_hash(project)["hash"]
+    assert projwiki_tool.cmd_check(argparse.Namespace(project=project, json=True))["current"] is True

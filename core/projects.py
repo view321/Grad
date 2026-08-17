@@ -293,8 +293,16 @@ def state(project_id: str) -> dict[str, Any]:
     ]
 
     collected = [r for r in runs if r.collected]
+    # Written off before judged, because a run that produced nothing has no
+    # deviations and would otherwise fall through to `done` -- putting a run
+    # that never returned a number under "Established" in `DONE.md`, which is
+    # the exact "DONE beside a run with no result" reading the queue window's
+    # own chip exists to prevent.
+    written_off = [r for r in collected if ls.is_written_off(r)]
     done, open_runs = [], []
     for run in collected:
+        if ls.is_written_off(run):
+            continue
         (open_runs if run.unjudged_deviations() else done).append(run)
 
     return {
@@ -307,6 +315,7 @@ def state(project_id: str) -> dict[str, Any]:
         "in_flight": [r for r in runs if not r.collected],
         "done": done,
         "awaiting_verdict": open_runs,
+        "written_off": written_off,
     }
 
 
@@ -629,13 +638,15 @@ def _render_done(snapshot: dict[str, Any]) -> str:
     project_id = snapshot["project"]
     lines = _header("Done", project_id, "ledger/runs.jsonl + ledger/expectations.jsonl")
     done, waiting, in_flight = snapshot["done"], snapshot["awaiting_verdict"], snapshot["in_flight"]
+    written_off = snapshot.get("written_off") or []
 
     lines += [
         "A run is *done* here when it has been collected **and** every deviation it "
         "produced has a verdict. Anything else is listed underneath, so this file "
         "cannot read as finished while work is open.",
         "",
-        f"**{len(done)} done | {len(waiting)} awaiting a verdict | {len(in_flight)} in flight**",
+        f"**{len(done)} done | {len(waiting)} awaiting a verdict | {len(in_flight)} in flight"
+        + (f" | {len(written_off)} written off**" if written_off else "**"),
         "",
     ]
 
@@ -665,6 +676,28 @@ def _render_done(snapshot: dict[str, Any]) -> str:
                     f"  `python -m tools.ledger verdict {r.id} --quantity {d.get('quantity')} "
                     "--verdict bug|real|inconclusive --note '...' --json`"
                 )
+        lines.append("")
+
+    if written_off:
+        # Their own heading rather than a footnote under "Established". These
+        # runs are terminal and they belong in the record -- a run that left the
+        # ledger without a result should be visible, with the reason someone
+        # gave for writing it off -- but nothing was measured, and listing them
+        # beside results would make the count of what this project established
+        # wrong in the direction that flatters it.
+        lines += [
+            "## Written off",
+            "",
+            "Terminal, and not results: these produced no measurement. `abandoned` never "
+            "reached a backend; `forgotten` reached one and the platform no longer has any "
+            "record of it.",
+            "",
+        ]
+        for r in written_off:
+            reason = r.get("reason") or "no reason recorded"
+            lines.append(
+                f"* `{r.id}` -- {r.get('task') or 'untitled'} -- **{r.status}**: {reason}"
+            )
         lines.append("")
 
     if in_flight:

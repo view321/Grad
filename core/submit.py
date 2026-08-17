@@ -659,7 +659,7 @@ def abandon(run_id: str, *, reason: str) -> dict[str, Any]:
 
     return finish(
         r.id,
-        status="abandoned",
+        status=ls.ABANDONED,
         results={},
         cost_usd_actual=0.0,
         # `paths.run_artifacts`, not `artifacts_dir`: `finish` only writes the

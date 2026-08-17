@@ -334,7 +334,14 @@ def sheet_for(facts: dict[str, Any], page: dict[str, Any]) -> str:
 
 
 def write_page(facts: dict[str, Any], page: dict[str, Any], *, model: str, log_name: str) -> dict[str, Any]:
-    """One page. Raises nothing the caller has to catch page-by-page."""
+    """One page, or an exception.
+
+    Deliberately not caught here: whether one page's failure should take the
+    build down is the *build's* decision, and `tools/projwiki.py` makes it --
+    per page, recording the error and writing the rest. Swallowing it here would
+    return a page-shaped object with no sections in it, which is the one
+    outcome that reads as a wiki rather than as a gap.
+    """
     sheet = sheet_for(facts, page)
     written = haiku.structured(
         stage=quota_log.STAGE_WIKI,

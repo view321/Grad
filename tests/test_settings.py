@@ -10,6 +10,8 @@ are worth more than the values.
 
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 from core import config as config_mod, paths, settings
@@ -473,3 +475,44 @@ def test_a_section_the_overlay_never_mentions_is_untouched(workspace, annotated_
     cfg = config_mod.load(reload=True)
     assert cfg.get("spend", "monthly_usd") == config_mod.DEFAULTS["spend"]["monthly_usd"]
     assert cfg.model_for("evolve") == "claude-sonnet-5"
+
+
+def test_a_boolean_is_not_a_token_count(workspace):
+    """`bool` is an `int` in Python, so both survive `float`: `True` became 1 and
+    was refused for being under the floor -- a confusing message for a wrong
+    *kind* -- while `False` became 0, which is the documented spelling of "off",
+    so passing one by mistake silently disabled compaction."""
+    for bad in (True, False):
+        with pytest.raises(UsageError) as exc:
+            settings.set_agent({"compact_at_tokens": bad})
+        assert "not a number of tokens" in str(exc.value) or "must be a number" in str(exc.value)
+    assert settings.agent() == {}
+
+
+def test_the_cli_calls_a_shipped_default_a_default(workspace):
+    """Three layers, and "config" was reported for anything not in the overlay
+    -- so `--clear` on a machine whose grad.toml has no [agent] section pointed
+    whoever read it at a file that does not mention the setting."""
+    from tools import setup as setup_tool
+
+    out = setup_tool.cmd_context(
+        argparse.Namespace(compact_at_tokens="150000", clear=False, json=True)
+    )
+    assert out["source"] == "setup"
+    assert out["bounds"] == [20_000, 10_000_000]
+
+    out = setup_tool.cmd_context(argparse.Namespace(compact_at_tokens=None, clear=True, json=True))
+    assert out["source"] == "default"
+    assert out["compact_at_tokens"] == config_mod.DEFAULTS["agent"]["compact_at_tokens"]
+
+
+def test_the_cli_names_the_config_when_the_config_is_what_won(workspace, annotated_config):
+    from tools import setup as setup_tool
+
+    paths.config_path().write_text(
+        ANNOTATED + "\n[agent]\ncompact_at_tokens = 250000\n", encoding="utf-8"
+    )
+    config_mod._cache.clear()
+    out = setup_tool.cmd_context(argparse.Namespace(compact_at_tokens=None, clear=True, json=True))
+    assert out["source"] == "config"
+    assert out["compact_at_tokens"] == 250_000
