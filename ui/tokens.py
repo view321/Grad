@@ -716,6 +716,45 @@ def _chat() -> str:
 .grad-composer { border-top: var(--grad-border); background: var(--grad-paper-sunk);
                  padding: 10px 14px; flex: 0 0 auto; }
 .grad-composer .field { border: var(--grad-border); background: var(--grad-paper-raised); }
+
+/* The other half of the typing-lag fix, and the half that removes the cause
+ * rather than reducing it.
+ *
+ * A textarea that grows with its content is the right control, and Quasar's
+ * way of getting one is `autogrow`: on every input event, set `height: 1px`,
+ * read `scrollHeight`, put the height back. The write invalidates layout to the
+ * root and the read forces it clean again -- a full-document synchronous layout
+ * *inside the keystroke handler*, so its cost is the size of the transcript and
+ * it is paid once per key. Measured against a 77,700-node conversation: typing
+ * twenty characters blocked the main thread for 289ms.
+ *
+ * `field-sizing: content` asks the browser for the same behaviour and lets it
+ * do the sizing during its own layout pass, where it belongs. Nothing is read
+ * back, so nothing is forced: the same twenty characters block for 0.2ms and
+ * the layout they imply is one 13ms pass for the whole burst rather than twenty
+ * separate ones. O(frames), not O(keystrokes) -- and a person typing quickly is
+ * precisely the case where those two diverge.
+ *
+ * The `autogrow` prop is gone from both composers, because leaving it on would
+ * keep the measurement above exactly as it was; this rule replaces it rather
+ * than assisting it. `min-height` is the one row `rows="1"` used to give, and
+ * `max-height` is what `autogrow` never had -- a pasted stack trace grew the
+ * box until it ate the transcript.
+ *
+ * WebView2 is evergreen and the app's floor is well past this property, but a
+ * browser without it would get a one-line box with an inner scrollbar, so the
+ * fallback asks for a few rows and lets it scroll. Usable, not lovely, and not
+ * reachable on the platform this ships to. */
+.grad-composer .field textarea,
+.grad-wiki-ask .field textarea {
+    field-sizing: content;
+    min-height: 1lh;
+    max-height: 40vh;
+}
+@supports not (field-sizing: content) {
+    .grad-composer .field textarea,
+    .grad-wiki-ask .field textarea { min-height: 4lh; max-height: 40vh; overflow-y: auto; }
+}
 .grad-mention { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.55; }
 
 /* Which conversation this is, and the opener for the rest of them. */

@@ -108,3 +108,28 @@ def test_help_lists_the_exit_codes(workspace, capsys):
     with pytest.raises(SystemExit):
         preflight_cli.cli.parser.parse_args(["--help"])
     assert "gate refusal" in capsys.readouterr().out
+
+
+def test_a_command_with_only_a_summary_describes_itself_with_it(workspace, capsys):
+    """`--help` for a command that has no docstring and no explicit description.
+
+    The fallback chain is `description or __doc__ or summary or name`, and while
+    the third of those was called `help` the line read that parameter. Renaming
+    it to `summary` left a bare `help` there resolving to the *builtin*, which is
+    truthy -- so every command in this position described itself as
+    "<built-in function help>". Only reachable through `--help`, which is exactly
+    the surface no other test in this file exercises per command.
+    """
+    cli = Cli("t", "test")
+
+    @cli.command("bare", "the summary and nothing else")
+    def _bare(_args):  # no docstring, deliberately
+        return {}
+
+    # The subparser directly, like `test_help_lists_the_exit_codes`: `run`
+    # converts a SystemExit into an exit code, so `--help` never escapes it.
+    with pytest.raises(SystemExit):
+        cli.sub.choices["bare"].parse_args(["--help"])
+    out = capsys.readouterr().out
+    assert "the summary and nothing else" in out
+    assert "built-in function" not in out

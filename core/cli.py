@@ -120,7 +120,13 @@ class Cli:
             p = self.sub.add_parser(
                 name,
                 **listing,
-                description=description or fn.__doc__ or help or name,
+                # `summary`, not `help`. While this parameter *was* named `help`
+                # the fallback read it; renaming it left this line resolving the
+                # builtin instead, which is truthy -- so every command with no
+                # `description` and no docstring described itself as
+                # "<built-in function help>" in `--help`. The exact failure
+                # A002 exists to prevent, produced by the fix for A002.
+                description=description or fn.__doc__ or summary or name,
                 formatter_class=argparse.RawDescriptionHelpFormatter,
             )
             p.set_defaults(_parser=p)

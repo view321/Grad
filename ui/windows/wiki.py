@@ -113,10 +113,14 @@ def _ask(workspace: Any) -> None:
             workspace.spawn(result, "wiki question")
         workspace.focus("chat")
 
-    with kit.row("", gap=6, align="flex-end"):
+    # `grad-wiki-ask` so the composer's `field-sizing` rule reaches this box too.
+    # The same `autogrow` was here, and a forced layout is document-wide however
+    # small the window asking for it -- so typing a question in this pane paid
+    # the size of the *chat* transcript in the pane beside it.
+    with kit.row("grad-wiki-ask", gap=6, align="flex-end"):
         entry = (
             ui.textarea(placeholder="ask about this codebase")
-            .props("autogrow borderless dense")
+            .props("borderless dense")
             .classes("field")
             .style("flex: 1 1 auto; border: var(--grad-border); background: var(--grad-paper-raised); padding: 0 8px")
         )

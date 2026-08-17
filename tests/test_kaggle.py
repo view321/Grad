@@ -905,3 +905,47 @@ def test_the_credential_pair_is_scrubbed_from_the_environment(monkeypatch):
     monkeypatch.setenv("KAGGLE_CONFIG_DIR", "/somewhere")
     removed = credentials.scrub_environment()
     assert {"KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_CONFIG_DIR"} <= set(removed)
+
+
+def test_a_compressible_directory_is_not_refused_before_it_is_packed(workspace, monkeypatch):
+    """The early guard counts raw bytes; the limit bounds base64-of-gzip.
+
+    Those units differ by whatever gzip achieves, so refusing on raw size alone
+    turned a tree of repetitive source -- which packs to a fraction of itself --
+    into a submission that never got the chance to be measured accurately.
+    """
+    write_config(workspace)
+    monkeypatch.setattr(kaggle, "MAX_PAYLOAD_B64", 4_000)
+    # 60 kB raw, far past the 4 kB limit, and hugely compressible.
+    sub = make_submission(workspace, extra_files={"generated.py": "x = 1\n" * 10_000})
+    blob, _ = kaggle._payload_b64(sub)
+    assert len(blob) <= kaggle.MAX_PAYLOAD_B64
+
+
+def test_a_directory_too_large_to_pack_is_still_refused_without_packing(workspace, monkeypatch):
+    write_config(workspace)
+    monkeypatch.setattr(kaggle, "MAX_PAYLOAD_B64", 256)
+    monkeypatch.setattr(kaggle, "_PACK_MEMORY_SLACK", 2)
+    sub = make_submission(workspace, extra_files={"big.bin": "x" * 100_000})
+    with pytest.raises(UsageError) as exc:
+        kaggle._payload_b64(sub)
+    assert "dataset" in (exc.value.fix or "")
+
+
+def test_a_credential_beside_the_entrypoint_refuses_the_whole_payload(workspace):
+    """The spec directory is uploaded whole, so a `.env` here is a `.env` there."""
+    write_config(workspace)
+    sub = make_submission(workspace, extra_files={".env": "KAGGLE_KEY=hunter2\n"})
+    with pytest.raises(UsageError) as exc:
+        kaggle._payload_b64(sub)
+    assert ".env" in exc.value.message
+    # Refused, not quietly dropped: a run that fails remotely for a file sitting
+    # right there locally is the bug report this backend exists to avoid.
+    assert "move them outside" in (exc.value.fix or "")
+
+
+def test_an_ordinary_pipeline_file_is_not_mistaken_for_a_credential(workspace):
+    write_config(workspace)
+    sub = make_submission(workspace, extra_files={"data/x.csv": "a,b\n1,2\n"})
+    blob, packed = kaggle._payload_b64(sub)
+    assert "data/x.csv" in packed and blob

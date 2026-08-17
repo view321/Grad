@@ -697,8 +697,13 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
 
         with kit.row("", gap=6, align="flex-end").style("margin-top: 8px"):
             entry = (
+                # No `autogrow`. It grows by CSS now -- see `field-sizing` in
+                # `ui/tokens.py`, which is also where the measurement that
+                # removed this prop is written down. Quasar's version reads
+                # `scrollHeight` back inside the input handler, and that read is
+                # a full-document layout whose cost is the transcript's size.
                 ui.textarea(placeholder="ask, or paste a result to interrogate")
-                .props("autogrow borderless dense")
+                .props("borderless dense")
                 .classes("field")
                 .style("flex: 1 1 auto; padding: 0 8px")
             )

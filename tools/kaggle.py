@@ -96,6 +96,43 @@ _EXCLUDE_DIRS = {"__pycache__", ".git", ".ipynb_checkpoints", ".venv", ".pytest_
 #: Refusing locally names the payload and points at the mechanism meant for bulk.
 MAX_PAYLOAD_B64 = 1_000_000
 
+#: How far past `MAX_PAYLOAD_B64` the *raw* bytes may go before `_payload_b64`
+#: refuses without packing. Only a bound on how much this is willing to hold in
+#: memory to find out; the real limit is checked on the finished blob.
+_PACK_MEMORY_SLACK = 20
+
+#: Filenames and suffixes that are credentials rather than pipeline. The whole
+#: spec directory is uploaded, so this is the list that keeps §9's "no general
+#: remote-execution capability" from being undone by a `.env` left beside the
+#: entrypoint. Matched on the name, because that is what these are recognised by
+#: -- a private key is not identifiable from its bytes.
+_SECRET_NAMES = frozenset({
+    ".env", ".netrc", "_netrc", ".npmrc", ".pypirc", ".htpasswd",
+    "kaggle.json", "credentials.json", "credentials", "secrets.json",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+})
+_SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".ppk")
+_SECRET_PREFIXES = ("client_secret", "service-account", "serviceaccount", ".env.")
+#: Directories that are nothing but credentials. Refused rather than skipped,
+#: like the files -- see `_payload_b64`.
+_SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".gcloud", ".azure", ".docker"})
+
+
+def is_secret(rel: Path) -> bool:
+    """Does this path, relative to the spec directory, look like a credential?
+
+    Deliberately generous about what counts. A false positive is a file someone
+    moves one directory up; a false negative is a key on Kaggle.
+    """
+    if any(part in _SECRET_DIRS for part in rel.parts[:-1]):
+        return True
+    name = rel.name.lower()
+    return (
+        name in _SECRET_NAMES
+        or name.endswith(_SECRET_SUFFIXES)
+        or name.startswith(_SECRET_PREFIXES)
+    )
+
 _STATUSES = (
     "complete",
     "error",
@@ -256,27 +293,55 @@ def _payload_b64(sub: Submission) -> tuple[str, list[str]]:
     """
     base = sub.spec_path.parent
     eligible: list[Path] = []
+    secrets: list[str] = []
     raw_bytes = 0
     for path in sorted(base.rglob("*")):
-        if any(part in _EXCLUDE_DIRS for part in path.relative_to(base).parts):
+        rel = path.relative_to(base)
+        if any(part in _EXCLUDE_DIRS for part in rel.parts):
             continue
         if not path.is_file():
+            continue
+        if is_secret(rel):
+            secrets.append(rel.as_posix())
             continue
         eligible.append(path)
         try:
             raw_bytes += path.stat().st_size
         except OSError:  # counted as nothing; the pack below will raise on it
             continue
-    # Refused on the way in, not after packing. The check used to run on the
-    # finished base64 string, which meant a spec directory with a 4 GB
-    # checkpoint in it was gzipped and base64-encoded *entirely in memory*
-    # before anything said no -- a refusal that costs more than the run would
-    # have. Uncompressed size is the wrong unit for the real limit and the right
-    # one for this: if the raw bytes already fit, the blob certainly does.
-    if raw_bytes > MAX_PAYLOAD_B64:
+    # Named and refused, not skipped. This blob leaves the machine, and §9's rule
+    # is that a credential goes into one subprocess's environment at the moment
+    # of use and nowhere else -- a `.env` sitting beside the entrypoint would
+    # ride to Kaggle inside the notebook source, private kernel or not. Silently
+    # dropping it would be worse than either: the run would fail remotely for a
+    # file that is right there locally, which is the bug report `_payload_b64`'s
+    # docstring says this backend exists to avoid.
+    if secrets:
         raise UsageError(
-            f"the pipeline directory holds {raw_bytes:,} bytes of files, past the "
-            f"{MAX_PAYLOAD_B64:,} a Kaggle kernel source can carry even before packing",
+            f"the pipeline directory holds {len(secrets)} file(s) that look like "
+            f"credentials, and this whole directory is uploaded: {', '.join(secrets[:5])}",
+            fix=(
+                "move them outside the spec directory -- a Kaggle kernel's source is public to "
+                "anyone the kernel is shared with, and the API key belongs in Windows "
+                "Credential Manager (python -m tools.jobs credential set kaggle_key)"
+            ),
+        )
+    # Refused on the way in, not after packing: a spec directory with a 4 GB
+    # checkpoint in it used to be gzipped and base64-encoded *entirely in
+    # memory* before anything said no -- a refusal costing more than the run.
+    #
+    # Against a multiple of the limit rather than the limit itself, because the
+    # units differ: this counts raw bytes and `MAX_PAYLOAD_B64` bounds the
+    # base64 of a gzip. The implication only runs one way -- raw bytes that fit
+    # certainly pack small enough, but raw bytes that do not may still compress
+    # under it, and a tree of generated source is exactly that case. So this is
+    # a memory guard, deliberately loose, and `len(blob)` below is still the
+    # check that decides. A directory would have to beat 26:1 to be refused here
+    # and accepted there, which is a file of zeros rather than a pipeline.
+    if raw_bytes > MAX_PAYLOAD_B64 * _PACK_MEMORY_SLACK:
+        raise UsageError(
+            f"the pipeline directory holds {raw_bytes:,} bytes of files, too much to pack "
+            f"in memory against a {MAX_PAYLOAD_B64:,}-byte kernel source limit",
             fix=(
                 "move the bulk out of the spec directory and reference it as a Kaggle dataset "
                 "in the spec's [target] dataset_sources -- kernel sources are for code"
