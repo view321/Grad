@@ -394,7 +394,12 @@ def _check(condition: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
 #: that record. The wake then fired immediately, reported that the run had
 #: stopped, and spent a metered turn on a claim nothing had checked -- when the
 #: honest answer was "ask the backend", which is what falling through does.
-TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "submit_failed", "abandoned"})
+#: `forgotten` is here for the same reason `abandoned` is: `tools/kaggle.py
+#: forget` writes a terminal record for a kernel Kaggle no longer has, and a
+#: wake left armed on it would poll a run that has already stopped.
+TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "failed", "submit_failed", "abandoned", "forgotten"}
+)
 
 
 def _check_run(run_id: str) -> tuple[bool, dict[str, Any]]:

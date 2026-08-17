@@ -372,14 +372,27 @@ def test_a_vanished_record_does_not_break_the_listing(workspace, monkeypatch):
     assert isinstance(models.preflight_model(), dict)
 
 
-def test_an_unreadable_wiki_manifest_is_not_reported_as_never_generated(workspace):
-    from tools import wiki as wiki_tool
+def test_an_unreadable_wiki_manifest_is_not_reported_as_never_built(workspace):
+    from core import budget as budget_mod
+    from tools import projwiki as projwiki_tool
 
-    wiki_tool.output_dir().mkdir(parents=True, exist_ok=True)
-    (wiki_tool.output_dir() / "manifest.json").write_bytes(b"\xff\xfe{}")
+    budget_mod.create("proj", title="P", budget={})
+    budget_mod.set_current("proj")
+    projwiki_tool.output_dir("proj").mkdir(parents=True, exist_ok=True)
+    (projwiki_tool.output_dir("proj") / "manifest.json").write_bytes(b"\xff\xfe{}")
     model = models.wiki_model()
     assert model["built"] is False
     assert "UnicodeDecodeError" in model["error"]
+
+
+def test_the_wiki_window_says_so_when_no_project_is_selected(workspace):
+    """A wiki is written *about* a project, so there is nothing to show without
+    one -- and "no wiki built yet" would send the reader to a build command that
+    would refuse for a different reason."""
+    model = models.wiki_model()
+    assert model["built"] is False
+    assert model["project"] is None
+    assert "budget use" in model["empty_fix"]
 
 
 def test_hash_warnings_survive_into_the_window(workspace):

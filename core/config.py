@@ -318,6 +318,14 @@ DEFAULTS: dict[str, Any] = {
         "triage": "claude-haiku-4-5",       # funnel stage 3 (§5)
         "report": "claude-opus-5",          # prose synthesis (§22)
         "cite": "claude-haiku-4-5",         # citation resolution -- mechanical matching (§22)
+        # One page of a project wiki (`core/wikigen.py`). Sonnet rather than
+        # Opus because the job is bounded: explain a fact sheet that was handed
+        # to you, in a schema that will not accept prose without citations. And
+        # rather than Haiku because it is still *writing* -- the page has to say
+        # why the pieces are arranged this way, which is the part of the job that
+        # is not extraction, and a build is a handful of calls a person is
+        # waiting on rather than a per-turn cost.
+        "wiki": "claude-sonnet-5",
     },
     "agent": {
         "model": "claude-opus-5",
@@ -438,6 +446,23 @@ class Config:
         return dict(self.raw.get(name, {}))
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
+        """One setting, overlay first.
+
+        The overlay outranking the file is this dataclass's stated rule and was
+        already true for the three things that had their own accessor -- models,
+        the default backend, the host inventory. It was not true for anything
+        read through `get`, which is every ordinary scalar, so a setup window
+        that wrote `[agent] compact_at_tokens` into the overlay would have
+        written a value nothing ever read.
+
+        Safe to widen because the overlay is not free-form: `core/settings.py`
+        is the only writer and every key it will write is on one of its
+        allowlists. A section the overlay does not mention resolves exactly as
+        it did before.
+        """
+        chosen = self.overlay.get(section)
+        if isinstance(chosen, dict) and key in chosen:
+            return chosen[key]
         return self.raw.get(section, {}).get(key, default)
 
     def model_for(self, role: str, *, project: bool = True) -> str:

@@ -71,7 +71,9 @@ carries a `fix` field that is usually the literal next command.
   with exit 13. `quota` shows the hours left; `accelerators` shows what may be
   asked for; `account --set <name>` chooses the Kaggle account and `--check`
   verifies it. A spec needs `[estimate] hours` and `[target] platform = "kaggle"`
-  to be submitted here.
+  to be submitted here. `forget <run> --reason "..."` writes off a run whose
+  kernel was deleted in the Kaggle UI — it asks Kaggle first and refuses unless
+  the answer is a 404, so it is not a way out of a job that still exists.
 - `python -m tools.quota summary --json` — where the tokens and credits went;
   `--by-role` answers what each model cost.
 - `python -m tools.budget status --json` — the current project's remaining GPU
@@ -154,6 +156,15 @@ with `ledger abandon` — `collect` cannot clear that one, because there is no j
 id to poll. `abandon` is not a way out of a job you would rather not pay for; it
 refuses any run that has a handle, and that refusal is not something to work
 around.
+
+There is a third case, and only on Kaggle: a kernel that was deleted through the
+Kaggle web UI. `collect` refuses it with `kernel_missing` because there is
+nothing left to fetch, and `abandon` refuses it because it has a handle, so
+`tools.kaggle forget <run> --reason "..."` is what clears it. It confirms the
+deletion with Kaggle before writing anything and refuses on any real status —
+including a status it could not read, which means the kernel may still be
+training. Use `--assume-deleted` only when you have seen for yourself that the
+kernel is gone; it records on the ledger that no 404 was ever observed.
 
 Exit 14 is the one refusal that is not a fault: too much is in flight at once.
 Nothing has gone wrong, and the fix is to collect one or to wait — never to

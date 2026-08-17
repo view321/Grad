@@ -391,3 +391,85 @@ def test_readiness_names_what_each_backend_is_missing(workspace, monkeypatch):
     assert rows["hf_jobs"]["missing"] == ["hf_token"]
     assert "an ssh host" in rows["ssh"]["missing"]
     assert not any(r["ready"] for r in rows.values())
+
+
+# ---------------------------------------------------------------------------
+# the agent's context budget
+# ---------------------------------------------------------------------------
+def test_the_context_budget_is_read_back_through_the_ordinary_config_path(workspace):
+    """The overlay outranking the file is this module's whole premise, and it was
+    true only for the three settings that had their own accessor. Every ordinary
+    scalar goes through `Config.get`, which read `raw` alone -- so a setup window
+    writing here would have written a value nothing ever read."""
+    from core import compaction
+
+    settings.set_agent({"compact_at_tokens": 120_000})
+    cfg = config_mod.load(reload=True)
+    assert cfg.get("agent", "compact_at_tokens") == 120_000
+    assert compaction.threshold(cfg) == 120_000
+
+
+def test_clearing_it_falls_back_through_the_layers(workspace):
+    """Retiring by making optional, not by deleting: a key set here and then
+    cleared resolves exactly as it did before anyone opened the wizard."""
+    from core import compaction
+
+    settings.set_agent({"compact_at_tokens": 120_000})
+    settings.clear_agent(["compact_at_tokens"])
+    assert settings.agent() == {}
+    assert compaction.threshold(config_mod.load(reload=True)) == (
+        config_mod.DEFAULTS["agent"]["compact_at_tokens"]
+    )
+
+
+def test_zero_is_off_rather_than_below_the_floor(workspace):
+    """0 is the documented way to disable compaction -- the same spelling
+    `compaction.threshold` already reads -- not a value under the minimum."""
+    from core import compaction
+
+    settings.set_agent({"compact_at_tokens": 0})
+    assert compaction.threshold(config_mod.load(reload=True)) == 0
+
+
+def test_a_threshold_small_enough_to_compact_every_turn_is_refused(workspace):
+    """A compaction costs a turn and seeds a session with a cold prompt cache.
+    Below the floor it would run continuously and cost more than it saves."""
+    with pytest.raises(UsageError) as exc:
+        settings.set_agent({"compact_at_tokens": 500})
+    assert "0 to leave compaction" in (exc.value.fix or "")
+
+
+def test_a_value_that_is_not_a_finite_number_is_refused(workspace):
+    """NaN fails every range comparison, so a naive check would let it through
+    -- as a threshold nothing is ever above, which reads as "compaction is
+    broken" rather than as a rejected setting."""
+    for bad in ("soon", float("nan"), float("inf")):
+        with pytest.raises(UsageError):
+            settings.set_agent({"compact_at_tokens": bad})
+    assert settings.agent() == {}
+
+
+def test_an_unknown_agent_setting_is_refused_rather_than_stored(workspace):
+    """This overlay outranks the file for every reader, so a typo would be a
+    setting that applies and is wrong -- not one that fails to apply."""
+    with pytest.raises(UsageError):
+        settings.set_agent({"compact_at_toknes": 100_000})
+
+
+def test_it_reports_what_it_is_shadowing(workspace, annotated_config):
+    """The report is the price of being allowed to win."""
+    path = paths.config_path()
+    path.write_text(ANNOTATED + '\n[agent]\ncompact_at_tokens = 250000\n', encoding="utf-8")
+    config_mod._cache.clear()
+    settings.set_agent({"compact_at_tokens": 120_000})
+
+    reported = settings.shadowing(config_mod.load(reload=True))
+    assert {"what": "[agent] compact_at_tokens", "config": "250000", "overlay": "120000"} in reported
+
+
+def test_a_section_the_overlay_never_mentions_is_untouched(workspace, annotated_config):
+    """Widening `Config.get` must not change how anything else resolves."""
+    settings.set_agent({"compact_at_tokens": 120_000})
+    cfg = config_mod.load(reload=True)
+    assert cfg.get("spend", "monthly_usd") == config_mod.DEFAULTS["spend"]["monthly_usd"]
+    assert cfg.model_for("evolve") == "claude-sonnet-5"

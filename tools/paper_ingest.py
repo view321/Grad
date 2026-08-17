@@ -218,8 +218,51 @@ def cmd_arxiv(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _title_from(tex: str) -> str | None:
-    m = re.search(r"\\title\{(.+?)\}", tex, re.DOTALL)
-    return _clean(m.group(1)) if m else None
+    r"""The paper's title out of `\title{...}`, brace-matched.
+
+    Non-greedy `\{(.+?)\}` stops at the first closing brace, which is the wrong
+    one whenever the title contains any markup at all: `\title{\textsc{Samba}: …}`
+    recorded the title as `\textsc{Samba` and that is what the papers window
+    then displayed, forever, because nothing re-reads a title. Counting braces
+    is four lines and cannot get that wrong.
+
+    `\title` may also be preceded by `\newcommand` or appear inside a comment,
+    so the search skips commented lines rather than matching the first
+    occurrence in the file.
+    """
+    body = "\n".join(line for line in tex.splitlines() if not line.lstrip().startswith("%"))
+    for match in re.finditer(r"\\title\s*(?:\[[^\]]*\])?\s*\{", body):
+        depth, start = 1, match.end()
+        for index in range(start, len(body)):
+            char = body[index]
+            if char == "{" and body[index - 1] != "\\":
+                depth += 1
+            elif char == "}" and body[index - 1] != "\\":
+                depth -= 1
+                if depth == 0:
+                    title = _clean_title(body[start:index])
+                    if title:
+                        return title
+                    break
+    return None
+
+
+#: Font and layout macros a title carries and a reader does not want: the corpus
+#: held one title that began `\LARGE \bf` and another that was three `\\` line
+#: breaks with words between them.
+_TITLE_MACRO = re.compile(r"\\[a-zA-Z@]+\s*")
+
+
+def _clean_title(text: str) -> str:
+    """`_clean`, then the formatting macros a title accumulates, then the braces
+    those macros left behind."""
+    out = _clean(text).replace("\\\\", " ")
+    out = _TITLE_MACRO.sub(" ", out)
+    out = out.replace("{", " ").replace("}", " ")
+    out = " ".join(out.split())
+    # `\textsc{Samba}: …` leaves a space where the closing brace was, and
+    # "Samba : Simple" reads as a typo in the paper rather than in the parser.
+    return re.sub(r"\s+([:;,.!?])", r"\1", out).strip(" .,:;-")
 
 
 def _compute_vectors(cfg: Any, texts: list[str], *, model: str, dim: int) -> list[list[float]]:
@@ -380,6 +423,63 @@ def cmd_reembed(args: argparse.Namespace) -> dict[str, Any]:
             corpus.bind_embedding_model(con, args.model, dim)
             corpus.store_vectors(con, ids, vectors)
         return {"model": args.model, "dim": dim, "vectors": len(vectors)}
+    finally:
+        con.close()
+
+
+@cli.command(
+    "retitle",
+    "re-parse the titles of papers already in the index, from their stored source",
+    setup=lambda p: (
+        p.add_argument("--id", help="one document id; every arXiv source by default"),
+        p.add_argument("--dry-run", action="store_true", help="report what would change, change nothing"),
+    ),
+)
+def cmd_retitle(args: argparse.Namespace) -> dict[str, Any]:
+    r"""Repair titles recorded by an older, worse parse of `\title{...}`.
+
+    Nothing re-reads a title once it is stored, so a paper ingested while
+    `_title_from` stopped at the first closing brace is called `\textsc{Samba`
+    in the papers window for as long as the index lives -- and re-ingesting to
+    fix a string would re-download the source and re-spend the embeddings.
+    This re-parses from the `.tex` already on disk and touches one column.
+
+    Only the title, and only when the new one is non-empty: a source file that
+    has been moved or emptied must not turn a correct title into a blank.
+    """
+    path = paths.corpus_sqlite()
+    if not path.exists():
+        return {"documents": [], "note": "the index does not exist yet"}
+    con = corpus.connect(path)
+    try:
+        sql = "SELECT id, title, path, source FROM documents WHERE source = 'arxiv-latex'"
+        params: tuple[Any, ...] = ()
+        if args.id:
+            sql += " AND id = ?"
+            params = (args.id,)
+        changed: list[dict[str, Any]] = []
+        unreadable: list[str] = []
+        for row in con.execute(sql, params).fetchall():
+            source = Path(row["path"] or "")
+            try:
+                tex = source.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                unreadable.append(row["id"])
+                continue
+            title = _title_from(tex)
+            if not title or title == row["title"]:
+                continue
+            changed.append({"id": row["id"], "was": row["title"], "now": title})
+            if not args.dry_run:
+                con.execute("UPDATE documents SET title = ? WHERE id = ?", (title, row["id"]))
+        if not args.dry_run:
+            con.commit()
+        return {
+            "changed": changed,
+            "unreadable": unreadable,
+            "dry_run": bool(args.dry_run),
+            "next": "python -m tools.paper_ingest list --json",
+        }
     finally:
         con.close()
 

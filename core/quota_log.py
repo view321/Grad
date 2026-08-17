@@ -34,6 +34,12 @@ STAGE_INGEST = "ingest"
 #: the one place in this system that issues model calls with no human waiting on
 #: them, which makes it the stage most worth being able to total.
 STAGE_EVOLVE = "evolve.mutate"
+#: One page of a project wiki (`core/wikigen.py`). Its own stage because a wiki
+#: build is several calls in a row with nobody waiting on any single one, which
+#: makes "what does regenerating this cost" a question worth being able to
+#: total -- and because it is the newest place tokens leave by, which is exactly
+#: the kind of spend §10 says must not be invisible.
+STAGE_WIKI = "wiki.page"
 
 
 def record(

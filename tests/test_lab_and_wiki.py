@@ -162,11 +162,30 @@ def test_check_refuses_when_no_wiki_exists(workspace):
     assert exc.value.code == "no_wiki"
 
 
-def test_check_detects_staleness_and_names_the_files(workspace):
+def test_the_scope_is_resolved_against_the_installation_not_the_workspace(workspace, monkeypatch):
+    """`core/` and `tools/` ship with the code. Resolved against `paths.root()`
+    they exist only in a checkout you are developing in -- in every installed
+    configuration the workspace is a research folder, so `map` raised "none of
+    core, tools exist under …" and the map could never be generated at all."""
+    from core import paths as paths_mod
+
+    installed = workspace.parent / "installation"
+    (installed / "core").mkdir(parents=True, exist_ok=True)
+    (installed / "core" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(paths_mod, "install_dir", lambda: installed)
+
+    assert wiki.source_root() == installed
+    assert "core/a.py" in wiki.source_hash()["files"]
+    assert wiki._scope_paths(wiki.source_root()) == [str(installed / "core")]
+
+
+def test_check_detects_staleness_and_names_the_files(workspace, monkeypatch):
     """"A wiki behind the code is worse than none, because it is trusted." """
     (workspace / "core").mkdir(parents=True, exist_ok=True)
     target = workspace / "core" / "a.py"
     target.write_text("x = 1\n", encoding="utf-8")
+    # The source tree is the installation's; this test's is the temp workspace.
+    monkeypatch.setattr(wiki, "source_root", lambda: workspace)
 
     jsonl.write_json(
         wiki.output_dir() / "manifest.json",

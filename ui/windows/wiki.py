@@ -1,18 +1,21 @@
-"""Window 10 — the codebase wiki and its references rail.
+"""Window 10 — the project wiki and its page rail.
 
-The design shows chat on the left and a numbered references rail on the right.
-The rail here holds what actually exists: the wiki's scope, when it was
-generated, and -- when the source tree has moved underneath it -- exactly which
-files differ.
+The subject is the research code the agent generated for the selected project:
+`pipelines/<name>/` -- the training script, the model, the data loader, the
+probe, the tests -- together with the spec that submits it and the ledger
+entries that record what it found. Grad's *own* `core/` and `tools/` are a
+different question with a different reader, and `tools/wiki.py` answers that one
+from the command line.
 
-There is no answer engine behind this window, and that is a decision rather than
-a gap. `tools/wiki.py` deliberately does not enable `repowiki scan`, the LLM
-half, because it reads `ANTHROPIC_API_KEY` by default -- the exact variable
-`credentials.scrub_environment()` deletes -- and a key in the user profile is
-also in the agent's environment, tripping the scrub warning on every launch.
-Safe, but noisy, and habituation to that warning erodes the credential
-discipline. So questions about the codebase go to the agent with an `@wiki`
-mention, and this window is the map plus its staleness.
+The design's chat-plus-numbered-references becomes a page list beside a page,
+which is the same shape doing the job it was drawn for: the rail holds what
+there is to read, and the pane holds what is being read.
+
+**Nothing is generated here.** `core/wikigen.py` writes the pages, and this
+window starts a background task to do it -- a build is several model calls and a
+window redrawn every two seconds must not be able to spend money. What is drawn
+is what a build wrote, plus the one thing a reader has to know before trusting
+it: whether the code has moved underneath.
 """
 
 from __future__ import annotations
@@ -22,21 +25,35 @@ from typing import Any
 from ui import kit
 from ui.tasks import start, task_message
 
+#: The rail's label per page kind. The generated titles are long and specific --
+#: `minimamba/model.py` -- so the kind is what makes the list scannable.
+KIND_LABEL = {"overview": "OVERVIEW", "run-path": "RUN PATH", "module": "MODULE"}
+
 
 def subtitle(workspace: Any) -> str:
     model = workspace.model("wiki") or {}
+    if not model.get("project"):
+        return "no project selected"
     if not model.get("built"):
-        return "not generated"
-    return f"generated {model.get('generated_at', '?')}"
+        return f"{model['project']} · not built"
+    written = len([p for p in model.get("pages") or [] if p["written"]])
+    return f"{model['project']} · {written} page{'s' if written != 1 else ''} · {model.get('generated_at', '?')}"
 
 
 def chips(workspace: Any) -> list[tuple[str, str]]:
     model = workspace.model("wiki") or {}
     if not model.get("built"):
         return []
+    out: list[tuple[str, str]] = []
     if model.get("stale"):
-        return [(f"STALE · {model.get('changed_total', 0)} FILES", "attention")]
-    return [("CURRENT", "ok")]
+        out.append((f"STALE · {model.get('changed_total', 0)} FILES", "attention"))
+    else:
+        out.append(("CURRENT", "ok"))
+    if not model.get("prose", True):
+        out.append(("FACTS ONLY", "neutral"))
+    if model.get("unverified_total"):
+        out.append((f"{model['unverified_total']} UNVERIFIED REFS", "attention"))
+    return out
 
 
 def render(workspace: Any) -> None:
@@ -48,51 +65,186 @@ def render(workspace: Any) -> None:
         workspace.invalidate("wiki")
         workspace.tick()
 
-    def rebuild() -> None:
-        """RepoWiki walks `core/` and `tools/` and calls a model per scope, so
-        this is minutes rather than seconds -- and nothing else in the workspace
-        needs to wait for it."""
-        start("wiki map", "tools.wiki", "map", "--json", on_done=settled)
-        workspace.say("regenerating the wiki — see the tasks window")
+    def build(*, prose: bool = True) -> None:
+        """A background task, always. Nine pages is nine model calls, and the
+        rest of the workspace has no reason to wait for them."""
+        project = model.get("project")
+        if not project:
+            workspace.say("select a project first — a wiki is written about one")
+            return
+        argv = ["tools.projwiki", "build", "--project", project, "--json"]
+        if not prose:
+            argv.append("--no-prose")
+        start(f"wiki {project}", *argv, on_done=settled)
+        workspace.say(
+            f"building the wiki for {project} — see the tasks window"
+            + ("" if prose else " (facts only, no model calls)")
+        )
         workspace.invalidate("tasks")
         workspace.tick()
 
     if not model.get("built"):
-        kit.empty("No wiki has been generated yet.", model.get("empty_fix"))
-        with kit.pad():
-            kit.button("▶ GENERATE", tone="primary", on_click=rebuild)
+        kit.empty(model.get("empty_message") or "No wiki has been built yet.", model.get("empty_fix"))
+        if model.get("project"):
+            with kit.pad():
+                with kit.row("", gap=9):
+                    kit.button("▶ BUILD", tone="primary", on_click=lambda: build())
+                    kit.button(
+                        "FACTS ONLY",
+                        tone="neutral",
+                        title="extract the tree, the spec, the symbols and the ledger without calling a model",
+                        on_click=lambda: build(prose=False),
+                    )
+                kit.note(
+                    "The wiki is half extracted and half written. The extracted half — the file "
+                    "tree, the spec, what imports what, every function with its line number, the "
+                    "predictions and the runs — is free and always true. The written half explains "
+                    "that arrangement, one page per call, and every section cites the extracted "
+                    "facts it rests on."
+                )
         return
 
-    with kit.row("", gap=0, align="stretch").style("min-height: 0; flex: 1 1 auto"):
-        with kit.column("grad-pad", gap=10).style("flex: 1 1 auto; min-width: 0; overflow-y: auto"):
-            with kit.row("", gap=9):
-                kit.button("↻ REGENERATE", tone="primary", on_click=rebuild)
-                kit.spacer()
-                kit.text(model.get("source_hash") or "", "grad-caption", tag="span")
-
+    with kit.row("grad-split", gap=0, align="stretch").style("min-height: 0; flex: 1 1 auto"):
+        with kit.column("main grad-pad", gap=10):
+            _header(workspace, model, build)
             if model.get("stale"):
-                with kit.el("div", "grad-card"):
-                    kit.text("STALE", "head attention")
-                    with kit.el("div", "body"):
-                        kit.text(
-                            f"the wiki was generated from a different source tree: "
-                            f"{model.get('changed_total', 0)} file(s) differ",
-                            "",
-                        )
-                        for path in model.get("changed") or []:
-                            kit.text(path, "grad-mono")
-            else:
-                kit.note("the wiki matches the current source tree")
-
-            kit.label("ask about the codebase")
+                _stale(model)
+            _page(model.get("page"))
+            kit.hr()
+            kit.label("ask about this project")
             kit.note(
-                "Questions go to the agent with an @wiki mention rather than to a local "
-                "answer engine: repowiki's scan half reads ANTHROPIC_API_KEY, the variable "
-                "the credential scrub deletes."
+                "A page is a document; a question is a conversation. Questions go to the agent "
+                "with an @wiki mention, which can read the code this describes — and read the "
+                "parts a page had to leave out."
             )
             _ask(workspace)
+        _rail(workspace, model)
 
-        _rail(model)
+
+def _header(workspace: Any, model: dict[str, Any], build: Any) -> None:
+    with kit.row("", gap=9).style("flex-wrap: wrap"):
+        kit.button("↻ REBUILD", tone="primary", on_click=lambda: build())
+        kit.button(
+            "FACTS ONLY",
+            tone="neutral",
+            title="re-extract without calling a model",
+            on_click=lambda: build(prose=False),
+        )
+        kit.spacer()
+        if model.get("model"):
+            kit.text(model["model"], "grad-caption", tag="span")
+        kit.text(model.get("source_hash") or "", "grad-caption", tag="span")
+
+
+def _stale(model: dict[str, Any]) -> None:
+    with kit.el("div", "grad-card"):
+        kit.text("STALE", "head attention")
+        with kit.el("div", "body"):
+            kit.text(
+                f"this wiki was written from a different source tree: "
+                f"{model.get('changed_total', 0)} file(s) differ. A wiki behind the code is "
+                f"worse than none, because it is trusted.",
+                "",
+            )
+            for path in model.get("changed") or []:
+                kit.text(path, "grad-mono")
+
+
+def _page(page: dict[str, Any] | None) -> None:
+    """One page: its summary, its sections, and the citations under each.
+
+    The refs are drawn *with* the section rather than collected at the bottom,
+    because their job is to be checked while the sentence they support is still
+    on screen. A ref that resolved to nothing is marked here rather than
+    silently dropped -- a reader deciding how far to trust a paragraph is
+    entitled to know which of its citations could not be found.
+    """
+    from nicegui import ui
+
+    if page is None:
+        kit.empty("Select a page.")
+        return
+    if page.get("error"):
+        with kit.el("div", "grad-card"):
+            kit.text("THIS PAGE WAS NOT WRITTEN", "head broken")
+            with kit.el("div", "body"):
+                kit.text(str(page["error"]), "grad-mono")
+                kit.note(
+                    "The rest of the wiki was written anyway. Rebuild to try this page again — "
+                    "half a wiki whose gaps are visible is worth more than a whole one with an "
+                    "invented page in it."
+                )
+        return
+    if not page.get("sections"):
+        kit.empty(
+            "This page has been planned but not written — the last build ran facts-only.",
+            "python -m tools.projwiki build --project <id> --json",
+        )
+        return
+
+    kit.text(page.get("title") or "", "grad-serif").style("font-size: 28px; line-height: 1.15")
+    if page.get("summary"):
+        kit.text(page["summary"], "grad-caption").style("font-size: 14px; line-height: 1.6")
+
+    for section in page["sections"]:
+        with kit.el("div", "grad-wiki-section"):
+            kit.text(section["heading"], "grad-serif").style("font-size: 19px; margin-bottom: 4px")
+            ui.markdown(section["body"], extras=["fenced-code-blocks", "tables"]).classes("bubble")
+            unverified = set(page.get("unverified_refs") or [])
+            with kit.row("", gap=5).style("flex-wrap: wrap; margin-top: 5px"):
+                for ref in section.get("refs") or []:
+                    bad = str(ref).strip().strip("`") in unverified
+                    kit.chip(
+                        str(ref),
+                        "attention" if bad else "neutral",
+                    ).props(
+                        'title="this citation matched nothing in the extracted facts"'
+                        if bad
+                        else ""
+                    )
+
+    if page.get("open_questions"):
+        with kit.el("div", "grad-card"):
+            kit.text("OPEN QUESTIONS", "head attention")
+            with kit.el("div", "body"):
+                kit.text(
+                    "What the extracted facts did not settle. Named rather than written around.",
+                    "grad-caption",
+                )
+                for question in page["open_questions"]:
+                    kit.text(f"— {question}", "").style("margin-top: 6px; line-height: 1.55")
+
+
+def _rail(workspace: Any, model: dict[str, Any]) -> None:
+    with kit.column("rail grad-pad", gap=9):
+        kit.label("pages")
+        selected = model.get("selected")
+        for index, page in enumerate(model.get("pages") or [], start=1):
+            classes = "grad-row" + (" striped selected" if page["id"] == selected else "")
+            row = kit.row(classes, gap=9, align="flex-start")
+            row.on(
+                "click",
+                lambda _=None, pid=page["id"]: workspace.select("wiki.page", pid, window="wiki"),
+            )
+            with row:
+                kit.chip(str(index), "solid" if page["written"] else "dashed")
+                with kit.column("", gap=3).style("min-width: 0; flex: 1 1 auto"):
+                    kit.text(page["title"], "grad-mono").style("font-size: 12px")
+                    with kit.row("", gap=5).style("flex-wrap: wrap"):
+                        kit.chip(KIND_LABEL.get(page["kind"], page["kind"]), "neutral")
+                        if page.get("error"):
+                            kit.chip("FAILED", "broken")
+                        elif not page["written"]:
+                            kit.chip("NOT WRITTEN", "dashed")
+                        if page["unverified_refs"]:
+                            kit.chip(f"{len(page['unverified_refs'])} UNVERIFIED", "attention")
+        kit.hr()
+        kit.text(model.get("output_dir") or "", "grad-caption")
+        kit.note(
+            "Every page was written against facts extracted from the code, not from memory: "
+            "the file tree, the spec, the symbols with their line numbers, the expectations and "
+            "the runs. `facts.json` beside these pages is exactly what each one was shown."
+        )
 
 
 def _ask(workspace: Any) -> None:
@@ -119,35 +271,10 @@ def _ask(workspace: Any) -> None:
     # the size of the *chat* transcript in the pane beside it.
     with kit.row("grad-wiki-ask", gap=6, align="flex-end"):
         entry = (
-            ui.textarea(placeholder="ask about this codebase")
+            ui.textarea(placeholder="ask about this project's code")
             .props("borderless dense")
             .classes("field")
             .style("flex: 1 1 auto; border: var(--grad-border); background: var(--grad-paper-raised); padding: 0 8px")
         )
         entry.on("keydown.enter.prevent", send)
         kit.button("ASK ⏎", tone="primary", on_click=send)
-
-
-def _rail(model: dict[str, Any]) -> None:
-    from nicegui import ui
-
-    with kit.column("grad-pad", gap=9).style(
-        "flex: 0 0 440px; background: var(--grad-paper-sunk); "
-        "border-left: var(--grad-border); overflow-y: auto"
-    ):
-        kit.label("references")
-        for index, scope in enumerate(model.get("scopes") or [], start=1):
-            with kit.row("grad-row", gap=9):
-                kit.chip(str(index), "solid")
-                kit.text(scope["name"], "grad-mono", tag="span")
-                kit.spacer()
-                if scope.get("entries") is not None:
-                    kit.text(f"{scope['entries']} entries", "grad-caption", tag="span")
-        if model.get("html"):
-            kit.hr()
-            kit.text(model["output_dir"], "grad-caption")
-            kit.button(
-                "↗ OPEN THE MAP",
-                tone="neutral",
-                on_click=lambda: ui.navigate.to("/grad-wiki/index.html", new_tab=True),
-            )

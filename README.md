@@ -327,7 +327,10 @@ here. The control protocol has ten subtypes — `initialize`, `mcp_status`,
 permission rules behind the code's back.
 
 So `core/compaction.py` does it, at `[agent] compact_at_tokens` (300k by
-default, 0 to disable). Being ours buys three things the CLI's version cannot:
+default, 0 to disable) — settable from the **setup** window's *context* step, or
+with `python -m tools.setup context --compact-at 200000`, which writes to the
+same overlay the model roles use rather than to the hand-annotated TOML. Being
+ours buys three things the CLI's version cannot:
 
 * **It is visible.** A compaction performed in-band rewrites what the model
   remembers while the transcript on screen still shows every turn — the user is
@@ -710,7 +713,8 @@ that carry the literal next command.
 | `tools/experiments.py` | every experiment ever run, across workspaces: `list` / `show` / `verify` |
 | `tools/lab.py` | the embedded JupyterLab server (human editing surface) |
 | `tools/traces.py` | tag stored sessions, and harvest eval candidates from real use — **human-facing only** |
-| `tools/wiki.py` | RepoWiki over `core/` and `tools/` — **human-facing only**, not an agent tool |
+| `tools/wiki.py` | RepoWiki over Grad's own `core/` and `tools/` — **human-facing only**, not an agent tool |
+| `tools/projwiki.py` | the wiki for a project's generated code under `pipelines/` — half extracted, half written, **human-facing only** |
 
 ### Exit codes
 

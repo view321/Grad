@@ -579,6 +579,30 @@ def _data() -> str:
 .grad-diff .del { background: var(--grad-broken-tint); color: var(--grad-broken-ink-2); }
 .grad-diff .meta { background: var(--grad-paper-sunk); opacity: 0.7; }
 
+/* A list beside a detail rail, in a pane that may be 320px wide.
+ *
+ * The rail used to be `flex: 0 0 520px`, which does not shrink -- so in any pane
+ * narrower than the rail the list column (`min-width: 0`) was squeezed to
+ * *zero* and the window showed a detail pane and nothing to select in it. Panes
+ * go down to `--grad-min-pane`, and three columns on a 1280px screen are 410px
+ * each, so this was the normal case rather than the edge one.
+ *
+ * `flex-wrap` is the fix rather than a smaller rail: the two hypothetical sizes
+ * below add up to 620px, and under that the browser stacks them, which is the
+ * one arrangement where both halves are still readable. No media query, because
+ * the constraint is the *pane* and a media query would read the window. */
+/* One wiki section: prose, then the facts it rests on. The rule above the
+   heading separates sections without the boxes a card would add -- a page of
+   six cards reads as six unrelated things, and these are one argument. */
+.grad-wiki-section { border-top: var(--grad-hairline); padding-top: 11px; margin-top: 11px; }
+.grad-wiki-section:first-of-type { border-top: 0; margin-top: 0; }
+.grad-wiki-section .bubble { font-size: 14px; line-height: 1.6; }
+
+.grad-split { flex-wrap: wrap; align-content: flex-start; }
+.grad-split > .main { flex: 1 1 300px; min-width: 0; overflow-y: auto; }
+.grad-split > .rail { flex: 0 1 320px; min-width: 0; max-width: 520px; overflow-y: auto;
+                      background: var(--grad-paper-sunk); border-left: var(--grad-border); }
+
 /* Paper covers and figure placeholders are CSS, per the handoff's assets note. */
 .grad-cover { width: 70px; height: 92px; border: 1.5px solid var(--grad-ink);
               flex: 0 0 70px;
@@ -637,6 +661,15 @@ def _chat() -> str:
 .grad-msg h1 { font-size: 28px; } .grad-msg h2 { font-size: 21px; } .grad-msg h3 { font-size: 19px; }
 .grad-msg sup.ref { color: var(--grad-link); font-family: var(--grad-font-mono);
                     font-size: 10px; font-weight: 700; }
+/* A figure the agent drew, in the transcript at the point it drew it. Bordered
+   like every other framed thing here, and bounded in *height* as well as width:
+   a tall figure that filled the pane would push the paragraph arguing about it
+   off the screen, which is the one thing a result and its reading must not do
+   to each other. `contain-intrinsic-size` on `.grad-msg` reserves 140px, so an
+   image whose dimensions arrive late does not jump the scroll position. */
+.grad-msg .grad-figure-img { display: block; margin: 9px 0 9px 23px; max-width: min(100%, 640px);
+                             max-height: 420px; border: var(--grad-border);
+                             background: var(--grad-paper-raised); }
 
 .grad-card { border: var(--grad-border); margin: 9px 14px; }
 .grad-card > .head { display: flex; align-items: center; gap: 9px; padding: 6px 10px;
