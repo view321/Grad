@@ -258,13 +258,24 @@ def cmd_configure(args: argparse.Namespace) -> dict[str, Any]:
     record = budget.configure(
         project_id, models=models, backend=args.backend, reason=args.reason
     )
+    overrides = budget.project_overrides(project_id)
+    # What *this* project resolves to, across every layer. `config.load()` folds
+    # in whichever project is currently selected, which is not necessarily the
+    # one being configured -- `--project other` would otherwise report the
+    # current project's models beside another project's overrides, and the two
+    # halves of one answer would be about different projects.
+    cfg = config_mod.load(reload=True)
+    models_now = {
+        role: overrides["models"].get(role) or cfg.model_for(role, project=False)
+        for role in config_mod.MODEL_ROLES
+    }
     return {
         "configured": record,
-        "overrides": budget.project_overrides(project_id),
-        # What the project actually resolves to now, across every layer. The
-        # override alone does not answer "which model will this use", and that is
-        # the question anyone runs this command to settle.
-        "models": config_mod.load(reload=True).models(),
+        "overrides": overrides,
+        # The override alone does not answer "which model will this use", and
+        # that is the question anyone runs this command to settle.
+        "models": models_now,
+        "project": project_id,
     }
 
 

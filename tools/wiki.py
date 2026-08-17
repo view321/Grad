@@ -43,7 +43,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -114,12 +113,21 @@ def source_hash(root: Path | None = None) -> dict[str, Any]:
 
 
 def _repowiki() -> str:
-    found = shutil.which("repowiki")
+    """The `repowiki` beside *this* interpreter, then the one on PATH.
+
+    `shutil.which` alone reported "not installed" for a repowiki sitting in the
+    venv this process is running from, because a virtualenv's `Scripts`
+    directory is on PATH only while the environment is activated and the desktop
+    shortcut does not activate anything. See `core/spawn.py:console_script`.
+    """
+    from core import spawn  # noqa: PLC0415
+
+    found = spawn.console_script("repowiki")
     if found:
         return found
     raise ConfigError(
         "repowiki is not installed",
-        fix="pip install -e '.[wiki]'   # pins repowiki==0.3.1",
+        fix="pip install -e '.[wiki]'   # pins repowiki==0.3.1; it is an optional extra",
     )
 
 

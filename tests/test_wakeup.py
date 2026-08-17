@@ -176,6 +176,55 @@ def test_an_unrecognised_remote_state_is_not_finished(workspace):
     assert wk._remote_finished({"remote": {}}) is False
 
 
+def test_a_run_with_no_status_is_not_a_finished_run(workspace, monkeypatch):
+    """The same mistake as the line above, one layer down.
+
+    The ledger short-circuit was `status and status != "in_flight"`, which treats
+    everything unrecognised as finished -- including `"unknown"`, which is what
+    `Run.status` returns for a fold with no status in it. `runs()` builds a node
+    from any event carrying an id and `jsonl.iter_records` *skips* a malformed
+    line rather than raising, so a torn `run_submitted` followed by an intact
+    `run_handle` produces exactly that record. The wake then fired at once and
+    spent a metered turn reporting something nothing had checked.
+    """
+    from core import ledger_store as ls
+
+    # The record that damage leaves behind: an id, a platform, no status.
+    ls.append_run_event({"type": "run_handle", "id": "run-torn", "platform": "hf_jobs"})
+    assert ls.run("run-torn").status == "unknown"
+
+    polled: list[str] = []
+
+    def _never_answers(tool, run_id):
+        polled.append(run_id)
+        return None
+
+    monkeypatch.setattr(wk, "_status_envelope", _never_answers)
+
+    fired, detail = wk._check_run("run-torn")
+    assert fired is False, "unknown is not finished"
+    assert polled == ["run-torn"], "it has to fall through to the backend, which does know"
+    assert "unreadable" in detail
+
+
+def test_a_terminal_status_still_fires_without_a_poll(workspace, monkeypatch):
+    """The short-circuit is still a short-circuit for the statuses that mean it."""
+    from core import ledger_store as ls
+
+    def _never(tool, run_id):
+        raise AssertionError("the backend must not be asked about a finished run")
+
+    monkeypatch.setattr(wk, "_status_envelope", _never)
+
+    for index, status in enumerate(sorted(wk.TERMINAL_RUN_STATUSES)):
+        run_id = f"run-{index}"
+        ls.append_run_event({"type": ls.T_RUN_SUBMITTED, "id": run_id, "status": "in_flight"})
+        ls.append_run_event({"type": "run_finished", "id": run_id, "status": status})
+        fired, detail = wk._check_run(run_id)
+        assert fired is True, status
+        assert detail["status"] == status
+
+
 # ---------------------------------------------------------------------------
 # the watcher
 # ---------------------------------------------------------------------------

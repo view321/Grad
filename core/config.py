@@ -497,13 +497,21 @@ class Config:
                 fix=f"see the [hosts.*] example in {paths.config_path()}",
             )
         # The inventory has two sources and stays fixed: `[hosts.*]` in the TOML,
-        # and whatever `setup host add` wrote. Merged rather than replaced, so a
-        # machine that had hosts in its config keeps them, and validated below by
-        # the same code either way -- a host added through the wizard is not a
-        # host that skipped the rate check.
+        # and whatever `setup host add` wrote. Combined by name, so a machine
+        # that had hosts in its config keeps them, and validated below by the
+        # same code either way -- a host added through the wizard is not a host
+        # that skipped the rate check.
+        #
+        # **Whole entries, not `_merge`.** A recursive merge would have an
+        # overlay host inherit the fields it omitted from the config host of the
+        # same name -- including `key_credential`, which names the keyring entry
+        # that authenticates the connection. Replacing `gpu-box` through the
+        # wizard and getting the old box's credential, user and workdir attached
+        # to the new hostname is a connection nobody described, and it is the one
+        # field in this table where being wrong reaches a machine.
         overlay_hosts = self.overlay.get("hosts")
         if isinstance(overlay_hosts, dict) and overlay_hosts:
-            raw = _merge(raw, overlay_hosts)
+            raw = {**raw, **{k: v for k, v in overlay_hosts.items() if isinstance(v, dict)}}
         out: dict[str, Host] = {}
         for name, spec in raw.items():
             if not isinstance(spec, dict):

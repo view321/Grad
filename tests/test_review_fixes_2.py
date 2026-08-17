@@ -729,5 +729,5 @@ def test_every_credential_the_store_knows_has_a_purpose_in_the_panel():
     from ui import models
 
     for name in credentials.ALL:
-        purpose, _required = models.CREDENTIAL_NOTES.get(name, ("", False))
+        purpose, _group = models.CREDENTIAL_NOTES.get(name, ("", "extras"))
         assert purpose.strip(), f"{name} has no purpose text in the credentials panel"

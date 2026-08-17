@@ -35,6 +35,7 @@ event and not a setting.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from pathlib import Path
 from typing import Any
 
@@ -252,12 +253,21 @@ def add_host(name: str, spec: dict[str, Any], root: Path | None = None) -> dict[
             f"host {chosen!r} has a malformed rate_usd_per_hour: {rate!r}",
             fix="a number; use 0 for a host that is free to use",
         ) from None
+    if not math.isfinite(rate):
+        # `nan` fails every comparison a gate makes against it and `inf` is a
+        # price no run can be under, so both are ceilings that stop bounding
+        # anything. `core/config.py` refuses them on the TOML side and this is
+        # the writable side of the same inventory -- a check that exists in only
+        # one of two entry points is a check with a way around it.
+        raise UsageError(
+            f"host {chosen!r} has a non-finite rate_usd_per_hour ({rate})",
+            fix="rate_usd_per_hour must be a finite number; use 0 for a free host",
+        )
     if rate < 0:
         # `collect` prices wall clock against this, and a negative rate books
         # negative actuals -- which *reduce* rolling spend. A typo that raises
         # the ceiling is the one shape of error worth refusing here rather than
-        # at the point of accounting. `core/config.py` makes the same check on
-        # the TOML side; this is the writable side of the same inventory.
+        # at the point of accounting.
         raise UsageError(
             f"host {chosen!r} has a negative rate_usd_per_hour ({rate})",
             fix="use 0 for a host that is free to use; negative spend is not a thing",

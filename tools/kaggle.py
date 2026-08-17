@@ -36,7 +36,6 @@ import io
 import json
 import os
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -155,11 +154,22 @@ _TERMINAL = {"complete", "error", "cancelAcknowledged"}
 # the kaggle CLI
 # ---------------------------------------------------------------------------
 def _executable() -> str:
-    found = shutil.which("kaggle")
+    """The `kaggle` beside *this* interpreter, then the one on PATH.
+
+    The order matters more here than for a missing tool. `shutil.which` alone
+    found the CLI in the user-site Python rather than in the venv, so this
+    project's pinned `kaggle` was installed and a *different* installation's was
+    what actually ran -- silently, against an API whose contract this module
+    encodes. See `core/spawn.py:console_script`.
+    """
+    from core import spawn  # noqa: PLC0415
+
+    found = spawn.console_script("kaggle")
     if found:
         return found
     raise ConfigError(
-        "the `kaggle` CLI is not on PATH, so Kaggle kernels cannot be reached",
+        "the `kaggle` CLI is not installed in this environment or on PATH, so Kaggle "
+        "kernels cannot be reached",
         fix="pip install -e '.[kaggle]'",
     )
 

@@ -290,6 +290,36 @@ def test_an_added_host_joins_the_inventory_the_config_declared(workspace, annota
     assert hosts["from-config"].hostname == "config-box.example"
 
 
+def test_an_overlay_host_replaces_the_config_one_rather_than_inheriting_it(
+    workspace, annotated_config
+):
+    """A recursive merge would have the overlay host inherit the fields it
+    omitted -- including `key_credential`, the keyring entry that authenticates
+    the connection. Replacing `from-config` through the wizard and getting the
+    old box's credential and user attached to the new hostname is a connection
+    nobody described, and it is the one field here where being wrong reaches a
+    machine."""
+    settings.add_host("from-config", {"hostname": "new-box.example", "rate_usd_per_hour": 0.0})
+
+    host = config_mod.load(reload=True).hosts["from-config"]
+    assert host.hostname == "new-box.example"
+    assert host.user == "", "the config host's user must not have carried over"
+    assert host.key_credential is None
+    assert host.rate_usd_per_hour == 0.0
+
+
+def test_a_non_finite_host_rate_is_refused_on_the_writable_side_too(workspace):
+    """`nan` fails every comparison a gate makes against it and `inf` is a price
+    no run can be under, so both are ceilings that stop bounding anything.
+    `core/config.py` refuses them on the TOML side; a check that exists in only
+    one of two entry points is a check with a way around it."""
+    for rate in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(UsageError) as caught:
+            settings.add_host("gpu-box", {"hostname": "box.example", "rate_usd_per_hour": rate})
+        assert "finite" in caught.value.message or "negative" in caught.value.message
+    assert settings.hosts() == {}
+
+
 def test_an_unknown_host_names_both_places_it_could_have_been_added(workspace):
     """The inventory is fixed by design -- a host that can be named ad-hoc is a
     general remote-execution capability. It now has two sources, so a refusal

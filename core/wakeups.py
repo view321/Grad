@@ -380,6 +380,23 @@ def _check(condition: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     return False, {"unknown_kind": str(kind)}
 
 
+#: Run statuses that mean it is over. Every one of these is written by
+#: `core/submit.py:record_collected`, which stamps `collected_at` too -- so in
+#: practice the `collected` branch below catches them first, and this is the
+#: backstop for a record where the two disagree.
+#:
+#: An explicit set, and that is the whole point. The test used to be `status and
+#: status != "in_flight"`, which treats *everything* unrecognised as finished --
+#: including `"unknown"`, which is what `Run.status` returns for a fold with no
+#: status in it. `ledger_store.runs()` builds a node from any event carrying an
+#: id, and `jsonl.iter_records` skips a malformed line rather than raising, so a
+#: torn `run_submitted` line followed by an intact `run_handle` produces exactly
+#: that record. The wake then fired immediately, reported that the run had
+#: stopped, and spent a metered turn on a claim nothing had checked -- when the
+#: honest answer was "ask the backend", which is what falling through does.
+TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "submit_failed", "abandoned"})
+
+
 def _check_run(run_id: str) -> tuple[bool, dict[str, Any]]:
     """Has this run stopped running on whatever machine it went to?
 
@@ -402,7 +419,7 @@ def _check_run(run_id: str) -> tuple[bool, dict[str, Any]]:
 
     if record.collected:
         return True, {"run": run_id, "collected": True, "status": record.status}
-    if record.status and record.status != "in_flight":
+    if record.status in TERMINAL_RUN_STATUSES:
         return True, {"run": run_id, "status": record.status}
 
     tool = STATUS_TOOLS.get(str(record.get("platform") or ""))

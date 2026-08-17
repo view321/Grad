@@ -486,77 +486,6 @@ def _draw_workspace_menu(
                 )
 
 
-def _updates(workspace: Workspace, menu: _Menu) -> None:
-    """Which Grad this is, and the one button that changes it.
-
-    Reads a cached answer -- `ui/models.py:update_model` explains why this must
-    never be the thing that talks to the network. The section is always drawn,
-    including when there is nothing to install: "you are on v0.2.0, checked an
-    hour ago" is the answer to a question people actually ask, and a section
-    that appeared only when an update existed would leave them with nowhere to
-    look for it.
-    """
-    model = workspace.update()
-
-    def act(coro: Any, what: str) -> None:
-        menu.close()
-        workspace.spawn(coro, what)
-
-    kit.text("THIS INSTALLATION", "grad-caption").style("margin-top: 16px")
-    kit.kv([("version", model["installed"]), ("last checked", model["checked"])])
-
-    if not model["is_checkout"]:
-        kit.note(
-            "This copy was not installed from a git checkout, so it cannot update itself. "
-            "Reinstall from the repository to get updates."
-        )
-        return
-
-    for warning in model["warnings"]:
-        kit.note(f"{warning['message']} — {warning['fix']}")
-    for blocker in model["blockers"]:
-        kit.error_strip(f"{blocker['message']} — {blocker['fix']}")
-
-    with kit.row("", gap=6).style("margin-top: 8px"):
-        if model["available"]:
-            kit.chip(f"{model['target']} AVAILABLE", "attention")
-            kit.button(
-                "UPDATE",
-                tone="primary",
-                title=(
-                    "quit first: this release changes dependencies"
-                    if model["needs_reinstall"]
-                    else "fast-forward this installation and migrate its state"
-                ),
-                on_click=lambda: act(workspace.apply_update(), "update"),
-            )
-        kit.button(
-            "CHECK NOW",
-            tone="neutral",
-            title="ask the remote whether there is a newer release",
-            on_click=lambda: act(workspace.check_update(), "update check"),
-        )
-        kit.spacer()
-
-    if model["available"] and model["needs_reinstall"]:
-        kit.text(
-            "this release changes dependencies, so it needs Grad closed — quit, then run "
-            "`grad update` in a terminal",
-            "grad-caption",
-        )
-    elif model["available"]:
-        kit.text(
-            f"{model['behind']} commit(s) behind · restart Grad afterwards to load it",
-            "grad-caption",
-        )
-    if model["dirty"]:
-        kit.text(
-            "the installation has uncommitted edits; runs submitted from it are stamped "
-            "as modified and `report check` will say so",
-            "grad-caption",
-        )
-
-
 def _setup_line(workspace: Workspace) -> str:
     """One line saying whether this machine is wired up, beside the button that
     wires it. Caught, because the menu has to open on a machine where nothing
@@ -573,70 +502,9 @@ def _setup_line(workspace: Workspace) -> str:
     return f"{len([s for s in steps if s['ready']])}/{len(steps)} answered"
 
 
-# The ceiling controls moved to `ui/windows/projects.py`, and the list of the
-# three resources with them (`ui/models.py:CEILINGS`). They lived here because
-# the menu was the only project surface there was, and they addressed only the
-# *selected* project -- the window draws them for every project, which is the
-# reason it exists.
-
-
-def _credentials(ui: Any, workspace: Workspace, menu: _Menu) -> None:
-    """Store the credentials the README's install section lists.
-
-    This is the one thing the workspace genuinely could not do: `credential set`
-    prompts with `getpass`, which needs a terminal, so a fresh machine needed a
-    shell open beside the app to become usable. The value goes down a pipe
-    rather than in an argument -- see `Workspace.set_credential`.
-
-    Values are never shown, and there is nothing here that could show one: the
-    CLI does not print them and `credentials.status()` returns booleans.
-    """
-    model = workspace.credentials()
-    kit.text("CREDENTIALS", "grad-caption").style("margin-top: 16px")
-    kit.error_strip(model.get("error"))
-
-    for row in model["rows"]:
-        # Two lines, not one. On one line the fixed-width pieces -- chip, name,
-        # a 200px input, two buttons -- left the purpose text a few dozen
-        # pixels in a 540px dialog, and flex squeezed it to its min-content
-        # width: one word per line, a column taller than the rest of the row.
-        with kit.column("grad-row", gap=6):
-            # Full width explicitly: `.grad-row`'s `align-items: flex-start`
-            # would otherwise shrink each line to its content and the input
-            # with it.
-            with kit.row("", gap=6).style("width: 100%"):
-                kit.chip(row["state"], row["tone"])
-                kit.text(row["name"], "grad-mono", tag="span")
-                kit.text(
-                    row["purpose"], "grad-caption", tag="span",
-                    style="flex: 1 1 auto; min-width: 0",
-                )
-            with kit.row("", gap=6).style("width: 100%"):
-                value = (
-                    ui.input(placeholder="paste to set")
-                    .props("borderless dense type=password")
-                    .classes("field")
-                    .style("flex: 1 1 auto; padding: 0 8px")
-                )
-
-                def store(_=None, name=row["name"], field=value) -> None:
-                    pasted, field.value = field.value or "", ""
-                    workspace.spawn(workspace.set_credential(name, pasted), "credential set")
-                    menu.redraw()
-
-                def forget(_=None, name=row["name"]) -> None:
-                    workspace.spawn(workspace.delete_credential(name), "credential delete")
-                    menu.redraw()
-
-                kit.button("SET", tone="neutral", on_click=store)
-                kit.button("✕", tone="neutral", disabled=not row["stored"], title="forget it",
-                           on_click=forget)
-
-    kit.text(
-        "stored in Windows Credential Manager, never in the workspace and never in the "
-        "agent's environment — they are fetched at the moment of use",
-        "grad-caption",
-    )
+# `_updates` and `_credentials` lived here and are gone: both panels moved to
+# `ui/windows/setup.py`, which is where a fact about the installation belongs.
+# `_Menu` stays -- `_bind_client_events` still reaches for it.
 
 
 def folder_dialog_type() -> int:

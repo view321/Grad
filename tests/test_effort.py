@@ -246,5 +246,4 @@ async def test_a_model_change_with_no_session_id_is_deferred_not_paid_for(worksp
 
     session = _FakeModelSession(sdk_session_id=None, client_model="claude-opus-5")
     assert await _apply_model(session) is False
-    assert session.calls == []
-    assert session.calls == []
+    assert session.calls == [], "a deferred change must not have cost a rebuild"

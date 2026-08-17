@@ -46,20 +46,38 @@ cli = Cli(
 def cmd_show(_: argparse.Namespace) -> dict[str, Any]:
     cfg = config_mod.load(reload=True)
     overlay_models = settings.models()
+    project_models = (cfg.project_overlay.get("models") or {})
     roles = []
     for role in config_mod.MODEL_ROLES:
         configured = (cfg.user.get("models") or {}).get(role)
+        legacy = config_mod.LEGACY_MODEL_KEYS.get(role)
+        from_legacy = (cfg.user.get(legacy[0]) or {}).get(legacy[1]) if legacy else None
         roles.append(
             {
                 "role": role,
                 "model": cfg.model_for(role),
+                # The layer that actually selected it, in `model_for`'s order.
+                # This listed three of the five and got the answer wrong for the
+                # other two -- a role set by the selected project reported as
+                # "config", and one coming from a legacy `[agent] model` key
+                # reported as "default". The whole point of `show` is that the
+                # resolution can be inspected, so a source that is nearly right
+                # is worse here than in most places.
                 "source": (
-                    "setup"
+                    "project"
+                    if role in project_models
+                    else "setup"
                     if role in overlay_models
-                    else ("config" if configured else "default")
+                    else "config"
+                    if configured
+                    else "legacy"
+                    if from_legacy
+                    else "default"
                 ),
+                "project": project_models.get(role),
                 "overlay": overlay_models.get(role),
                 "config": configured,
+                "legacy": from_legacy,
                 "default": config_mod.DEFAULTS["models"][role],
             }
         )

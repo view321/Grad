@@ -371,7 +371,12 @@ def _spend_line(state: dict[str, Any]) -> str:
     """
     resources = state.get("resources") or {}
     parts: list[str] = []
-    for name, render in (("gpu_usd", _usd), ("quota_tokens", _tokens), ("credits_usd", _usd)):
+    # Derived from `CEILINGS` rather than listed again. This held its own copy of
+    # the three resources and their formatters, which is the third place that
+    # list has existed -- and a fourth ceiling added to `core/budget.py` would
+    # have appeared in every meter in the app except this line.
+    for name, _flag, _caption, _hint in CEILINGS:
+        render = _CEILING_FORMAT[name]
         entry = resources.get(name) or {}
         ceiling = entry.get("ceiling")
         if not ceiling:

@@ -630,13 +630,21 @@ class Workspace:
         than using either.
         """
         argv = ["tools.budget", "configure", "--project", project_id]
+        # An explicit flag rather than counting argv. The length sentinel was
+        # correct only while the prefix stayed four words long, which is exactly
+        # the kind of thing a later flag breaks silently -- and the failure would
+        # be a command that runs with nothing to do and reports success.
+        changed = False
         if role and model:
             argv += [f"--{role}", model]
+            changed = True
         elif role:
             argv += ["--clear", role]
+            changed = True
         if backend:
             argv += ["--backend", backend]
-        if len(argv) == 4:
+            changed = True
+        if not changed:
             self.say("nothing to change — pick a model or a backend")
             return
         await self.run_and_reload(*argv, "--json")

@@ -63,13 +63,19 @@ def render(workspace: Any) -> None:
 
     kit.steps(steps, active, lambda step_id: workspace.select("setup.step", step_id))
 
+    # `.get`, not `[]`. A step added to `SETUP_STEPS` without a body here would
+    # otherwise raise a KeyError out of `render` and take the whole window down
+    # -- the one window whose job is to be usable when nothing else works.
     body = {
         "token": _token,
         "models": _models,
         "backends": _backends,
         "extras": _extras,
-    }[active]
-    body(workspace, model)
+    }.get(active)
+    if body is None:
+        kit.empty(f"the {active} step has no body yet")
+    else:
+        body(workspace, model)
 
     _installation(workspace)
 
@@ -267,11 +273,15 @@ def _backends(workspace: Any, model: dict[str, Any]) -> None:
                         kit.text(
                             "missing: " + ", ".join(backend["missing"]), "grad-caption"
                         ).style("margin-top: 6px")
+                    # Named explicitly rather than falling through to `_hosts`.
+                    # A fourth backend would otherwise be handed an SSH host
+                    # editor, which is not merely useless -- it invites someone
+                    # to add an inventory entry that backend will never read.
                     if name == "kaggle":
                         _kaggle(workspace, model)
                     elif name == "hf_jobs":
                         _credential_field(workspace, "hf_token")
-                    else:
+                    elif name == "ssh":
                         _hosts(workspace, model)
 
 

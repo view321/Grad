@@ -273,14 +273,22 @@ def _models(workspace: Any, model: dict[str, Any], row: dict[str, Any]) -> None:
                 .classes("field")
                 .style("flex: 0 0 170px; padding: 0 8px")
             )
-            kit.button(
-                "SET",
-                tone="primary",
-                on_click=lambda _=None, pid=row["id"], r=entry["role"], f=field: workspace.spawn(
-                    workspace.configure_project(pid, role=r, model=(f.value or "").strip()),
-                    "project model",
-                ),
-            )
+            def set_model(
+                _=None, pid: str = row["id"], role: str = entry["role"], f: Any = field
+            ) -> None:
+                # An empty field means "I clicked the wrong button", not "clear
+                # it": `configure_project` reads an empty model for a named role
+                # as `--clear`, so SET on a blank field silently dropped the
+                # override that ✕ is there to drop deliberately.
+                chosen = (f.value or "").strip()
+                if not chosen:
+                    workspace.say("no model given — type an id, or use ✕ to drop the override")
+                    return
+                workspace.spawn(
+                    workspace.configure_project(pid, role=role, model=chosen), "project model"
+                )
+
+            kit.button("SET", tone="primary", on_click=set_model)
             kit.button(
                 "✕",
                 tone="neutral",
@@ -345,7 +353,7 @@ def _new_project(workspace: Any, model: dict[str, Any]) -> None:
             kit.label("ceilings").style("margin-top: 10px")
             fields: dict[str, Any] = {}
             with kit.row("", gap=6):
-                for resource, flag, caption_text, hint in CEILINGS:
+                for _resource, flag, caption_text, hint in CEILINGS:
                     field = (
                         ui.input(placeholder=caption_text)
                         .props("borderless dense")
