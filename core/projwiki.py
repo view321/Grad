@@ -170,11 +170,28 @@ def symbols(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 def _callable(node: Any, path: Path, *, qualifier: str = "") -> dict[str, Any]:
-    args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
-    if node.args.vararg:
-        args.append("*" + node.args.vararg.arg)
-    if node.args.kwarg:
-        args.append("**" + node.args.kwarg.arg)
+    """One function or method, with the signature it actually has.
+
+    Positional-only arguments and the `/` and `*` markers are part of the
+    contract, not decoration: `def f(a, /, b, *, c)` rendered as `def f(b, c)`
+    -- `posonlyargs` is a separate list and was never read -- which is not a
+    shortened signature but a *wrong* one, in a fact sheet whose whole claim is
+    that everything in it was read off disk.
+    """
+    spec = node.args
+    args = [a.arg for a in spec.posonlyargs]
+    if spec.posonlyargs:
+        args.append("/")
+    args += [a.arg for a in spec.args]
+    if spec.vararg:
+        args.append("*" + spec.vararg.arg)
+    elif spec.kwonlyargs:
+        # The bare `*` is what *makes* the arguments after it keyword-only.
+        # Without it they read as ordinary positional ones.
+        args.append("*")
+    args += [a.arg for a in spec.kwonlyargs]
+    if spec.kwarg:
+        args.append("**" + spec.kwarg.arg)
     name = f"{qualifier}.{node.name}" if qualifier else node.name
     return {
         "kind": "method" if qualifier else "function",
@@ -291,6 +308,7 @@ def _modules(
     files = sorted(
         p for p in directory.rglob(SOURCE_GLOB) if p.is_file() and not SKIP_DIRS & set(p.parts)
     )
+    root = directory.resolve()
     reached: set[Path] = set()
     warnings: list[str] = []
     for spec in specs:
@@ -298,6 +316,19 @@ def _modules(
         if not entry:
             continue
         path = (directory / str(entry)).resolve()
+        # The entrypoint is a *value read from a file*, and it is the one thing
+        # here that can point outside the pipeline: an absolute path, or one
+        # that climbs. `import_graph` would then read and parse it, which is
+        # this module's scope allowlist -- core/ and tools/ are in scope,
+        # `notes/` and `data/papers/` are not -- being decided by a `.toml`
+        # rather than by code. Checked after `resolve`, so a symlink is caught
+        # too.
+        if root not in path.parents:
+            warnings.append(
+                f"{spec['name']}: entrypoint {entry} resolves outside the pipeline directory "
+                "and was not followed"
+            )
+            continue
         if not path.is_file():
             warnings.append(f"{spec['name']}: entrypoint {entry} does not exist")
             continue
@@ -318,7 +349,7 @@ def _modules(
                 "path": path.relative_to(directory).as_posix(),
                 "doc": _module_doc(source),
                 "symbols": found,
-                "imports": _first_party_imports(source, directory),
+                "imports": _first_party_imports(source, directory, path),
                 "reachable": path.resolve() in reached,
                 "is_test": path.name.startswith("test_") or path.name.endswith("_test.py"),
                 "lines": source.count("\n") + 1 if source else 0,
@@ -336,27 +367,105 @@ def _module_doc(source: str) -> str:
         return ""
 
 
-def _first_party_imports(source: str, directory: Path) -> list[str]:
-    """Sibling modules this file imports. Third-party ones are pinned by the
-    image digest and are not what a map of the pipeline is about."""
+def _local_modules(directory: Path) -> set[str]:
+    """Every module in the pipeline, by the name an import would use.
+
+    Dotted, not by file stem. `rglob` (matching `_modules`, so a pipeline with a
+    subdirectory has those files listed *and* reachable as someone's import)
+    means stems collide with the world: a `kernels/scan.py` made every
+    `import scan` in the tree look first-party, including a third-party one --
+    a wrong edge in a fact sheet whose entire claim is that it was read off
+    disk. `kernels/__init__.py` names the package `kernels` rather than a module
+    called `__init__`.
+    """
+    out: set[str] = set()
+    for path in directory.rglob(SOURCE_GLOB):
+        if not path.is_file() or SKIP_DIRS & set(path.parts):
+            continue
+        parts = path.relative_to(directory).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if parts:
+            out.add(".".join(parts))
+    return out
+
+
+def _package_of(path: Path, directory: Path) -> str:
+    """The package a relative import inside `path` is relative *to*."""
+    parts = path.relative_to(directory).with_suffix("").parts
+    # A package's `__init__.py` is inside the package it names; every other
+    # module is inside its parent.
+    return ".".join(parts[:-1]) if parts[-1] != "__init__" else ".".join(parts[:-1])
+
+
+def _first_party_imports(source: str, directory: Path, path: Path | None = None) -> list[str]:
+    """Modules in this pipeline that this file imports.
+
+    Third-party imports are deliberately absent: they are pinned by the image
+    digest, and a map of the pipeline is about how its own pieces fit. Only the
+    names that resolve to a file in the tree are kept, so an import that merely
+    shares a word with one of them is not reported as an edge.
+    """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
-    # `rglob`, matching `_modules`: a pipeline that puts anything in a
-    # subdirectory would otherwise have those modules listed as files and never
-    # as anyone's import, which draws a dependency graph with edges missing.
-    local = {p.stem for p in directory.rglob(SOURCE_GLOB) if not SKIP_DIRS & set(p.parts)}
+    local = _local_modules(directory)
+    package = _package_of(path, directory) if path is not None else ""
+
+    def resolve(name: str) -> str | None:
+        """`a.b.c` if the tree has it, else the longest prefix it does have."""
+        parts = name.split(".")
+        for stop in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:stop])
+            if candidate in local:
+                return candidate
+        return None
+
+    def relative(level: int, module: str | None, leaf: str = "") -> str | None:
+        """`from ..pkg import x`, against the importing file's own package."""
+        base = package.split(".") if package else []
+        # One dot is "this package"; each further dot climbs one level.
+        if level > 1:
+            base = base[: len(base) - (level - 1)]
+        parts = [*base, *(module.split(".") if module else []), *([leaf] if leaf else [])]
+        return resolve(".".join(parts)) if parts else None
+
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names |= {a.name.split(".")[0] for a in node.names}
+            names |= {r for a in node.names if (r := resolve(a.name))}
         elif isinstance(node, ast.ImportFrom):
-            if node.level:  # a relative import is first-party by definition
-                names |= {a.name for a in node.names}
-            if node.module:
-                names.add(node.module.split(".")[0])
-    return sorted(n for n in names if n in local)
+            # `from pkg import mod` names a *module* as often as an attribute,
+            # so each alias is tried as one and the bare module is tried too --
+            # the same ambiguity `core/submission.py:import_graph` resolves for
+            # the submission hash, and for the same reason.
+            resolved = {
+                r
+                for alias in node.names
+                if (
+                    r := (
+                        relative(node.level, node.module, alias.name)
+                        if node.level
+                        else resolve(f"{node.module}.{alias.name}" if node.module else alias.name)
+                    )
+                )
+            }
+            if resolved:
+                names |= resolved
+                continue
+            # Only when no alias was a module: `from kernels import scan` is an
+            # edge to `kernels.scan`, and reporting `kernels` beside it would be
+            # a second edge for one import. `from kernels import CONST` has no
+            # submodule to name, and there the package *is* the edge.
+            bare = (
+                relative(node.level, node.module)
+                if node.level
+                else (resolve(node.module) if node.module else None)
+            )
+            if bare:
+                names.add(bare)
+    return sorted(names)
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +591,20 @@ def _paper_key(value: Any) -> str:
 # ---------------------------------------------------------------------------
 # the whole thing
 # ---------------------------------------------------------------------------
-def source_hash(project_id: str) -> dict[str, Any]:
+#: What a change to invalidates a wiki. **Source and spec, and nothing else** --
+#: which is narrower than the file list in `_tree` on purpose.
+#:
+#: A pipeline directory also holds `metrics.jsonl`, `runs.jsonl` and whatever
+#: the last kernel wrote there, and those change every time a run is collected.
+#: Hashing them would mark every page stale the moment a *result* arrived, which
+#: is the opposite of what staleness means here: a page is stale when the code
+#: it describes has moved. It is also the honest line, because these are the
+#: only files whose contents ever reach a page -- `_tree` lists the rest by name
+#: and size, and a name does not change when the bytes behind it do.
+HASHED_SUFFIXES: tuple[str, ...] = (".py", ".toml")
+
+
+def source_hash(project_id: str, pipelines: list[Path] | None = None) -> dict[str, Any]:
     """A digest over exactly what the wiki was built from.
 
     The same idea as `core/submission.py`'s hash and `tools/wiki.py`'s: not a
@@ -491,6 +613,13 @@ def source_hash(project_id: str) -> dict[str, Any]:
     project's authored documents -- and deliberately not the ledger, which grows
     every time a run is collected: a wiki is not stale because a new result
     arrived, it is stale because the code it describes changed.
+
+    `pipelines` is passed by `collect`, which has already worked out which
+    directories belong to this project. Recomputing it here read the ledger a
+    second time for an answer it already had -- and left a window in which the
+    hash and `facts["pipelines"]` could describe two different sets of
+    directories, so a wiki could record a digest over files no page was written
+    from.
     """
     digests: dict[str, str] = {}
     root = paths.root()
@@ -499,11 +628,11 @@ def source_hash(project_id: str) -> dict[str, Any]:
         path = directory / name
         if path.is_file():
             digests[path.relative_to(root).as_posix()] = _digest(path)
-    for pipeline in pipelines_for(project_id):
+    for pipeline in pipelines if pipelines is not None else pipelines_for(project_id):
         for path in sorted(pipeline.rglob("*")):
             if not path.is_file() or SKIP_DIRS & set(path.parts):
                 continue
-            if path.suffix.lower() not in (".py", ".toml"):
+            if path.suffix.lower() not in HASHED_SUFFIXES:
                 continue
             digests[path.relative_to(root).as_posix()] = _digest(path)
     canonical = "\n".join(f"{k}:{v}" for k, v in sorted(digests.items()))
@@ -555,7 +684,12 @@ def collect(project_id: str) -> dict[str, Any]:
 
     warnings: list[str] = []
     pipelines: list[dict[str, Any]] = []
-    for pipeline in pipelines_for(project_id, state):
+    # Worked out once and reused for the digest below: two calls could disagree
+    # -- `pipelines_for` reads the ledger, and a run collected between them adds
+    # a directory -- and a wiki whose hash covers files no page was written from
+    # is a wiki that reports itself stale for a reason nobody can find.
+    directories = pipelines_for(project_id, state)
+    for pipeline in directories:
         specs = _specs(pipeline)
         modules, notes = _modules(pipeline, specs)
         warnings += notes
@@ -577,5 +711,5 @@ def collect(project_id: str) -> dict[str, Any]:
         "ledger": ledger,
         "papers": _papers(ledger),
         "warnings": warnings,
-        "source": source_hash(project_id),
+        "source": source_hash(project_id, directories),
     }

@@ -477,15 +477,20 @@ def test_a_project_with_no_pipeline_leaves_no_facts_behind(workspace):
 
 def test_imports_from_a_subdirectory_are_first_party_too(project):
     """`_modules` walks with `rglob` and this used `glob`, so a pipeline with
-    anything in a subdirectory drew a dependency graph with edges missing."""
+    anything in a subdirectory drew a dependency graph with edges missing.
+
+    By the name an import would actually use -- `kernels.scan`, not the file's
+    stem. A bare `import scan` would not find that file at runtime either, and
+    reporting it as an edge would be inventing one.
+    """
     nested = paths.root() / "pipelines" / "demo" / "kernels"
     nested.mkdir(parents=True, exist_ok=True)
     (nested / "scan.py").write_text('"""Scan."""\n\n\ndef run():\n    return 1\n', encoding="utf-8")
     (paths.root() / "pipelines" / "demo" / "train.py").write_text(
-        "import data\nimport scan\n" + TRAIN.split("import data", 1)[1], encoding="utf-8"
+        "import data\nimport kernels.scan\n" + TRAIN.split("import data", 1)[1], encoding="utf-8"
     )
     facts = projwiki.collect(project)
-    assert "scan" in _module(facts, "train.py")["imports"]
+    assert _module(facts, "train.py")["imports"] == ["data", "kernels.scan"]
 
 
 def test_the_missing_project_hint_lists_the_ones_that_exist(workspace):
@@ -522,3 +527,98 @@ def test_facts_only_re_extracts_without_discarding_the_prose(project, monkeypatc
     # ...and the facts underneath it are the new ones, which is what was asked for.
     assert out["source_hash"] == projwiki.source_hash(project)["hash"]
     assert projwiki_tool.cmd_check(argparse.Namespace(project=project, json=True))["current"] is True
+
+
+# ---------------------------------------------------------------------------
+# signatures and edges have to be right, not approximately right
+# ---------------------------------------------------------------------------
+def test_a_signature_keeps_its_positional_only_and_keyword_only_markers(workspace):
+    """`posonlyargs` is a separate list and was never read, so `def f(a, /, b, *,
+    c)` came out as `def f(b, c)` -- not a shortened signature but a wrong one,
+    in a fact sheet whose whole claim is that it was read off disk."""
+    path = workspace / "sig.py"
+    path.write_text(
+        "def f(a, /, b, *, c):\n    pass\n\n\n"
+        "def g(a, *rest, k=1, **kw):\n    pass\n\n\n"
+        "def h(x, y):\n    pass\n",
+        encoding="utf-8",
+    )
+    found = {s["name"]: s["signature"] for s in projwiki.symbols(path)[0]}
+    assert found["f"] == "def f(a, /, b, *, c)"
+    assert found["g"] == "def g(a, *rest, k, **kw)"
+    assert found["h"] == "def h(x, y)"
+
+
+def test_an_import_is_only_first_party_when_it_resolves_to_a_file(project):
+    """Matching by file stem made a `kernels/scan.py` claim every `import scan`
+    in the tree, third-party ones included -- a wrong edge in a fact sheet that
+    exists to be trustworthy."""
+    pipeline = paths.root() / "pipelines" / "demo"
+    (pipeline / "kernels").mkdir(exist_ok=True)
+    (pipeline / "kernels" / "__init__.py").write_text("", encoding="utf-8")
+    (pipeline / "kernels" / "scan.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (pipeline / "train.py").write_text(
+        "import data\n"
+        "import scan\n"                      # third-party: no top-level scan.py here
+        "import kernels.scan\n"
+        "from kernels import scan as s\n"
+        "import torch\n"
+        + TRAIN.split("import data", 1)[1],
+        encoding="utf-8",
+    )
+    facts = projwiki.collect(project)
+    assert _module(facts, "train.py")["imports"] == ["data", "kernels.scan"]
+
+
+def test_a_relative_import_resolves_against_its_own_package(project):
+    pipeline = paths.root() / "pipelines" / "demo"
+    (pipeline / "kernels").mkdir(exist_ok=True)
+    (pipeline / "kernels" / "__init__.py").write_text("", encoding="utf-8")
+    (pipeline / "kernels" / "scan.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (pipeline / "kernels" / "block.py").write_text(
+        "from . import scan\nfrom .scan import run\n", encoding="utf-8"
+    )
+    facts = projwiki.collect(project)
+    assert _module(facts, "kernels/block.py")["imports"] == ["kernels.scan"]
+
+
+def test_an_entrypoint_that_points_outside_the_pipeline_is_not_followed(project):
+    """The entrypoint is a value read from a `.toml`, and it is the one thing
+    here that can name a path outside the scope this module says it keeps."""
+    outside = paths.notes_dir()
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "private.py").write_text("SECRET = 1\n", encoding="utf-8")
+    (paths.root() / "pipelines" / "demo" / "spec.toml").write_text(
+        SPEC.replace('entrypoint   = "train.py"', 'entrypoint   = "../../notes/private.py"'),
+        encoding="utf-8",
+    )
+    facts = projwiki.collect(project)
+    assert any("outside the pipeline directory" in w for w in facts["warnings"])
+    assert not any(m["reachable"] for m in facts["pipelines"][0]["modules"])
+
+
+# ---------------------------------------------------------------------------
+# one snapshot, one digest
+# ---------------------------------------------------------------------------
+def test_the_digest_covers_the_pipelines_the_facts_describe(project):
+    """`source_hash` recomputed which directories belong to the project, which
+    read the ledger twice for an answer `collect` already had -- and left a
+    window in which the two could disagree."""
+    facts = projwiki.collect(project)
+    named = {p["name"] for p in facts["pipelines"]}
+    hashed = {k.split("/")[1] for k in facts["source"]["files"] if k.startswith("pipelines/")}
+    assert hashed == named
+
+
+def test_a_result_written_into_the_pipeline_does_not_make_the_wiki_stale(project):
+    """The reason the digest is narrower than the file list: a kernel writes its
+    metrics back into this directory, and hashing them would report every page
+    stale the moment a *result* arrived."""
+    before = projwiki.source_hash(project)["hash"]
+    (paths.root() / "pipelines" / "demo" / "metrics.jsonl").write_text(
+        '{"val_loss": 3.0}\n', encoding="utf-8"
+    )
+    assert projwiki.source_hash(project)["hash"] == before
+    # ...and it is still listed, because what is in the directory is a fact.
+    facts = projwiki.collect(project)
+    assert any(r["path"] == "metrics.jsonl" for r in facts["pipelines"][0]["tree"])

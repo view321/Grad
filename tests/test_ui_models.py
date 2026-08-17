@@ -521,13 +521,23 @@ def test_a_filter_the_user_pressed_is_left_alone_even_when_empty(workspace):
 
 def test_the_window_asks_for_no_filter_until_one_is_chosen(workspace):
     """The state builder has to pass `None`, not `"cited"` -- a default there
-    makes "nobody pressed a chip" and "someone pressed CITED" the same value."""
+    makes "nobody pressed a chip" and "someone pressed CITED" the same value,
+    and the fallback then cannot fire for the case it exists for.
+
+    Asserted as the concrete answer rather than "one of the three": with a read
+    paper and nothing cited, `read` is the only correct one, and a membership
+    check would have passed on the `cited` this is meant to catch.
+    """
     from ui import state as state_mod
+
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
 
     class _Space:
         selection: dict = {}
 
-    assert state_mod.MODEL_BUILDERS["papers"](_Space())["filter"] in models.FILTER_KEYS
+    assert state_mod.MODEL_BUILDERS["papers"](_Space())["filter"] == "read"
 
 
 # ---------------------------------------------------------------------------
