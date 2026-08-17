@@ -45,11 +45,12 @@ def build(workspace: Workspace) -> None:
 
     windows = _windows_menu(ui, workspace)
     projects = _project_menu(ui, workspace)
+    workspaces = _workspace_menu(ui, workspace)
 
     def draw_appbar() -> None:
         appbar.clear()
         with appbar:
-            _appbar(workspace, windows, projects)
+            _appbar(workspace, windows, projects, workspaces)
 
     def draw_status() -> None:
         statusbar.clear()
@@ -96,6 +97,24 @@ def build(workspace: Workspace) -> None:
                             _handle(vertical=True)
                         with kit.el("div", "grad-slot", style=f"--grad-fraction: {slot.fraction:.6f}"):
                             _frame(workspace, slot.window, roots, bars, attic, draw_window)
+
+            # Every root above has just been through `Element.move()`, and a
+            # moved root comes back as a *new DOM node* on the client -- which
+            # silently discards anything a window attached to its own node
+            # rather than to a NiceGUI element. The sticky transcript is the one
+            # that mattered: it was armed once at chat render and died on the
+            # first retile, so opening any window once stopped the chat
+            # scrolling for the rest of the session. `gradRearm` is idempotent
+            # and knows which ids to re-arm, so the shell does not have to know
+            # that `grad-transcript` exists.
+            #
+            # Inside `with tiles`, and that is not stylistic. This runs from a
+            # titlebar button, and by here the retile has deleted that button
+            # along with the slot it belonged to -- so at this point there is no
+            # current slot, no way to reach the client through one, and
+            # `kit.run_js` raises into `_guard` rather than sending anything.
+            # `tiles` is built once in `build` and outlives every retile.
+            kit.run_js("window.gradRearm && window.gradRearm()")
 
     workspace.bind_chrome(draw_appbar)
     workspace.bind_chrome(draw_status)
@@ -154,7 +173,7 @@ def _install_quit_guard(ui: Any, workspace: Workspace) -> None:
 # ---------------------------------------------------------------------------
 # chrome
 # ---------------------------------------------------------------------------
-def _appbar(workspace: Workspace, windows: Any, projects: Any) -> None:
+def _appbar(workspace: Workspace, windows: Any, projects: Any, workspaces: Any) -> None:
     header = workspace.header()
     session = header["session"]
 
@@ -162,13 +181,30 @@ def _appbar(workspace: Workspace, windows: Any, projects: Any) -> None:
         kit.text("∇", "grad-mark")
         kit.text("GRAD", "grad-wordmark")
 
+    # Two scopes, two controls. One folder holds many projects, and switching
+    # folders replaces the ledger, the project list, the notebooks and the config
+    # under every open window -- while switching project changes what spend is
+    # charged to. They were one dialog, six rows apart, styled identically.
+    with kit.el("div", "grad-appbar-cell"):
+        kit.text("workspace", "dim")
+        kit.button(
+            f"{header['root_name']} ▾",
+            tone="ghost",
+            classes="grad-appbar-btn",
+            # The basename is on the button because an absolute path does not fit
+            # the cell; the whole one is here, because "which folder is this?"
+            # has to be answerable without opening anything.
+            title=f"{header['root']} — switch folder, credentials, and this installation",
+            on_click=workspaces.open,
+        )
+
     with kit.el("div", "grad-appbar-cell"):
         kit.text("project", "dim")
         kit.button(
             f"{header['project']} ▾",
             tone="ghost",
             classes="grad-appbar-btn",
-            title="switch project, or open another workspace folder",
+            title="switch the project runs and tokens are charged to",
             on_click=projects.open,
         )
         # Only when there is something to do about it. A permanent "up to date"
@@ -183,7 +219,7 @@ def _appbar(workspace: Workspace, windows: Any, projects: Any) -> None:
                 tone="ghost",
                 classes="grad-appbar-btn",
                 title=f"{update['target']} is available — open the workspace menu to install it",
-                on_click=projects.open,
+                on_click=workspaces.open,
             )
 
     with kit.el("div", "grad-appbar-cell"):
@@ -269,14 +305,23 @@ _Menu = kit.Menu
 
 
 def _project_menu(ui: Any, workspace: Workspace) -> kit.Menu:
-    """The workspace menu: which folder, which project, and how to change both."""
-    return kit.menu(
-        lambda body, menu: _draw_project_menu(ui, workspace, body, menu), width=540
-    )
+    """The quick switcher: which project is charged, and nothing else.
+
+    It used to be the whole settings surface — folder, recent folders, projects,
+    creation, ceilings, credentials and the updater, in one 540px dialog behind a
+    button labelled `project`. Four scopes in one menu, and the two most
+    different actions in the app (switch project, switch folder) six rows apart
+    and styled the same.
+
+    What is left here is the one thing worth a single click from the title bar.
+    Everything a project *is* — its ceilings, its memory, creating and closing —
+    is the projects window, which this opens.
+    """
+    return kit.menu(lambda body, menu: _draw_project_menu(workspace, body, menu), width=460)
 
 
-def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> None:
-    model = workspace.workspaces()
+def _draw_project_menu(workspace: Workspace, body: Any, menu: Any) -> None:
+    model = workspace.projects()
     body.clear()
 
     def act(coro: Any, what: str) -> None:
@@ -284,6 +329,104 @@ def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> N
         dialog still open over it would be showing the workspace it just left."""
         menu.close()
         workspace.spawn(coro, what)
+
+    def open_window() -> None:
+        menu.close()
+        workspace.open("projects")
+
+    with body:
+        kit.text("PROJECT", "head ink")
+        with kit.el("div", "body"):
+            kit.error_strip(model.get("error"))
+
+            rows = [r for r in model.get("rows") or [] if r["status"] != "closed"]
+            if not rows:
+                kit.text("none in this folder yet", "grad-empty")
+            for project in rows:
+                with kit.row("grad-row", gap=6):
+                    kit.button(
+                        "IN USE" if project["current"] else "USE",
+                        tone="active" if project["current"] else "neutral",
+                        disabled=project["current"],
+                        on_click=lambda _=None, pid=project["id"]: act(
+                            workspace.use_project(pid), "project switch"
+                        ),
+                    )
+                    kit.text(project["id"], "", style="font-weight: 700; white-space: nowrap")
+                    # Squeezable, but never to less than a word a line: the id,
+                    # the badge and the spend own their width, the title takes
+                    # what is left and ellipsizes.
+                    kit.text(
+                        project["title"], "grad-caption",
+                        style="flex: 1 1 auto; min-width: 0; overflow: hidden;"
+                        " text-overflow: ellipsis; white-space: nowrap",
+                    )
+                    kit.spacer()
+                    if project["unbounded"]:
+                        kit.chip("UNBOUNDED", "attention")
+                    kit.text(project["spend"], "grad-caption")
+
+            with kit.row("", gap=6).style("margin-top: 12px"):
+                kit.button(
+                    "OPEN THE PROJECTS WINDOW",
+                    tone="primary",
+                    title="ceilings, memory, creating and closing — for every project, not just this one",
+                    on_click=open_window,
+                )
+
+
+def _workspace_menu(ui: Any, workspace: Workspace) -> kit.Menu:
+    """Everything that is not a project: which folder, which credentials, which
+    Grad.
+
+    The `Confirm` is built here, during the page, for the reason
+    `_install_quit_guard` builds its dialog here: a NiceGUI element belongs to
+    the client whose slot context made it, and by the time the answer is wanted
+    that context is gone.
+    """
+    confirm = kit.confirm()
+    return kit.menu(
+        lambda body, menu: _draw_workspace_menu(ui, workspace, body, menu, confirm), width=540
+    )
+
+
+#: What switching folders actually does, said before it happens. Every window in
+#: the app re-reads from the new root, `config/grad.toml` may resolve to a
+#: different file, and the agent's own tools follow — which is the whole point,
+#: and is also nothing like the project switch two controls away.
+SWITCH_NOTE = (
+    "The ledger, the project list, the notebooks and the config all come from the folder, "
+    "so every open window re-reads from the new one and the agent's tools follow it. "
+    "Nothing is deleted, and the folder you are leaving is untouched."
+)
+
+
+def _draw_workspace_menu(
+    ui: Any, workspace: Workspace, body: Any, menu: Any, confirm: kit.Confirm
+) -> None:
+    model = workspace.workspaces()
+    body.clear()
+
+    def act(coro: Any, what: str) -> None:
+        menu.close()
+        workspace.spawn(coro, what)
+
+    def open_setup() -> None:
+        menu.close()
+        workspace.open("setup")
+
+    async def switch(path: str, *, create: bool = False) -> None:
+        if not (path or "").strip():
+            workspace.say("no folder given")
+            return
+        if not await confirm.ask(
+            "Switch workspace folder?",
+            f"This app moves to {path}.",
+            confirm="SWITCH",
+            note_text=SWITCH_NOTE,
+        ):
+            return
+        await workspace.switch_root(path, create=create)
 
     with body:
         kit.text("WORKSPACE", "head ink")
@@ -308,9 +451,7 @@ def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> N
                     "OPEN",
                     tone="primary",
                     title="switch this app to that folder",
-                    on_click=lambda: act(
-                        workspace.switch_root(folder.value or "", create=True), "workspace switch"
-                    ),
+                    on_click=lambda: act(switch(folder.value or "", create=True), "workspace switch"),
                 )
             kit.text(
                 "a folder that does not exist yet is created; the agent's tools follow it",
@@ -324,260 +465,46 @@ def _draw_project_menu(ui: Any, workspace: Workspace, body: Any, menu: Any) -> N
                         kit.button(
                             "OPEN",
                             tone="neutral",
-                            on_click=lambda _=None, p=path: act(
-                                workspace.switch_root(p), "workspace switch"
-                            ),
+                            on_click=lambda _=None, p=path: act(switch(p), "workspace switch"),
                         )
                         kit.text(path, "grad-caption")
 
-            # -- projects ---------------------------------------------------
-            kit.text("PROJECTS IN THIS FOLDER", "grad-caption").style("margin-top: 16px")
-            if not model["projects"]:
-                kit.text("none yet — the first one is created below", "grad-empty")
-            for project in model["projects"]:
-                with kit.row("grad-row", gap=6):
-                    kit.button(
-                        "IN USE" if project["current"] else "USE",
-                        tone="active" if project["current"] else "neutral",
-                        disabled=project["current"] or project["status"] == "closed",
-                        on_click=lambda _=None, pid=project["id"]: act(
-                            workspace.use_project(pid), "project switch"
-                        ),
-                    )
-                    kit.text(project["id"], "", style="font-weight: 700; white-space: nowrap")
-                    # Squeezable, but never to less than a word a line: the id,
-                    # the badge and the spend own their width, the title takes
-                    # what is left and ellipsizes.
-                    kit.text(
-                        project["title"], "grad-caption",
-                        style="flex: 1 1 auto; min-width: 0; overflow: hidden;"
-                        " text-overflow: ellipsis; white-space: nowrap",
-                    )
-                    kit.spacer()
-                    if project["status"] == "closed":
-                        kit.chip("CLOSED", "neutral")
-                    kit.text(project["spend"], "grad-caption")
-
-            # -- a new one --------------------------------------------------
-            kit.text("NEW PROJECT", "grad-caption").style("margin-top: 16px")
-            with kit.row("", gap=6):
-                project_id = (
-                    ui.input(placeholder="id, e.g. proj-scaling-w2")
-                    .props("borderless dense")
-                    .classes("field")
-                    .style("flex: 0 0 220px; padding: 0 8px")
-                )
-                title = (
-                    ui.input(placeholder="what this research is")
-                    .props("borderless dense")
-                    .classes("field")
-                    .style("flex: 1 1 auto; padding: 0 8px")
-                )
+            # Credentials and the updater moved to the setup window. They are
+            # facts about this machine and this installation, they need more
+            # room than a 540px dialog, and neither was ever a thing you do
+            # *while* switching folders.
+            with kit.row("", gap=6).style("margin-top: 16px"):
                 kit.button(
-                    "CREATE",
+                    "SETUP",
                     tone="primary",
-                    on_click=lambda: act(
-                        workspace.create_project(project_id.value or "", title.value or ""),
-                        "project create",
-                    ),
+                    title="token, models, backends, credentials and this installation",
+                    on_click=open_setup,
                 )
-            kit.text(
-                "created with no ceilings — set them below once it is selected",
-                "grad-caption",
-            )
-
-            _ceilings(ui, workspace, model, menu)
-            _credentials(ui, workspace, menu)
-            _updates(workspace, menu)
-
-
-def _updates(workspace: Workspace, menu: _Menu) -> None:
-    """Which Grad this is, and the one button that changes it.
-
-    Reads a cached answer -- `ui/models.py:update_model` explains why this must
-    never be the thing that talks to the network. The section is always drawn,
-    including when there is nothing to install: "you are on v0.2.0, checked an
-    hour ago" is the answer to a question people actually ask, and a section
-    that appeared only when an update existed would leave them with nowhere to
-    look for it.
-    """
-    model = workspace.update()
-
-    def act(coro: Any, what: str) -> None:
-        menu.close()
-        workspace.spawn(coro, what)
-
-    kit.text("THIS INSTALLATION", "grad-caption").style("margin-top: 16px")
-    kit.kv([("version", model["installed"]), ("last checked", model["checked"])])
-
-    if not model["is_checkout"]:
-        kit.note(
-            "This copy was not installed from a git checkout, so it cannot update itself. "
-            "Reinstall from the repository to get updates."
-        )
-        return
-
-    for warning in model["warnings"]:
-        kit.note(f"{warning['message']} — {warning['fix']}")
-    for blocker in model["blockers"]:
-        kit.error_strip(f"{blocker['message']} — {blocker['fix']}")
-
-    with kit.row("", gap=6).style("margin-top: 8px"):
-        if model["available"]:
-            kit.chip(f"{model['target']} AVAILABLE", "attention")
-            kit.button(
-                "UPDATE",
-                tone="primary",
-                title=(
-                    "quit first: this release changes dependencies"
-                    if model["needs_reinstall"]
-                    else "fast-forward this installation and migrate its state"
-                ),
-                on_click=lambda: act(workspace.apply_update(), "update"),
-            )
-        kit.button(
-            "CHECK NOW",
-            tone="neutral",
-            title="ask the remote whether there is a newer release",
-            on_click=lambda: act(workspace.check_update(), "update check"),
-        )
-        kit.spacer()
-
-    if model["available"] and model["needs_reinstall"]:
-        kit.text(
-            "this release changes dependencies, so it needs Grad closed — quit, then run "
-            "`grad update` in a terminal",
-            "grad-caption",
-        )
-    elif model["available"]:
-        kit.text(
-            f"{model['behind']} commit(s) behind · restart Grad afterwards to load it",
-            "grad-caption",
-        )
-    if model["dirty"]:
-        kit.text(
-            "the installation has uncommitted edits; runs submitted from it are stamped "
-            "as modified and `report check` will say so",
-            "grad-caption",
-        )
-
-
-#: The three ceilings a project carries, and the unit each is counted in.
-#: `tools.budget raise` takes one flag per resource; this is that list, in the
-#: order the quota window draws them.
-CEILINGS = (
-    ("gpu-usd", "GPU $", "dollars of remote compute"),
-    ("quota-tokens", "tokens", "subscription tokens, all roles"),
-    ("credits-usd", "credits $", "reranker and embeddings"),
-)
-
-
-def _ceilings(ui: Any, workspace: Workspace, model: dict[str, Any], menu: _Menu) -> None:
-    """Move a ceiling on the selected project.
-
-    A logged event, not a setting: `budget raise` appends to the ledger, so the
-    history of what was raised and when survives. The UI runs the same command
-    for the same reason every other button does.
-    """
-    current = next((p for p in model["projects"] if p["current"]), None)
-    if current is None:
-        return
-
-    kit.text("CEILINGS", "grad-caption").style("margin-top: 16px")
-    fields: dict[str, Any] = {}
-    with kit.row("", gap=6):
-        for flag, caption, hint in CEILINGS:
-            field = (
-                ui.input(placeholder=caption)
-                .props("borderless dense")
-                .classes("field")
-                .style("flex: 1 1 0; padding: 0 8px")
-            )
-            field.props(f'title="{kit.attr(hint)}"')
-            fields[flag] = field
-
-        def raise_them() -> None:
-            # `--project <id>`, not a positional: `tools.budget raise` takes the
-            # project as a flag, and passing it positionally failed with a usage
-            # error on every click -- the one budget-mutating control in the app,
-            # dead since it was written, and the control the over-budget refusal
-            # tells you to use. `tests/test_ui_argv.py` now runs every button's
-            # argv through the real parser.
-            argv = ["tools.budget", "raise", "--project", current["id"]]
-            base = len(argv)
-            for flag, field in fields.items():
-                if (field.value or "").strip():
-                    argv += [f"--{flag}", str(field.value).strip()]
-            if len(argv) == base:
-                workspace.say("no ceiling given — fill one of the three fields")
-                return
-            menu.close()
-            workspace.spawn(workspace.run_and_reload(*argv, "--json"), "ceiling raise")
-
-        kit.button("RAISE", tone="primary", on_click=raise_them)
-    kit.text(
-        f"a logged event on {current['id']} — leave a field blank to leave that ceiling alone",
-        "grad-caption",
-    )
-
-
-def _credentials(ui: Any, workspace: Workspace, menu: _Menu) -> None:
-    """Store the credentials the README's install section lists.
-
-    This is the one thing the workspace genuinely could not do: `credential set`
-    prompts with `getpass`, which needs a terminal, so a fresh machine needed a
-    shell open beside the app to become usable. The value goes down a pipe
-    rather than in an argument -- see `Workspace.set_credential`.
-
-    Values are never shown, and there is nothing here that could show one: the
-    CLI does not print them and `credentials.status()` returns booleans.
-    """
-    model = workspace.credentials()
-    kit.text("CREDENTIALS", "grad-caption").style("margin-top: 16px")
-    kit.error_strip(model.get("error"))
-
-    for row in model["rows"]:
-        # Two lines, not one. On one line the fixed-width pieces -- chip, name,
-        # a 200px input, two buttons -- left the purpose text a few dozen
-        # pixels in a 540px dialog, and flex squeezed it to its min-content
-        # width: one word per line, a column taller than the rest of the row.
-        with kit.column("grad-row", gap=6):
-            # Full width explicitly: `.grad-row`'s `align-items: flex-start`
-            # would otherwise shrink each line to its content and the input
-            # with it.
-            with kit.row("", gap=6).style("width: 100%"):
-                kit.chip(row["state"], row["tone"])
-                kit.text(row["name"], "grad-mono", tag="span")
                 kit.text(
-                    row["purpose"], "grad-caption", tag="span",
+                    _setup_line(workspace), "grad-caption", tag="span",
                     style="flex: 1 1 auto; min-width: 0",
                 )
-            with kit.row("", gap=6).style("width: 100%"):
-                value = (
-                    ui.input(placeholder="paste to set")
-                    .props("borderless dense type=password")
-                    .classes("field")
-                    .style("flex: 1 1 auto; padding: 0 8px")
-                )
 
-                def store(_=None, name=row["name"], field=value) -> None:
-                    pasted, field.value = field.value or "", ""
-                    workspace.spawn(workspace.set_credential(name, pasted), "credential set")
-                    menu.redraw()
 
-                def forget(_=None, name=row["name"]) -> None:
-                    workspace.spawn(workspace.delete_credential(name), "credential delete")
-                    menu.redraw()
+def _setup_line(workspace: Workspace) -> str:
+    """One line saying whether this machine is wired up, beside the button that
+    wires it. Caught, because the menu has to open on a machine where nothing
+    reads -- that is the machine it exists for."""
+    try:
+        model = workspace.model("setup") or {}
+    except Exception:  # noqa: BLE001 - a caption must never break a menu
+        return "credentials, models, backends"
+    if not (model.get("token") or {}).get("ready"):
+        return "not authenticated — nothing can reach a model yet"
+    if not model.get("complete"):
+        return "no backend configured — runs cannot leave this machine"
+    steps = model.get("steps") or []
+    return f"{len([s for s in steps if s['ready']])}/{len(steps)} answered"
 
-                kit.button("SET", tone="neutral", on_click=store)
-                kit.button("✕", tone="neutral", disabled=not row["stored"], title="forget it",
-                           on_click=forget)
 
-    kit.text(
-        "stored in Windows Credential Manager, never in the workspace and never in the "
-        "agent's environment — they are fetched at the moment of use",
-        "grad-caption",
-    )
+# `_updates` and `_credentials` lived here and are gone: both panels moved to
+# `ui/windows/setup.py`, which is where a fact about the installation belongs.
+# `_Menu` stays -- `_bind_client_events` still reaches for it.
 
 
 def folder_dialog_type() -> int:

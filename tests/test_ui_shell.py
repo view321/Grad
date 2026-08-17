@@ -204,6 +204,24 @@ def test_a_quote_in_a_tooltip_cannot_truncate_the_props_string(rendered):
     assert "see below" in element.props["title"]
 
 
+def test_a_windows_path_in_a_tooltip_does_not_raise_out_of_props(rendered):
+    """NiceGUI hands each props value to `ast.literal_eval`, so the text is read
+    as a Python string literal and a backslash is an escape in it. `C:\\Users\\…`
+    contains `\\U`, which begins a unicode escape and raises a SyntaxError from
+    inside `element.props()` -- taking down whatever was being built, not the
+    tooltip. It surfaced the first time a control put a path in a tooltip, which
+    is to say the first time the appbar said which folder this is.
+    """
+    from ui import kit
+
+    client, _ = rendered(["chat"])
+    with client:
+        element = kit.button("OPEN", title=r"C:\Users\vovas\Grad — switch folder")
+
+    assert "Users" in element.props["title"]
+    assert "switch folder" in element.props["title"]
+
+
 def test_a_handle_sits_between_every_pair_of_columns(rendered):
     client, space = rendered(["chat", "ledger", "quota"])
     handles = [e for e in client.elements.values() if "grad-handle" in getattr(e, "classes", [])]
@@ -667,7 +685,9 @@ def test_reopening_a_closed_window_builds_a_fresh_root(rendered):
 # ---------------------------------------------------------------------------
 # switching project and folder
 # ---------------------------------------------------------------------------
-def test_the_project_menu_lists_the_folder_and_its_projects(rendered):
+def test_the_project_menu_lists_the_projects_and_nothing_else(rendered):
+    """It is the quick switcher now. The folder, the credentials and the updater
+    are a different scope and live behind `workspace ▾`."""
     from core import budget as budget_mod
 
     budget_mod.create("proj-a", title="Scaling laws", budget={})
@@ -681,13 +701,44 @@ def test_the_project_menu_lists_the_folder_and_its_projects(rendered):
     # Drawn on open, not at build time: creating a project makes the list it was
     # read from stale, so it is rebuilt each time.
     with client:
-        shell_mod._draw_project_menu(  # noqa: SLF001 - no public hook
-            __import__("nicegui").ui, space, menu[0], _NullMenu()
-        )
+        shell_mod._draw_project_menu(space, menu[0], _NullMenu())  # noqa: SLF001 - no public hook
     markup = html_of(client)
     assert "proj-a" in markup
     assert "Scaling laws" in markup
+    assert "CREDENTIALS" not in markup
+    assert "RECENT" not in markup
+
+
+def test_the_workspace_menu_lists_the_folder_and_how_to_leave_it(rendered):
+    """The folder and the recent list. Credentials and the updater are facts
+    about the installation and live in the setup window; what is left here is a
+    button that opens it."""
+    client, space = rendered(["chat"])
+
+    from ui import shell as shell_mod
+
+    card = [e for e in client.elements.values() if "grad-card" in getattr(e, "classes", [])][0]
+    with client:
+        shell_mod._draw_workspace_menu(  # noqa: SLF001 - no public hook
+            __import__("nicegui").ui, space, card, _NullMenu(), _NullConfirm()
+        )
+    markup = html_of(client)
     assert "WORKSPACE" in markup
+    assert "SETUP" in markup
+    assert "hf_token" not in markup, "the credential rows moved to the setup window"
+
+
+def test_the_appbar_carries_the_folder_basename_not_its_path(rendered):
+    """An absolute path does not fit an appbar cell, and the whole one is the
+    button's tooltip — "which folder is this?" has to be answerable without
+    opening anything."""
+    from core import paths
+
+    client, space = rendered(["chat"])
+    markup = html_of(client)
+    root = paths.root()
+    assert f"{root.name} ▾" in markup
+    assert str(root) in markup, "the full path should still be reachable, as the tooltip"
 
 
 class _NullMenu:
@@ -698,12 +749,140 @@ class _NullMenu:
         pass
 
 
-def test_the_workspace_menu_can_store_a_credential_without_a_terminal(rendered, monkeypatch):
+class _NullConfirm:
+    """The folder switch asks before it moves. Nothing here answers it — these
+    tests draw the menu, they do not click through it."""
+
+    async def ask(self, *_a, **_k) -> bool:
+        return False
+
+
+def test_creating_a_project_sets_its_ceilings_in_the_same_command(rendered, monkeypatch):
+    """Not as a raise afterwards. A raise appends an event carrying a `previous`
+    value, so setting the first ceiling through one would record that the GPU
+    allowance moved from nothing to $50 -- which is not what happened, and the
+    history is the reason that module is append-only at all."""
+    import asyncio
+
+    from ui import tasks as tasks_mod
+
+    calls: list[tuple] = []
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        calls.append(argv)
+        return {"ok": True, "data": {"message": "created"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+
+    _, space = rendered(["projects"])
+    asyncio.run(
+        space.create_project(
+            "proj-a",
+            "Scaling laws",
+            ceilings={"gpu-usd": "50", "quota-tokens": "5e6", "credits-usd": ""},
+            payer="hf:myorg",
+        )
+    )
+
+    assert len(calls) == 1, "the ceilings must not be a second command"
+    argv = calls[0]
+    assert argv[:2] == ("tools.budget", "new")
+    assert "--gpu-usd" in argv and "50" in argv
+    assert "--quota-tokens" in argv and "5e6" in argv
+    # Blank is left alone rather than sent as an empty ceiling.
+    assert "--credits-usd" not in argv
+    assert "--payer" in argv and "hf:myorg" in argv
+    assert "raise" not in argv
+
+
+def test_a_create_with_no_ceilings_still_works(rendered, monkeypatch):
+    """They are strongly encouraged and not compulsory: `budget new` accepts a
+    project with none, and refusing here would be this window inventing a rule
+    the ledger does not have."""
+    import asyncio
+
+    from ui import tasks as tasks_mod
+
+    calls: list[tuple] = []
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        calls.append(argv)
+        return {"ok": True, "data": {"message": "created"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+
+    _, space = rendered(["projects"])
+    asyncio.run(space.create_project("proj-a", "A", ceilings={"gpu-usd": ""}, payer=""))
+
+    argv = calls[0]
+    assert "--gpu-usd" not in argv
+    assert "--payer" not in argv
+
+
+def test_creating_a_project_on_an_unconfigured_machine_opens_setup(rendered, monkeypatch):
+    """The user's "setup starts when a project is created", narrowed to the case
+    where there is something left to ask. A wizard that opened on every creation
+    would ask someone with six projects for their token six times."""
+    import asyncio
+
+    from ui import models as models_mod, tasks as tasks_mod
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        return {"ok": True, "data": {"message": "created"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+    monkeypatch.setattr(models_mod, "setup_needed", lambda: True)
+
+    _, space = rendered(["projects"])
+    asyncio.run(space.create_project("proj-a", "A"))
+    assert "setup" in space.layout.windows
+
+
+def test_creating_a_project_on_a_configured_machine_opens_nothing(rendered, monkeypatch):
+    import asyncio
+
+    from ui import models as models_mod, tasks as tasks_mod
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        return {"ok": True, "data": {"message": "created"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+    monkeypatch.setattr(models_mod, "setup_needed", lambda: False)
+
+    _, space = rendered(["projects"])
+    asyncio.run(space.create_project("proj-a", "A"))
+    assert "setup" not in space.layout.windows
+
+
+def test_a_failed_create_does_not_open_setup(rendered, monkeypatch):
+    """`reload` and the wizard both hang off `ok`. A refused id that opened a
+    wizard would read as though the project had been made."""
+    import asyncio
+
+    from ui import models as models_mod, tasks as tasks_mod
+
+    async def fake_run_tool(*argv, timeout=120.0, stdin=None):
+        return {"ok": False, "error": {"message": "that id is not a slug"}}
+
+    monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
+    monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
+    monkeypatch.setattr(models_mod, "setup_needed", lambda: True)
+
+    _, space = rendered(["projects"])
+    asyncio.run(space.create_project("not a slug!", "A"))
+    assert "setup" not in space.layout.windows
+
+
+def test_the_setup_window_can_store_a_credential_without_a_terminal(rendered, monkeypatch):
     """The one thing the workspace could not do. `credential set` prompts with
     `getpass`, which needs a terminal -- so a fresh machine needed a shell open
     beside the app before the app was usable."""
     from core import budget as budget_mod
-    from ui import shell as shell_mod, tasks as tasks_mod
+    from ui import tasks as tasks_mod
 
     calls: list[dict] = []
 
@@ -716,14 +895,11 @@ def test_the_workspace_menu_can_store_a_credential_without_a_terminal(rendered, 
 
     budget_mod.create("proj-a", title="A", budget={})
     budget_mod.set_current("proj-a")
-    client, space = rendered(["chat"])
-    card = [e for e in client.elements.values() if "grad-card" in getattr(e, "classes", [])][0]
-    with client:
-        shell_mod._draw_project_menu(  # noqa: SLF001 - no public hook
-            __import__("nicegui").ui, space, card, _NullMenu()
-        )
+    client, space = rendered(["setup"])
 
-    assert "CREDENTIALS" in html_of(client)
+    markup = html_of(client)
+    assert "subscription token" in markup
+    assert "claude setup-token" in markup, "the window has to say how to mint one"
     import asyncio
 
     asyncio.run(space.set_credential("hf_token", "hf_the-actual-token"))
@@ -986,8 +1162,23 @@ def test_every_window_renders_with_real_data(rendered):
         "gradnum",                             # editor source highlighting
         "different source tree",               # wiki staleness
         "run-1",                               # queue
+        # The projects window, with a row in it. Asserted on *content* rather
+        # than on the element count, for the reason at the top of this file: a
+        # window whose render raises becomes a card saying so, so a broken
+        # window still adds elements. `_project` referenced a name that was not
+        # in its scope and the whole suite went green -- the empty-workspace
+        # test returned before reaching it, and this one caught the NameError in
+        # the failure card.
+        "Scaling",                             # projects, the seeded title
+        "ceiling raises",                      # projects, the per-project detail
+        "workspace defaults",                  # projects, models with no override
+        "subscription token",                  # setup, its first step
     ):
         assert expected in markup, expected
+
+    # And nothing anywhere is a failure card. Cheaper than asserting a string
+    # per window, and it is the actual claim: every window rendered.
+    assert "failed to render" not in markup
 
 
 def test_a_populated_workspace_survives_the_full_gesture_sequence(rendered):

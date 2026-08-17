@@ -437,8 +437,19 @@
    * scrolling up to re-read a tool's output has to survive the next token, so
    * this pins only while the reader is already at the bottom. Server-side this
    * would be a `run_javascript` per flush, fifteen times a second. */
+
+  /* Every id this page has ever been asked to pin. It is a *set of ids* rather
+   * than a set of elements on purpose: the element behind an id does not
+   * survive a retile, and the id is the only handle that does. See `gradRearm`. */
+  const stuck = new Set();
+
   window.gradStickBottom = (id) => {
+    stuck.add(id);
     const el = document.getElementById(id);
+    /* Two ways to do nothing, and they are different. No element: the window is
+     * closed, or the pane tree has not been patched in yet -- the next retile
+     * calls back through here and finds it. Already marked: this exact node is
+     * already observed, and a second observer on it would scroll it twice. */
     if (!el || el.dataset.gradStuck) return;
     el.dataset.gradStuck = '1';
     const SLACK_PX = 80;
@@ -449,6 +460,27 @@
     new MutationObserver(stick).observe(el, {childList: true, subtree: true, characterData: true});
     stick();
   };
+
+  /* Re-arm everything after the pane tree has been rebuilt.
+   *
+   * **This is what makes the transcript keep scrolling.** `gradStickBottom` was
+   * called once, from the chat window's render, and the marker plus the observer
+   * were the only record that it had been -- both of which live on the DOM node.
+   * A retile moves every window root through the attic with `Element.move()`,
+   * NiceGUI reparents server-side, and the client *re-creates* the node: new
+   * node, no marker, no observer, and the old observer left watching an orphan.
+   * Nothing re-ran the render, so nothing re-armed it. From the first time
+   * anyone opened, closed, focused or dragged a window, the transcript never
+   * scrolled itself again for the rest of the session.
+   *
+   * Cheap enough to call unconditionally: one `getElementById` and a dataset
+   * read per pinned id, on an event that happens when a human moves a window --
+   * not on the flush, which is the thing the comment above refuses to pay for.
+   *
+   * An id whose element is genuinely gone (its window is closed) stays in the
+   * set and costs one lookup per retile. That is deliberate: the window can be
+   * reopened, and the set is the only thing that remembers it wanted pinning. */
+  window.gradRearm = () => { stuck.forEach((id) => window.gradStickBottom(id)); };
 
   window.addEventListener('resize', reflowFrames);
   window.addEventListener('scroll', reflowFrames, true);

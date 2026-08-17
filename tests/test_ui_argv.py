@@ -28,10 +28,40 @@ UI_COMMANDS = [
     ("tools.budget", ["raise", "--project", "proj-x", "--gpu-usd", "50"]),
     ("tools.budget", ["raise", "--project", "proj-x", "--quota-tokens", "5e6"]),
     ("tools.budget", ["raise", "--project", "proj-x", "--credits-usd", "10"]),
+    # The projects window offers the reason the CLI has always taken. A ceiling
+    # that moved without one is unarguable with six months later.
+    ("tools.budget", ["raise", "--project", "proj-x", "--gpu-usd", "50", "--reason", "why"]),
     ("tools.budget", ["new", "--id", "proj-x", "--title", "a title", "--use"]),
+    # The create form sends the ceilings and the payer on `new` itself, rather
+    # than as a raise afterwards -- a raise records a ceiling that *moved*.
+    (
+        "tools.budget",
+        [
+            "new", "--id", "proj-x", "--title", "a title", "--use",
+            "--gpu-usd", "120", "--quota-tokens", "5e6", "--credits-usd", "10",
+            "--payer", "hf:myorg",
+        ],
+    ),
     ("tools.budget", ["use", "proj-x"]),
+    ("tools.budget", ["close", "proj-x"]),
+    # Per-project overrides, from the projects window's model editor.
+    ("tools.budget", ["configure", "--project", "proj-x", "--research", "claude-opus-5"]),
+    ("tools.budget", ["configure", "--project", "proj-x", "--report", "claude-opus-5"]),
+    ("tools.budget", ["configure", "--project", "proj-x", "--clear", "evolve"]),
+    ("tools.budget", ["configure", "--project", "proj-x", "--backend", "kaggle"]),
     ("tools.budget", ["status", "--project", "proj-x"]),
+    # The setup window. Every one of these is a button.
+    ("tools.setup", ["models", "--research", "claude-opus-5"]),
+    ("tools.setup", ["models", "--evolve", "claude-sonnet-5"]),
+    ("tools.setup", ["models", "--clear", "evolve"]),
+    ("tools.setup", ["backend", "--default", "kaggle"]),
+    ("tools.setup", ["host", "add", "--name", "gpu-box", "--hostname", "h", "--user", "u", "--rate", "0"]),
+    ("tools.setup", ["host", "remove", "--name", "gpu-box"]),
+    ("tools.setup", ["show"]),
+    ("tools.setup", ["check"]),
+    ("tools.kaggle", ["account", "--set", "someone"]),
     ("tools.jobs", ["credential", "set", "hf_token", "--stdin"]),
+    ("tools.jobs", ["credential", "delete", "hf_token"]),
     ("tools.jobs", ["credential", "status"]),
     ("tools.jobs", ["collect", "run-1"]),
     ("tools.ledger", ["verdict", "run-1", "--quantity", "loss", "--verdict", "bug", "--note", "x"]),

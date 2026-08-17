@@ -423,6 +423,39 @@ def icon_path(*, refresh: bool = False) -> str | None:
         return None
 
 
+def splash_png(size: int = 96) -> str | None:
+    """The mark as a PNG, for the loading window. Rendered once, then cached.
+
+    A PNG and not the `.ico` beside it because the reader is Tk, which has read
+    PNG since 8.6 and has never read ICO -- and because the loading window is
+    the one consumer of this glyph that is not an operating-system icon slot.
+
+    It is still `_icon_image`, which is the point: `write_icon`'s docstring says
+    there is one drawing of this mark and everything reads it, and a splash
+    screen with its own hand-drawn nabla is exactly the drift that rule exists to
+    prevent. The size is in the filename so changing it cannot silently serve a
+    stale render at the old one.
+
+    Called from the *splash's own process*, never from the launch path. Importing
+    Pillow costs a couple of hundred milliseconds and the whole purpose of that
+    process is to be on screen before anything expensive happens here.
+
+    Returns None rather than raising, like `icon_path`: a machine with no Pillow
+    still gets a loading window, just a wordmark instead of a glyph.
+    """
+    try:
+        from core import appdata  # noqa: PLC0415
+
+        target = appdata.app_dir() / f"grad-splash-{int(size)}.png"
+        if not target.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _icon_image(int(size)).save(target, format="PNG")
+        return str(target)
+    except Exception:  # noqa: BLE001 - see the docstring; cosmetic, never fatal
+        log.debug("could not render the splash mark", exc_info=True)
+        return None
+
+
 def _available_tag() -> str | None:
     """The release the last check found, or None. Cheap enough for a menu draw.
 
@@ -614,6 +647,241 @@ def hold_window_open(flag_path: str) -> None:
         return False
 
     window.events.closing += _closing
+
+
+# ---------------------------------------------------------------------------
+# where the window was
+# ---------------------------------------------------------------------------
+#: The size a machine that has never been told otherwise opens at. It was
+#: written inline at the `ui.run` call for as long as this app has existed,
+#: which is also exactly as long as the window has opened in the same place
+#: every time no matter where it was left.
+DEFAULT_SIZE = (1600, 1000)
+#: Nothing smaller than this is restored. A window can be dragged down to a
+#: sliver, and reopening at a sliver looks like an app that failed to start
+#: rather than like the size someone chose.
+MIN_SIZE = (640, 480)
+#: How much of the window has to land on a real screen for its saved position
+#: to be used. A corner is enough -- it is grabbable, which is the only thing
+#: that matters -- and anything less is a window nobody can reach.
+MIN_VISIBLE_PX = 80
+#: Seconds between writes while the window is being dragged. `moved` fires per
+#: pixel of a drag; the file is 60 bytes and the disk should still not see all
+#: of them.
+SAVE_EVERY_S = 1.0
+
+#: The geometry as last observed in a *normal* window state, and the one
+#: previous to it. Two, not one: see `_note_maximized`.
+_geometry: dict[str, Any] = {}
+_previous: dict[str, Any] = {}
+_saved_at = 0.0
+
+
+def geometry_path() -> Any:
+    """Where the window's own state lives.
+
+    Beside `tray.flag` and `ui_storage_secret` in the app's state directory, not
+    under `workspaces/`: there is one window, and it does not become a different
+    window because the workspace root was pointed somewhere else.
+    """
+    from core import appdata  # noqa: PLC0415 - import cycle if hoisted
+
+    return appdata.state_dir() / "window.json"
+
+
+def read_geometry() -> dict[str, Any]:
+    """The saved geometry, or `{}`. Never raises and never returns nonsense.
+
+    Every field is re-derived rather than trusted: this file survives upgrades,
+    can be edited by hand, and is read at the one moment where a bad value costs
+    the most -- deciding where to put a window before there is any UI to report
+    a problem with.
+    """
+    from core import jsonl  # noqa: PLC0415
+
+    try:
+        raw = jsonl.read_json(geometry_path())
+    except Exception:  # noqa: BLE001 - a missing or corrupt file is not an error
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("x", "y", "width", "height"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[key] = int(value)
+    if raw.get("maximized") is True:
+        out["maximized"] = True
+    return out
+
+
+def _screens() -> list[tuple[int, int, int, int]]:
+    """Every attached screen as `(x, y, width, height)`, or `[]` if unknown.
+
+    `webview.screens` answers without starting anything, which is what makes it
+    usable here -- this runs before `ui.run`, and the window process does not
+    exist yet.
+    """
+    try:
+        import webview  # noqa: PLC0415
+
+        return [
+            (int(s.x), int(s.y), int(s.width), int(s.height))
+            for s in webview.screens
+            if int(s.width) > 0 and int(s.height) > 0
+        ]
+    except Exception:  # noqa: BLE001 - no webview, no display, an odd backend
+        log.debug("could not enumerate screens", exc_info=True)
+        return []
+
+
+def on_screen(x: int, y: int, width: int, height: int) -> bool:
+    """Would a window at this rectangle be reachable?
+
+    **This is the half of "remember the position" that is not optional.** A
+    saved position is a promise about a monitor arrangement, and the arrangement
+    is the part that changes: undock a laptop, unplug the second screen, and the
+    coordinates that were perfect yesterday put the window somewhere with no
+    pixels in it -- running, holding the port and the single-instance lock, and
+    invisible. That is a worse failure than opening in the wrong place, because
+    there is no way back from it that does not involve deleting a file.
+
+    With no screen information at all this answers True. Refusing to restore
+    because we could not check would make the feature stop working on every
+    machine whose backend does not enumerate displays, in exchange for a
+    guarantee we have no evidence we need there.
+    """
+    screens = _screens()
+    if not screens:
+        return True
+    for sx, sy, sw, sh in screens:
+        overlap_w = min(x + width, sx + sw) - max(x, sx)
+        overlap_h = min(y + height, sy + sh) - max(y, sy)
+        if overlap_w >= MIN_VISIBLE_PX and overlap_h >= MIN_VISIBLE_PX:
+            return True
+    return False
+
+
+def window_args() -> dict[str, Any]:
+    """What `webview.create_window` should be given for the main window.
+
+    Merged into `app.native.window_args`, which NiceGUI splices in *after* its
+    own `width`/`height` (see `native_mode._open_window`) -- so this overrides
+    `ui.run(window_size=...)` rather than fighting it, and the default lives
+    here rather than in two places.
+
+    A size is always returned; a position only when there is a saved one that
+    lands on a screen that exists right now.
+    """
+    saved = read_geometry()
+    width = max(MIN_SIZE[0], int(saved.get("width") or DEFAULT_SIZE[0]))
+    height = max(MIN_SIZE[1], int(saved.get("height") or DEFAULT_SIZE[1]))
+    args: dict[str, Any] = {"width": width, "height": height}
+    if saved.get("maximized"):
+        args["maximized"] = True
+    if "x" in saved and "y" in saved:
+        x, y = int(saved["x"]), int(saved["y"])
+        if on_screen(x, y, width, height):
+            args["x"], args["y"] = x, y
+        else:
+            # Said out loud, once. A window that quietly ignores the position it
+            # was told to use looks identical to one that never saved it.
+            log.info(
+                "not restoring the window to %d,%d: no attached screen covers it", x, y
+            )
+    return args
+
+
+def _note_maximized(maximized: bool) -> None:
+    """Record the maximized flag without letting it eat the restored geometry.
+
+    Maximizing a window also *moves and resizes* it, and pywebview reports those
+    as ordinary `moved`/`resized` events. Left alone, the last thing recorded
+    before `maximized` arrives is the maximized rectangle -- so un-maximizing on
+    the next launch would restore a window the size of the screen at its top
+    left corner, and the size the user actually chose would be gone.
+
+    The order the two events arrive in is a backend detail, so this does not
+    depend on it: one observation of history is kept, and adopting it on the way
+    into the maximized state discards exactly the stray one.
+    """
+    global _geometry
+
+    if maximized:
+        if _previous:
+            _geometry = dict(_previous)
+        _geometry["maximized"] = True
+    else:
+        _geometry.pop("maximized", None)
+
+
+def remember(**fields: int) -> None:
+    """Take one observation of the window's rectangle."""
+    global _geometry, _previous
+
+    if _geometry.get("maximized"):
+        # A move or resize *while* maximized is the window manager's business,
+        # not a choice to remember. The rectangle to restore to is the one from
+        # before it was maximized, which is already held.
+        return
+    _previous = dict(_geometry)
+    _geometry.update(fields)
+    save_geometry()
+
+
+def save_geometry(*, force: bool = False) -> None:
+    """Write the geometry, at most every `SAVE_EVERY_S` unless forced.
+
+    Throttled rather than deferred to close time, and that is the important
+    choice: closing the window *hides* it (see `hold_window_open`), so the
+    close-time hook that would be the obvious place to save this never runs on
+    the ordinary path. The app can then live in the notification area for days
+    and be quit from the tray, or killed, and either way the last thing written
+    should be roughly where the window was.
+    """
+    global _saved_at
+
+    import time  # noqa: PLC0415
+
+    if not _geometry:
+        return
+    now = time.monotonic()
+    if not force and now - _saved_at < SAVE_EVERY_S:
+        return
+    _saved_at = now
+    from core import jsonl  # noqa: PLC0415
+
+    try:
+        path = geometry_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        jsonl.write_json(path, _geometry)
+    except OSError:  # noqa: BLE001 - where the window was is never worth failing over
+        log.debug("could not save the window geometry", exc_info=True)
+
+
+def track_window(nicegui_app: Any) -> None:
+    """Follow the window around and keep `window.json` current.
+
+    All of this runs in *this* process. NiceGUI bridges pywebview's window
+    events from the child over a pipe and dispatches them onto the event loop
+    (`native/event_manager.py`), which is what makes a plain handler enough --
+    the alternative would be another pickled function riding across in
+    `start_args`, like `hold_window_open`, for state this side is perfectly able
+    to keep.
+
+    Registered before `ui.run`, because `ui.run` is what starts the event
+    manager that would deliver them.
+    """
+    nicegui_app.native.on("moved", lambda e: remember(x=int(e.args["x"]), y=int(e.args["y"])))
+    nicegui_app.native.on(
+        "resized", lambda e: remember(width=int(e.args["width"]), height=int(e.args["height"]))
+    )
+    nicegui_app.native.on("maximized", lambda _: _note_maximized(True))
+    nicegui_app.native.on("restored", lambda _: _note_maximized(False))
+    # The throttle drops the last observation of a burst, and the last
+    # observation of a burst is the one worth keeping.
+    nicegui_app.native.on("closed", lambda _: save_geometry(force=True))
+    nicegui_app.on_shutdown(lambda: save_geometry(force=True))
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:

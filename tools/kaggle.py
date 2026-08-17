@@ -36,7 +36,6 @@ import io
 import json
 import os
 import re
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -155,11 +154,22 @@ _TERMINAL = {"complete", "error", "cancelAcknowledged"}
 # the kaggle CLI
 # ---------------------------------------------------------------------------
 def _executable() -> str:
-    found = shutil.which("kaggle")
+    """The `kaggle` beside *this* interpreter, then the one on PATH.
+
+    The order matters more here than for a missing tool. `shutil.which` alone
+    found the CLI in the user-site Python rather than in the venv, so this
+    project's pinned `kaggle` was installed and a *different* installation's was
+    what actually ran -- silently, against an API whose contract this module
+    encodes. See `core/spawn.py:console_script`.
+    """
+    from core import spawn  # noqa: PLC0415
+
+    found = spawn.console_script("kaggle")
     if found:
         return found
     raise ConfigError(
-        "the `kaggle` CLI is not on PATH, so Kaggle kernels cannot be reached",
+        "the `kaggle` CLI is not installed in this environment or on PATH, so Kaggle "
+        "kernels cannot be reached",
         fix="pip install -e '.[kaggle]'",
     )
 
@@ -290,13 +300,45 @@ def _run(argv: list[str], cfg: Config, *, timeout: float) -> str:
 # ---------------------------------------------------------------------------
 # staging: one uploadable file
 # ---------------------------------------------------------------------------
-def _payload_b64(sub: Submission) -> tuple[str, list[str]]:
+def _add_bytes(tar: Any, rel: str, data: bytes) -> None:
+    """One in-memory file into the tar, with the same determinism as the rest.
+
+    The name is checked here rather than at the caller for the reason
+    `tools/gpu.py:_write_remote` checks its own: this is content going onto a
+    machine we do not own, and a relative path that climbs is worth refusing
+    where it is written rather than trusting every future caller.
+    """
+    if rel.startswith("/") or ".." in Path(rel).parts:
+        raise UsageError(
+            f"refusing to pack {rel!r}: a payload entry is a path inside the pipeline",
+            fix="pass a name relative to the spec directory, with no '..' in it",
+        )
+    info = tarfile.TarInfo(rel)
+    info.size = len(data)
+    info.mtime = 0
+    info.mode = 0o644
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _payload_b64(
+    sub: Submission, *, overrides: dict[str, str] | None = None
+) -> tuple[str, list[str]]:
     """The spec directory, packed into one base64 blob.
 
     The whole directory rather than only the import graph, so this backend stages
     what `gpu.py`'s `scp -r` stages. A pipeline that reads a CSV sitting beside
     its entrypoint works on an SSH host and would fail here on a narrower rule,
     and "it ran on the other backend" is the least useful bug report there is.
+
+    `overrides` replaces or adds files by relative path on the way into the tar,
+    without touching the directory on disk. That is what an evolve candidate is:
+    the preflighted pipeline with one program swapped for a mutated one. Doing it
+    here rather than by copying the tree to a temp directory keeps one packing
+    implementation -- the secret scan, the size refusals and the deterministic
+    mtimes all apply to a candidate exactly as they do to a submission, which
+    they would not if candidates got a packer of their own.
     """
     base = sub.spec_path.parent
     eligible: list[Path] = []
@@ -359,15 +401,28 @@ def _payload_b64(sub: Submission) -> tuple[str, list[str]]:
     # `gzip` rather than `tar` alone, and deterministically: mtime=0 keeps the
     # blob byte-identical between two pushes of an unchanged directory, which is
     # what makes a re-push diffable.
+    replacements = {str(k): str(v) for k, v in (overrides or {}).items()}
     with tarfile.open(fileobj=buffer, mode="w:gz", compresslevel=9) as tar:
         for path in eligible:
             rel = path.relative_to(base).as_posix()
+            if rel in replacements:
+                # Replaced, not appended alongside. Two entries with one name in
+                # a tar is a file whose contents depend on extraction order,
+                # which for a candidate means a score that depends on tar.
+                _add_bytes(tar, rel, replacements.pop(rel).encode("utf-8"))
+                packed.append(rel)
+                continue
             info = tar.gettarinfo(str(path), arcname=rel)
             info.mtime = 0
             info.uid = info.gid = 0
             info.uname = info.gname = ""
             with open(path, "rb") as fh:
                 tar.addfile(info, fh)
+            packed.append(rel)
+        # Whatever the overrides added rather than replaced. Sorted so the blob
+        # stays a function of its inputs, like the sorted walk above.
+        for rel in sorted(replacements):
+            _add_bytes(tar, rel, replacements[rel].encode("utf-8"))
             packed.append(rel)
     blob = base64.b64encode(buffer.getvalue()).decode("ascii")
     if len(blob) > MAX_PAYLOAD_B64:
@@ -511,8 +566,9 @@ def _metadata(cfg: Config, sub: Submission, *, ref: str, slug: str, accelerator:
 
 
 def _stage(cfg: Config, sub: Submission, workdir: Path, *, ref: str, slug: str,
-           accelerator: str, command: list[str]) -> list[str]:
-    payload, packed = _payload_b64(sub)
+           accelerator: str, command: list[str],
+           overrides: dict[str, str] | None = None) -> list[str]:
+    payload, packed = _payload_b64(sub, overrides=overrides)
     notebook = _notebook_for(sub, command, payload=payload)
     (workdir / f"{slug}.ipynb").write_text(
         json.dumps(notebook, ensure_ascii=False), encoding="utf-8"
@@ -971,6 +1027,133 @@ def run_smoke(
             "remote; exercises the real Kaggle image, the real accelerator, and the "
             "preinstalled package set a kernel cannot add to without internet"
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# evolve candidates
+# ---------------------------------------------------------------------------
+#: How many bytes of a candidate's output are kept, matching `tools/gpu.py`.
+CANDIDATE_OUTPUT_BYTES = 8000
+
+
+def evaluate_candidate(
+    sub: Submission,
+    cfg: Config,
+    *,
+    candidate_id: str,
+    files: dict[str, str],
+    command: list[str],
+    timeout_s: int,
+    artifacts: Path,
+    accelerator: str | None = None,
+) -> dict[str, Any]:
+    """Run one evolve candidate as a Kaggle kernel, and read its metrics back.
+
+    A candidate here is a changed architecture or a changed optimiser, so its
+    evaluation is a training run and one kernel per candidate is the right unit
+    -- the minute or two of queue and start-up is noise against it. This is the
+    same push/poll/fetch the real submitter does, with two differences that both
+    follow from a candidate not being a run.
+
+    **No ledger row.** `tools/evolve.py` records candidates in
+    `candidates.jsonl` so a long campaign cannot dominate a ledger read by hand
+    (§23 item 4), and that holds when the search goes remote. The campaign is the
+    ledgered unit and its expectation is the bound prediction.
+
+    **The hours are still counted.** `core/kaggle_quota.py` folds candidate rows
+    beside runs, because the weekly accelerator allowance is a hard external
+    limit and a campaign that spent it invisibly would surface as an ordinary
+    submission being refused for hours nothing could account for. The caller
+    checks the projection before generation 0; this records what was actually
+    used so the fold has something to read.
+
+    The mutated program reaches the kernel the same way the pipeline does --
+    inside the notebook's base64 payload, via `_payload_b64`'s `overrides`. There
+    is no second delivery path, so the secret scan and the size refusals apply to
+    a candidate exactly as they do to a submission.
+    """
+    accelerator = resolve_accelerator(accelerator, sub, cfg)
+    kind = cfg.accelerator_kind(accelerator)
+    slug = _slug(cfg, candidate_id)
+    ref = f"{_username(cfg)}/{slug}"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+
+    def _failed(message: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "output": "",
+            "error": message,
+            "hours": round((time.time() - started) / 3600.0, 4),
+            "cost_usd": 0.0,
+            "accelerator": accelerator,
+            "accelerator_kind": kind,
+            "where": _url(ref),
+            **extra,
+        }
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="grad-cand-") as tmp:
+            workdir = Path(tmp)
+            _stage(
+                cfg, sub, workdir,
+                ref=ref, slug=slug, accelerator=accelerator, command=command,
+                overrides=files,
+            )
+            _push(
+                cfg, workdir,
+                accelerator=accelerator,
+                timeout_s=float(cfg.get("kaggle", "push_timeout_s", 600)),
+                # Bounded where it runs, not only where it is watched. Without
+                # this the only limit is how long we choose to poll, which stops
+                # us waiting and does not stop the kernel -- and an abandoned
+                # kernel keeps spending the weekly allowance.
+                kernel_timeout_s=int(timeout_s),
+            )
+    except GradError as exc:
+        return _failed(exc.message)
+
+    state = _wait(cfg, ref, deadline=time.time() + int(timeout_s) + _queue_grace(cfg))
+    if state.get("status") not in _TERMINAL:
+        # The kernel's own timeout should have ended it. Reaching here means
+        # Kaggle is queueing or not answering, so it is left alone rather than
+        # guessed at -- `kernels status` is the only thing that knows.
+        return _failed(
+            f"the candidate was still {state.get('status') or 'unknown'} after "
+            f"{int(timeout_s)}s plus the queue grace",
+            kernel_status=state.get("status"),
+        )
+
+    marker, hours, log_text = _fetch_output(cfg, ref, artifacts)
+    exit_code = marker.get("exit_code")
+    if exit_code is None:
+        # No marker means the kernel died before cell 3, which is a real
+        # outcome and not an exit code. Reported as one would be a number
+        # nobody measured.
+        return _failed(
+            f"the kernel finished as {state.get('status')} without recording an outcome",
+            kernel_status=state.get("status"),
+            hours=round(hours or (time.time() - started) / 3600.0, 4),
+            output=log_text[-CANDIDATE_OUTPUT_BYTES:],
+        )
+
+    exit_code = int(exit_code)
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "output": log_text[-CANDIDATE_OUTPUT_BYTES:],
+        "error": None if exit_code == 0 else f"the candidate exited {exit_code} on Kaggle",
+        "hours": round(hours or 0.0, 4),
+        # Kaggle rations hours, not dollars -- see `core/kaggle_quota.py`. The
+        # zero is a fact about the backend rather than a missing measurement, and
+        # `hours` is the number that bounds a campaign here.
+        "cost_usd": 0.0,
+        "accelerator": accelerator,
+        "accelerator_kind": kind,
+        "kernel_status": state.get("status"),
+        "where": _url(ref),
     }
 
 

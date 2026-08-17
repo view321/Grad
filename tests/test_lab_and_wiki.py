@@ -11,6 +11,8 @@ network, no external process.
 
 from __future__ import annotations
 
+import os
+
 import argparse
 import json
 
@@ -198,10 +200,63 @@ def test_wiki_is_not_in_the_agents_tool_list(workspace):
 
 
 def test_a_missing_repowiki_names_the_extra(workspace, monkeypatch):
-    monkeypatch.setattr(wiki.shutil, "which", lambda name: None)
+    from core import spawn
+
+    monkeypatch.setattr(spawn, "console_script", lambda name: None)
     with pytest.raises(ConfigError) as exc:
         wiki._repowiki()
     assert "[wiki]" in (exc.value.fix or "")
+
+
+def test_a_repowiki_in_the_venv_is_found_without_activating_it(workspace, monkeypatch, tmp_path):
+    r"""The bug this replaced `shutil.which` for.
+
+    A virtualenv's `Scripts` directory is on PATH only while the environment is
+    *activated*, and the desktop shortcut points straight at
+    `.venv\Scripts\pythonw.exe` -- so the interpreter was the venv's and PATH
+    was the machine's. `repowiki` was installed, `which` did not find it, and
+    the error said "not installed" with a `pip install` that had already been
+    run.
+    """
+    import shutil
+    import sys
+
+    from core import spawn
+
+    scripts = tmp_path / "Scripts"
+    scripts.mkdir()
+    installed = scripts / ("repowiki.exe" if os.name == "nt" else "repowiki")
+    installed.write_text("", encoding="utf-8")
+    installed.chmod(0o755)
+
+    monkeypatch.setattr(sys, "executable", str(scripts / "python.exe"))
+    # Nothing on PATH at all: the venv copy is the only one, which is exactly the
+    # situation that used to report "not installed".
+    monkeypatch.setattr(shutil, "which", _venv_only_which())
+
+    found = spawn.console_script("repowiki")
+    # Case-folded: on Windows `which` returns the name with PATHEXT's casing, so
+    # a file written as `repowiki.exe` comes back as `repowiki.EXE`.
+    assert found is not None
+    assert found.casefold() == str(installed).casefold()
+
+
+def _venv_only_which():
+    """`shutil.which` that answers only when given an explicit `path`.
+
+    Which is the whole shape of the bug: the tool exists on disk beside the
+    interpreter and is invisible to a PATH search.
+    """
+    import shutil as _shutil
+
+    real = _shutil.which
+
+    def which(name, mode=os.F_OK | os.X_OK, path=None):
+        if path is None:
+            return None            # PATH does not have it
+        return real(name, mode=mode, path=path)
+
+    return which
 
 
 def _repo_root():
@@ -297,7 +352,9 @@ def test_repowiki_is_invoked_with_one_path_and_a_supported_format(workspace, mon
     (workspace / "tools").mkdir(parents=True, exist_ok=True)
     (workspace / "tools" / "b.py").write_text("y = 2\n", encoding="utf-8")
 
-    monkeypatch.setattr(wiki.shutil, "which", lambda name: "repowiki")
+    from core import spawn
+
+    monkeypatch.setattr(spawn, "console_script", lambda name: "repowiki")
     monkeypatch.setattr(wiki.subprocess, "run", fake_run)
 
     result = wiki.cmd_map(argparse.Namespace(top=200, open=False, json=True))

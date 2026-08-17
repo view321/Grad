@@ -14,6 +14,8 @@ per-host rate in the inventory (rate 0 for hosts that are free to use).
 from __future__ import annotations
 
 import argparse
+import base64
+import logging
 import os
 import shlex
 import stat
@@ -33,8 +35,17 @@ from core import (
 )
 from core.cli import Cli, main
 from core.config import Config, Host
-from core.errors import EXIT_RUNNING, ConfigError, GradError, UpstreamError, UsageError
+from core.errors import (
+    EXIT_RUNNING,
+    EXIT_USAGE,
+    ConfigError,
+    GradError,
+    UpstreamError,
+    UsageError,
+)
 from core.submission import Submission, parse_override
+
+log = logging.getLogger("grad.gpu")
 
 cli = Cli(
     "grad-gpu",
@@ -357,6 +368,235 @@ def run_smoke(
         "fix": None if ok else f"read {artifacts / 'smoke.log'} -- this is the environment the real job would have used",
         "scope": "remote; exercises the real driver stack, data path, and per-device batch size",
     }
+
+
+# ---------------------------------------------------------------------------
+# evolve candidates
+# ---------------------------------------------------------------------------
+#: How many bytes of a candidate's output are kept. An evaluator prints one JSON
+#: object by contract, but a failing one prints a traceback, and a campaign of
+#: forty candidates should not be able to write forty training logs into
+#: `candidates.jsonl`.
+CANDIDATE_OUTPUT_BYTES = 8000
+#: Seconds between marker reads while a candidate trains. Each one is an ssh
+#: round trip, and the thing being waited for takes minutes to hours.
+CANDIDATE_POLL_S = 10.0
+#: How long past its own `timeout` a candidate is given to record a marker.
+#: Enough for the remote `timeout` to fire, the shell to write the marker and one
+#: poll to read it; anything beyond this is a host that has stopped answering.
+CANDIDATE_TIMEOUT_GRACE_S = 60.0
+
+
+def evaluate_candidate(
+    sub: Submission,
+    cfg: Config,
+    *,
+    candidate_id: str,
+    files: dict[str, str],
+    command: list[str],
+    timeout_s: int,
+    host: Host | None = None,
+) -> dict[str, Any]:
+    """Run one evolve candidate on a known host, and return what it printed.
+
+    **This deliberately writes no run record.** A candidate is not a run --
+    `tools/evolve.py` records them in `ledger/candidates.jsonl` precisely so a
+    campaign of thousands cannot dominate a ledger meant to be read by hand
+    (§23 item 4) -- and a campaign that emitted a ledger row per candidate would
+    undo that the moment it went remote. The campaign is the ledgered unit, its
+    expectation is the bound prediction, and its cost is the sum of these.
+
+    That is *not* a hole in the gates, and the difference is where the gate
+    sits. `tools/evolve.py:_remote_gate` refuses the whole campaign unless the
+    spec has a complete, passing preflight -- tests, dry run, **and a real smoke
+    run on this hardware** -- so the environment every candidate lands in is one
+    that has already been proven by the ordinary §6 path. What varies per
+    candidate is the contents of one marked region, which is the thing the
+    campaign is searching over.
+
+    The pipeline directory is staged fresh per candidate rather than reused,
+    which is a few seconds of `scp` bought for the property that matters in a
+    search: candidate N cannot see a file candidate N-1 left behind. An
+    evolutionary loop that can accumulate state across evaluations is one whose
+    scores stop being comparable, and the failure looks like a real improvement.
+
+    **The job is detached and its marker polled, not held open on the ssh
+    channel.** The first version of this ran the evaluator inside a single
+    synchronous `ssh` with a timeout, which is the right shape only if a
+    candidate is quick. A candidate here is a changed architecture or a changed
+    optimiser, so its evaluation is a training run -- minutes to hours -- and a
+    single TCP connection held open across that is a connection that a NAT
+    timeout, a sleeping laptop or a wifi handover will drop. What you get then
+    is not a failed candidate, it is a candidate that *scored nothing* because
+    the network moved, which the search then selects against. `cmd_submit` has
+    used `nohup` plus `grad_status.json` since it was written, for exactly this
+    reason; this uses the same two functions.
+    """
+    host = host or cfg.host(sub.target.get("host") or "")
+    remote_dir = f"{host.workdir}/{candidate_id}"
+    started = time.time()
+
+    def _failed(message: str) -> dict[str, Any]:
+        _discard(host, remote_dir)
+        return {
+            "ok": False,
+            "exit_code": None,
+            "output": "",
+            "error": message,
+            "cost_usd": round((time.time() - started) / 3600.0 * host.rate_usd_per_hour, 4),
+            "host": host.name,
+            "where": f"{host.name}:{remote_dir}",
+        }
+
+    try:
+        _stage(host, sub, remote_dir)
+        for name, text in files.items():
+            _write_remote(host, remote_dir, name, text)
+        # `timeout` on the *remote* side, not only in the poll below. The poll
+        # giving up would end this function; it would not end the training run,
+        # because the job is detached by design -- and an abandoned candidate
+        # keeps holding the GPU that the next one is about to be measured on.
+        # Bounding it where it runs means a candidate that overruns exits 124
+        # and writes a marker like any other failure.
+        pid = _launch(host, sub, remote_dir, ["timeout", str(int(timeout_s)), *command])
+    except GradError as exc:
+        return _failed(exc.message)
+
+    # Longer than the remote bound, so the ordinary overrun is observed as a
+    # `timeout` exit rather than as this loop giving up on a job that is about
+    # to record one.
+    deadline = time.time() + int(timeout_s) + CANDIDATE_TIMEOUT_GRACE_S
+    marker: dict[str, Any] = {}
+    while time.time() < deadline:
+        try:
+            marker = _marker(host, remote_dir)
+        except GradError:
+            # A single unreadable marker is a network hiccup, not a verdict. The
+            # deadline is what stops this being forever, and the job is still
+            # running on the host either way -- which is the whole point of
+            # having detached it.
+            marker = {}
+        if marker.get("state") == "finished":
+            break
+        time.sleep(CANDIDATE_POLL_S)
+
+    cost = round((time.time() - started) / 3600.0 * host.rate_usd_per_hour, 4)
+    if marker.get("state") != "finished":
+        # The remote `timeout` should have ended it and written a marker, so
+        # reaching here means the host stopped answering rather than that the
+        # candidate overran. Killed anyway, and killed before the directory is
+        # removed: the loop starts the next candidate the moment this returns,
+        # and one left running is a process competing with its own successor for
+        # the same GPU -- which would make the next score a measurement of this
+        # one's overrun rather than of the mutation.
+        _kill_remote(host, pid)
+        _discard(host, remote_dir)
+        return {
+            "ok": False,
+            "exit_code": None,
+            "output": "",
+            "error": f"the candidate did not finish within {int(timeout_s)}s on {host.name}",
+            "cost_usd": cost,
+            "host": host.name,
+            "where": f"{host.name}:{remote_dir}",
+        }
+
+    exit_code = int(marker.get("exit_code") or 0)
+    output = _read_remote_logs(host, remote_dir)
+    _discard(host, remote_dir)
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "output": output[-CANDIDATE_OUTPUT_BYTES:],
+        "error": None if exit_code == 0 else f"the candidate exited {exit_code} on {host.name}",
+        "cost_usd": cost,
+        "host": host.name,
+        "where": f"{host.name}:{remote_dir}",
+    }
+
+
+def _read_remote_logs(host: Host, remote_dir: str) -> str:
+    """`stdout.log` then `stderr.log`, in that order and bounded.
+
+    `_launch` sends the two streams to separate files, so unlike the synchronous
+    version there is no interleaving to rely on -- and the order matters to the
+    caller: `tools/evolve.py:_metrics_from` reads the *last* line, and the
+    evaluator's one JSON object is on stdout. Appending stderr after it would
+    put a traceback's last line where the metrics belong.
+
+    So stdout is read last. What comes back is stderr first, then stdout, which
+    reads oddly in a log and is the only ordering that keeps the contract.
+    """
+    parts: list[str] = []
+    for name in ("stderr.log", "stdout.log"):
+        try:
+            text = _ssh(
+                host,
+                f"tail -c {CANDIDATE_OUTPUT_BYTES} {shlex.quote(remote_dir + '/' + name)} 2>/dev/null || true",
+                timeout=120,
+            )
+        except GradError:
+            continue
+        if text.strip():
+            parts.append(text.rstrip("\n"))
+    return "\n".join(parts)
+
+
+def _write_remote(host: Host, remote_dir: str, name: str, text: str) -> None:
+    """Put one file on the host, through base64 rather than through a heredoc.
+
+    The content is a mutated Python source produced by a language model. It can
+    contain anything a heredoc terminator, a quote or a backtick means to a
+    shell, and the failure mode of getting that wrong is not an error -- it is a
+    file that arrives subtly different from the one that was scored, which is a
+    campaign whose records describe code that never ran.
+
+    The name is checked rather than quoted: it comes from this module's own
+    callers today, and a path that could climb out of the working directory is
+    worth refusing at the one place it would be written rather than trusting
+    every future caller.
+    """
+    if "/" in name or "\\" in name or name in ("", ".", ".."):
+        raise GradError(
+            "bad_remote_name",
+            f"refusing to write {name!r} on {host.name}: a candidate file is a plain name",
+            exit_code=EXIT_USAGE,
+            fix="pass a file name, not a path",
+        )
+    blob = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    _ssh(
+        host,
+        f"cd {shlex.quote(remote_dir)} && printf %s {shlex.quote(blob)} | base64 -d > {shlex.quote(name)}",
+        timeout=120,
+    )
+
+
+def _kill_remote(host: Host, pid: str) -> None:
+    """End a detached candidate and whatever it started. Never raises.
+
+    Children first, then the wrapper: `_launch` runs the command under
+    `sh -c`, so the pid it echoed is the shell's and killing only that leaves
+    the training process orphaned but very much alive on the GPU.
+    """
+    if not pid or not pid.strip().isdigit():
+        return
+    try:
+        _ssh(host, f"pkill -P {int(pid)} 2>/dev/null; kill {int(pid)} 2>/dev/null; true", timeout=120)
+    except Exception:  # noqa: BLE001 - a cleanup must not become the failure
+        log.debug("could not kill %s on %s", pid, host.name, exc_info=True)
+
+
+def _discard(host: Host, remote_dir: str) -> None:
+    """Remove a candidate's working directory. Never raises.
+
+    Best-effort on purpose: a campaign must not fail because a cleanup did, and
+    the directory is named after the candidate, so what is left behind on a host
+    that refused is identifiable rather than anonymous.
+    """
+    try:
+        _ssh(host, f"rm -rf {shlex.quote(remote_dir)}", timeout=120)
+    except Exception:  # noqa: BLE001 - see the docstring
+        log.debug("could not remove %s on %s", remote_dir, host.name, exc_info=True)
 
 
 def _exit_code_from(output: str) -> int:

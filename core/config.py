@@ -421,6 +421,18 @@ class Config:
     # `model_for` needs the difference: an explicit [models] entry must beat a
     # legacy key, while the [models] *default* must not.
     user: dict[str, Any] = field(default_factory=dict)
+    # `core/settings.py`: the writable half, chosen through the setup wizard and
+    # stored under the app directory rather than in the hand-annotated TOML.
+    # Outranks everything in the file, which is `kaggle account`'s rule and for
+    # the same reason -- a command that silently did nothing because a config
+    # file disagreed would be worse than one that overrides it, and
+    # `settings.shadowing` is what stops that being a surprise.
+    overlay: dict[str, Any] = field(default_factory=dict)
+    # The selected project's own overrides (`core/budget.py:configure`). Kept
+    # apart from `overlay` rather than merged into it, because "what would this
+    # role be without the project" is a question the projects window has to
+    # answer -- it draws every project, and only one of them is selected.
+    project_overlay: dict[str, Any] = field(default_factory=dict)
 
     def section(self, name: str) -> dict[str, Any]:
         return dict(self.raw.get(name, {}))
@@ -428,19 +440,34 @@ class Config:
     def get(self, section: str, key: str, default: Any = None) -> Any:
         return self.raw.get(section, {}).get(key, default)
 
-    def model_for(self, role: str) -> str:
+    def model_for(self, role: str, *, project: bool = True) -> str:
         """The model for one role (HANDOFF-2 §16).
 
-        Resolution: an explicit `[models] <role>` wins; then the legacy key the
-        role replaced (`[agent] model`, `[retrieval] expand_model` /
-        `triage_model`), readable "for one release so existing configs do not
-        break"; then the `[models]` default.
+        Resolution, outermost first: the selected project's own override
+        (`core/budget.py:configure`); then a `core/settings.py` overlay entry
+        (what the setup window chose); then an explicit `[models] <role>`; then
+        the legacy key the role replaced (`[agent] model`,
+        `[retrieval] expand_model` / `triage_model`), readable "for one release
+        so existing configs do not break"; then the `[models]` default.
+
+        `project=False` answers the same question with the outermost layer
+        removed -- "what would this be if the project said nothing". The
+        projects window needs it because it draws every project and only one of
+        them is selected, so for the rest the project layer in effect is not
+        theirs.
         """
         if role not in DEFAULTS["models"]:
             raise ConfigError(
                 f"unknown model role {role!r}",
                 fix=f"roles are: {', '.join(MODEL_ROLES)}",
             )
+        if project:
+            chosen = (self.project_overlay.get("models") or {}).get(role)
+            if chosen:
+                return str(chosen)
+        chosen = (self.overlay.get("models") or {}).get(role)
+        if chosen:
+            return str(chosen)
         explicit = (self.user.get("models") or {}).get(role)
         if explicit:
             return str(explicit)
@@ -469,6 +496,22 @@ class Config:
                 f"[hosts] must be a table of host entries, not {type(raw).__name__}",
                 fix=f"see the [hosts.*] example in {paths.config_path()}",
             )
+        # The inventory has two sources and stays fixed: `[hosts.*]` in the TOML,
+        # and whatever `setup host add` wrote. Combined by name, so a machine
+        # that had hosts in its config keeps them, and validated below by the
+        # same code either way -- a host added through the wizard is not a host
+        # that skipped the rate check.
+        #
+        # **Whole entries, not `_merge`.** A recursive merge would have an
+        # overlay host inherit the fields it omitted from the config host of the
+        # same name -- including `key_credential`, which names the keyring entry
+        # that authenticates the connection. Replacing `gpu-box` through the
+        # wizard and getting the old box's credential, user and workdir attached
+        # to the new hostname is a connection nobody described, and it is the one
+        # field in this table where being wrong reaches a machine.
+        overlay_hosts = self.overlay.get("hosts")
+        if isinstance(overlay_hosts, dict) and overlay_hosts:
+            raw = {**raw, **{k: v for k, v in overlay_hosts.items() if isinstance(v, dict)}}
         out: dict[str, Host] = {}
         for name, spec in raw.items():
             if not isinstance(spec, dict):
@@ -525,7 +568,13 @@ class Config:
             known = ", ".join(sorted(hosts)) or "(none configured)"
             raise ConfigError(
                 f"unknown host {name!r}; the inventory is fixed. known hosts: {known}",
-                fix=f"add a [hosts.{name}] block to {paths.config_path()}",
+                # Both halves named, because there are now two places a host can
+                # be defined and the wrong guess costs an edit to a file that was
+                # never going to be read.
+                fix=(
+                    f"python -m tools.setup host add --name {name} --hostname … --user … --json"
+                    f"   # or add a [hosts.{name}] block to {paths.config_path()}"
+                ),
             )
         return hosts[name]
 
@@ -566,8 +615,18 @@ _cache: dict[str, Config] = {}
 
 
 def load(path: Path | None = None, *, reload: bool = False) -> Config:
+    from core import budget as budget_mod, settings as settings_mod  # noqa: PLC0415
+
     path = Path(path) if path else paths.config_path()
-    key = str(path)
+    # The mtimes are part of the key, not just the path. `setup models` and
+    # `budget configure` run as child processes and write files this process has
+    # already read -- so without this the app goes on serving whatever it loaded
+    # at startup and the setup window appears to do nothing. Three `stat` calls
+    # and one tiny read per load, against a config that is read on the gate
+    # path; the alternative is every writer remembering to clear a cache in a
+    # module it does not import.
+    project_id = budget_mod.current_project()
+    key = f"{path}\x00{settings_mod.stamp()}\x00{project_id}\x00{budget_mod.selection_stamp()}"
     if not reload and key in _cache:
         return _cache[key]
     user: dict[str, Any] = {}
@@ -579,7 +638,12 @@ def load(path: Path | None = None, *, reload: bool = False) -> Config:
                 f"{path} is not valid TOML: {exc}",
                 fix=f"fix the syntax in {path}, or delete it to fall back to defaults",
             ) from exc
-    cfg = Config(raw=_merge(DEFAULTS, user), user=user)
+    cfg = Config(
+        raw=_merge(DEFAULTS, user),
+        user=user,
+        overlay=settings_mod.load(),
+        project_overlay=budget_mod.project_overrides(project_id),
+    )
     _validate(cfg, path)
     _cache[key] = cfg
     return cfg

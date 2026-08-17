@@ -85,6 +85,41 @@ def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     return subprocess.run(argv, **{**quiet(), **kwargs})
 
 
+def console_script(name: str) -> str | None:
+    """Find a console script installed *beside this interpreter*, then on PATH.
+
+    `shutil.which` alone was wrong here, and wrong in the way that is hardest to
+    argue with: it searches `PATH`, and a virtualenv's `Scripts` directory is on
+    `PATH` only while the environment is *activated*. Grad is launched from a
+    desktop shortcut pointing at `.venv\\Scripts\\pythonw.exe`, and Explorer
+    starts it with the ambient environment -- so the interpreter is the venv's
+    and `PATH` is the machine's.
+
+    That produced both halves of one bug report. `repowiki` was installed in the
+    venv, `which` did not find it, and `tools/wiki.py` reported "repowiki is not
+    installed" with a `pip install -e '.[wiki]'` that had already been run. And
+    `kaggle` was found -- in the *user-site* Python, not the venv -- so the wiki
+    said a package was missing while Kaggle silently shelled out to a different
+    installation's CLI, against a version this project pins.
+
+    Beside the interpreter first, therefore, because `sys.executable` is the one
+    thing that is always right about which environment this is. PATH stays as
+    the fallback for a tool that genuinely lives elsewhere.
+    """
+    import shutil  # noqa: PLC0415 - only this function needs it
+    import sys  # noqa: PLC0415
+
+    scripts = os.path.dirname(sys.executable)
+    if scripts:
+        # `shutil.which` with an explicit `path`, rather than joining a name and
+        # testing it: on Windows the extension is PATHEXT's business, and
+        # `repowiki` on disk is `repowiki.exe`.
+        found = shutil.which(name, path=scripts)
+        if found:
+            return found
+    return shutil.which(name)
+
+
 _sdk_masked = False
 
 

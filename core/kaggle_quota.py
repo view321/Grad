@@ -112,6 +112,69 @@ def hours_for_quota(run: ls.Run) -> float:
         return 0.0
 
 
+def _fold_candidates(
+    pools: dict[str, dict[str, Any]], *, cutoff: _dt.datetime, kind: str | None
+) -> None:
+    """Evolve candidates evaluated on Kaggle, folded in beside the runs.
+
+    **Without this the weekly allowance has a hole exactly the size of a
+    campaign.** Candidates deliberately never enter `runs.jsonl` -- §23 item 4,
+    so a hundred-generation search cannot dominate a ledger read by hand -- and
+    the quota fold reads runs. A remote campaign would therefore burn real GPU
+    hours that this function could not see, and the first thing to notice would
+    be an ordinary submission refused for an allowance something else had
+    already spent.
+
+    Dollars do not have this problem: `core/budget.py` already reaches into
+    `candidates.jsonl` for exactly this reason. Hours needed the same treatment
+    and did not have it, because until now nothing could spend them from here.
+
+    Always an estimate. A candidate records the wall clock its evaluation took,
+    which is a measurement -- but it is measured by us rather than reported by
+    Kaggle, and the run path's `actual` means "what the platform's own log said".
+    Counting ours as `in_flight` keeps that distinction honest and errs toward
+    the allowance being spent rather than free.
+    """
+    from core import campaign as camp  # noqa: PLC0415 - import cycle if hoisted
+
+    try:
+        rows = camp.candidates()
+    except Exception:  # noqa: BLE001 - a gate must not fail on an unreadable file
+        return
+    for row in rows:
+        if str(row.get("backend") or "") != PLATFORM:
+            continue
+        row_kind = str(row.get(F_KIND) or "")
+        if not row_kind or row_kind == UNMETERED:
+            continue
+        if kind and row_kind != kind:
+            continue
+        at = ls.parse_iso(row.get("at"))
+        if at and at < cutoff:
+            continue
+        try:
+            hours = max(0.0, float(row.get(F_ACTUAL) or row.get(F_ESTIMATE) or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if hours <= 0:
+            continue
+        pool = pools.setdefault(
+            row_kind,
+            {"kind": row_kind, "actual_hours": 0.0, "in_flight_hours": 0.0, "runs": []},
+        )
+        pool["in_flight_hours"] += hours
+        pool["runs"].append(
+            {
+                "run_id": row.get("candidate_id"),
+                "hours": round(hours, 4),
+                "basis": "estimate",
+                "accelerator": row.get(F_ACCELERATOR),
+                "smoke": False,
+                "campaign": row.get("campaign"),
+            }
+        )
+
+
 def accelerator_hours(
     *, window_days: int = 7, now: _dt.datetime | None = None, kind: str | None = None
 ) -> dict[str, Any]:
@@ -124,6 +187,7 @@ def accelerator_hours(
     now = now or _dt.datetime.now(_dt.timezone.utc)
     cutoff = now - _dt.timedelta(days=window_days)
     pools: dict[str, dict[str, Any]] = {}
+    _fold_candidates(pools, cutoff=cutoff, kind=kind)
     for r in ls.runs():
         if r.get("platform") != PLATFORM:
             continue

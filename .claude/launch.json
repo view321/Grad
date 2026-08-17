@@ -6,6 +6,15 @@
       "runtimeExecutable": ".venv/Scripts/python.exe",
       "runtimeArgs": ["-c", "from ui.app import run; run(native=False, port=8123)"],
       "port": 8123
+    },
+    {
+      "name": "grad-ui-scratch",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import os, tempfile, pathlib; root = pathlib.Path(tempfile.gettempdir()) / 'grad-scratch-ws'; root.mkdir(parents=True, exist_ok=True); os.environ['GRAD_ROOT'] = str(root); os.environ['GRAD_APP_DIR'] = str(root / 'appdata'); from ui.app import run; run(native=False, port=8124)"
+      ],
+      "port": 8124
     }
   ]
 }

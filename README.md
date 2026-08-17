@@ -179,10 +179,16 @@ Then authenticate against the subscription, not the API:
 claude setup-token
 ```
 
-Export the result as `CLAUDE_CODE_OAUTH_TOKEN` and make sure `ANTHROPIC_API_KEY`
-is **not** set — it outranks the OAuth token in the credential chain and will
-silently bill the Developer Platform instead. `python agent.py --check` removes
-it from the process environment and reports what it removed.
+Export the result as `CLAUDE_CODE_OAUTH_TOKEN`, **or** store it as
+`claude_oauth_token` below and skip the export — the two are equivalent for the
+agent's own loop, and the stored copy is the one that works from the desktop
+shortcut, which inherits whatever Explorer had and usually that is nothing. An
+exported token wins over a stored one, so a terminal that set one deliberately
+keeps it. `python agent.py --check` reports which of the two it is using.
+
+Make sure `ANTHROPIC_API_KEY` is **not** set — it outranks the OAuth token in
+the credential chain and will silently bill the Developer Platform instead.
+`--check` removes it from the process environment and reports what it removed.
 
 Store credentials once; they never enter the agent's environment:
 
@@ -219,12 +225,19 @@ directory rather than in `config/grad.toml`: that file is hand-annotated and
 reformat it and drop every comment in it. `[kaggle] username` is still read as a
 fallback, and `account` says when a stored selection is shadowing one.
 
-Or store them from the app: the workspace menu (`project ▾`) has a credentials
-panel, which is the same command with `--stdin` instead of the `getpass` prompt.
-That exists because the prompt needs a terminal, and needing one for this was
-the only thing that forced a shell open beside the app on a fresh machine. The
-value goes down a pipe rather than in an argument — an argv is visible to
-anything that can list processes.
+Or store them from the app, which is the shorter route: the **setup** window
+asks for the subscription token first, then which model runs which role, then
+which backends this machine can reach — and it is the same commands underneath,
+with `--stdin` instead of the `getpass` prompt. That prompt needs a terminal, and
+needing one for this was the only thing that forced a shell open beside the app
+on a fresh machine. The value goes down a pipe rather than in an argument — an
+argv is visible to anything that can list processes.
+
+A workspace that has never been arranged and has no subscription token opens on
+that window, because the four windows it would otherwise open are four windows
+that cannot do anything. Nothing else forces it: an unconfigured backend means
+no remote training, which is a real limitation and not a reason to put a wizard
+in front of someone who opened the app to read a ledger.
 
 ## Update
 
@@ -687,7 +700,8 @@ that carry the literal next command.
 | `tools/kaggle.py` | the same verbs on Kaggle's free GPU/TPU, plus `account` / `quota` / `accelerators` |
 | `tools/ledger.py` | `expect` / `query` / `verdict` / `falsify` / `abandon` / `verify` / `reindex` |
 | `tools/quota.py` | measured token and credit usage, summarised by stage, role, and project |
-| `tools/budget.py` | projects and their ceilings: `new` / `use` / `status` / `raise` / `close` |
+| `tools/budget.py` | projects, their ceilings and their own models: `new` / `use` / `status` / `raise` / `configure` / `close` |
+| `tools/setup.py` | the writable half of the configuration: `show` / `models` / `backend` / `host` / `check` |
 | `tools/docs.py` | is this library call current? introspection first, then Context7 |
 | `tools/evolve.py` | evolutionary search as a budgeted campaign, over our own operator |
 | `tools/task.py` | run a CLI in the background: `start` / `list` / `status` / `output` / `wait` / `stop` |
@@ -790,7 +804,8 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   traces.py           a session as tags a later query can slice on  -- pure, tested
   submission.py       the resolved submission and its hash
   gates.py            the submit gates and the smoke carve-out
-  budget.py           the project dimension and its three ceilings
+  budget.py           the project dimension, its ceilings and its own models
+  settings.py         the writable overlay: what setup may change, and what it shadows
   kaggle_quota.py     the weekly accelerator allowance, folded like rolling spend
   ledger_store.py     event-folded runs, rolling spend, staleness, derived index
   submit.py           shared submitter machinery: record, collect, deviations
@@ -895,13 +910,37 @@ unrecognised one still raises rather than returning an empty list.
   on that rail spends subscription quota no ledger here can see — which is a
   reason not to use it whether or not it works.
 
+- **Phase 2 of the campaign loop (remote evaluation) is enabled, on all three
+  backends.** The gate was proven locally first, which is what made it safe:
+  `--remote {ssh|hf_jobs|kaggle} --remote-spec <spec>` evaluates every candidate
+  on real hardware and refuses unless that spec's preflight is complete and
+  passing *including the smoke run*. The required checks are named in
+  `tools/evolve.py` rather than read from `[preflight] checks`, so a machine
+  configured without `smoke` cannot let a loop with no human in it put forty
+  candidates on hardware nothing has ever run one step on. A candidate still
+  never becomes a run — the campaign remains the ledgered unit and its
+  expectation the bound prediction.
+
+  The loop is local; the compute is not. A candidate changes an architecture or
+  an optimiser, so evaluating one is a training run — which is why each backend
+  gets a fresh remote per candidate and why every adapter bounds the work *where
+  it runs* rather than only where it is watched. The three differ in how the
+  mutated program gets there: `scp` to a host that stays up, a swapped file
+  inside Kaggle's embedded notebook payload, or a gzipped tar in an environment
+  variable for HF Jobs, whose pipeline lives in the image and has no upload step.
+
+  Kaggle carries a second gate, because the dollar gate cannot see it: that
+  backend rations *hours*, so a campaign priced at zero would otherwise pass the
+  budget check and spend the week. `core/kaggle_quota.py` now folds candidate
+  rows beside runs, closing a hole exactly the size of a campaign.
+
 **Still open:**
 - **Historical records are left as `"unassigned"`** rather than retrofitted with
   a project. Cheap to change while the ledger is small.
-- **Phase 2 of the campaign loop (remote evaluation) is not enabled.**
-  `--remote` is refused: the gate is proven locally first, because doing the
-  ledger work and the spend work simultaneously against live GPU jobs is how you
-  learn about exit 7 the hard way.
+- **Nothing has run a remote campaign against live hardware yet.** The gate, the
+  driver and the records are covered by `tests/test_evolve_remote.py` with the
+  ssh side stubbed; the first real campaign should be one generation of two
+  candidates on a host you can watch.
 
 **One correction to HANDOFF-2 itself.** §20 records `repowiki map` as taking
 `--format html --open`. The 0.3.1 wheel's `map` takes exactly one `path`,

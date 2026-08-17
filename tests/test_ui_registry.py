@@ -25,12 +25,14 @@ def test_ids_are_unique():
 
 
 def test_the_windows_the_handoff_lists_are_all_here():
-    """The handoff's eleven, and `tasks` -- which is not one of them because the
-    handoff had nowhere to put a local command that runs for twenty minutes.
-    Everything long was awaited under a wall clock until it was."""
+    """The handoff's eleven, and three it has nowhere to put: `tasks`, for a
+    local command that runs for twenty minutes; `projects`, the unit every run,
+    ceiling and report is keyed by; and `setup`, which is what the four scopes
+    crammed into one dropdown turned into once they were separated."""
     assert set(registry.ids()) == {
         "chat", "notebook", "wiki", "papers", "evolve", "editor",
         "ledger", "preflight", "quota", "funnel", "queue", "tasks",
+        "projects", "setup",
     }
 
 
@@ -75,6 +77,27 @@ def test_the_defaults_reproduce_the_mocks_opening_arrangement():
     assert registry.defaults() == ("chat", "notebook", "ledger", "quota")
     layout = layout_mod.Layout.default(registry.defaults())
     assert [c.windows for c in layout.columns] == [["chat"], ["notebook"], ["ledger", "quota"]]
+
+
+def test_an_unauthenticated_machine_opens_on_setup(monkeypatch):
+    """Those four windows are four windows that cannot do anything without a
+    token, so the first thing on screen should be the one that fixes it."""
+    monkeypatch.setattr(state_mod.models, "setup_needed", lambda: True)
+    assert state_mod.opening_windows()[0] == "setup"
+    assert set(registry.defaults()) <= set(state_mod.opening_windows())
+
+
+def test_a_configured_machine_opens_on_the_mocks_four(monkeypatch):
+    monkeypatch.setattr(state_mod.models, "setup_needed", lambda: False)
+    assert state_mod.opening_windows() == registry.defaults()
+
+
+def test_a_credential_store_that_raises_does_not_stop_a_workspace_opening(monkeypatch):
+    def boom():
+        raise RuntimeError("no keyring, no registry, nothing")
+
+    monkeypatch.setattr(state_mod.models, "setup_needed", boom)
+    assert state_mod.opening_windows() == registry.defaults()
 
 
 def test_the_default_layout_fits_the_minimum_pane_width():

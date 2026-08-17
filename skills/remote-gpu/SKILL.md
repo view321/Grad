@@ -57,7 +57,41 @@ written to disk by us.
 
 `collect` is non-blocking by default and exits 10 while the job is running — a
 two-hour poll inside the agent's only shell is a tool timeout waiting to happen.
-Use `--wait --timeout <seconds>` when you genuinely want to block.
+Use `--wait --timeout <seconds>` when you genuinely want to block, which from the
+agent is almost never: `python -m tools.wakeup arm --run <run_id> --timeout <s>`
+waits out of process and starts a new turn when the job stops, holding no shell.
+
+## Evolve campaigns on a host
+
+`python -m tools.evolve run --remote ssh --remote-spec <spec>` evaluates every
+candidate on the host that spec names. (`--remote hf_jobs` and `--remote kaggle`
+do the same thing on those backends; this section is the SSH one.) The campaign
+loop — mutation, selection, the ledger — stays local. What goes to the host is
+the training.
+
+Each candidate is launched detached under `nohup` with a `grad_status.json`
+marker and polled, exactly as `submit` does, and bounded by `timeout` on the host
+itself. Both of those matter because a candidate is a training run: a held SSH
+connection would be dropped by a NAT timeout or a sleeping laptop, and a poll
+that gave up would leave the job running against the next candidate's GPU.
+
+Each candidate gets a fresh copy of the
+pipeline directory under `<workdir>/<candidate_id>`, its own `initial.py` and
+`evaluate.py` written over the top, one bounded run, and the directory removed
+afterwards — so candidate N cannot see what candidate N-1 left behind. A search
+that can accumulate state across evaluations is one whose scores stop being
+comparable, and the failure looks like a real improvement.
+
+It refuses unless that spec has a complete, passing preflight *including the
+smoke run*. That is stricter than an ordinary submission, deliberately: a
+campaign is a loop with no human in it, so the environment is proven once, before
+generation 0, rather than rediscovered forty times at the host's hourly rate.
+
+Candidates do not become runs. They stay in `ledger/candidates.jsonl`; the
+campaign is the ledgered unit and its expectation is the bound prediction. Cost
+per candidate is measured wall clock against the host rate, not the campaign's
+flat estimate — so a host priced at 0 records a campaign that spent nothing,
+which is another reason to set `rate_usd_per_hour` honestly.
 
 ## Conventions the pipeline must follow
 

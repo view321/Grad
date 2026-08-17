@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import re
 import time as _time
 from pathlib import Path
@@ -142,6 +143,170 @@ def workspaces_model() -> dict[str, Any]:
     }
 
 
+#: The three ceilings a project carries: the resource name `core/budget.py` uses,
+#: the `tools.budget raise` flag it maps to, and how to say it on screen.
+#:
+#: One list, because there were two. `ui/shell.py` kept its own copy for the
+#: menu's raise controls, keyed by flag, while every meter in the app was keyed
+#: by resource -- so the two spellings of one idea were maintained in different
+#: files and neither knew the other existed.
+CEILINGS: tuple[tuple[str, str, str, str], ...] = (
+    ("gpu_usd", "gpu-usd", "GPU $", "dollars of remote compute"),
+    ("quota_tokens", "quota-tokens", "tokens", "subscription tokens, all roles"),
+    ("credits_usd", "credits-usd", "credits $", "the reranker and embeddings"),
+)
+
+#: How each resource is written. Tokens are counted, not priced, and rendering
+#: 4.2M of them as `$4,200,000.00` was the specific thing this separates.
+_CEILING_FORMAT = {"gpu_usd": _usd, "quota_tokens": _tokens, "credits_usd": _usd}
+
+
+def _project_memory(project_id: str) -> dict[str, Any]:
+    """Which of the six per-project documents exist. Six `exists()`, no reads.
+
+    "Scaffolded but empty" and "never scaffolded" are different states and the
+    window says which: the first is a project nobody has written in yet, the
+    second is one whose `new` failed to scaffold -- `tools/budget.py` guards that
+    step precisely because it must not fail the creation, and this is where the
+    consequence becomes visible instead of being discovered by `project sync`.
+    """
+    from core import projects as projects_mod
+
+    directory, error = _safe(lambda: projects_mod.resolve_dir(project_id))
+    if directory is None:
+        return {"dir": None, "present": [], "missing": list(projects_mod.DOCS), "error": error}
+    present, listing_error = _safe(
+        lambda: [name for name in projects_mod.DOCS if (directory / name).exists()], []
+    )
+    present = present or []
+    return {
+        "dir": str(directory),
+        "present": present,
+        "missing": [name for name in projects_mod.DOCS if name not in present],
+        "scaffolded": bool(present),
+        "error": error or listing_error,
+    }
+
+
+def projects_model() -> dict[str, Any]:
+    """Every project in this folder: what bounds it, what it has spent, and
+    whether anything has been written down about it.
+
+    This replaced a section of the `project ▾` dialog and is deliberately not the
+    same data. A menu row had space for an id, a title and one summary line, and
+    the ceiling controls under the list addressed only the *selected* project --
+    so reading what bounds a project you were not on meant switching to it first,
+    which charges nothing but reloads every window in the app.
+
+    Wrapped reader by reader, for `workspaces_model`'s reason: this window has to
+    render when the workspace is wrong. `status` folds the whole run ledger for
+    one project, so it is caught per row -- one project whose spend will not
+    compute says so in its own row instead of taking the list down with it.
+    """
+    from core import budget as budget_mod, config as config_mod, settings as settings_mod
+
+    root, root_error = _safe(lambda: str(paths.root()), "")
+    current, _ = _safe(budget_mod.current_project)
+    records, projects_error = _safe(budget_mod.projects, {})
+    cfg, _ = _safe(config_mod.load)
+
+    # What a role resolves to with the project layer removed. Every project but
+    # the selected one has *someone else's* project layer in effect, so this is
+    # the only honest thing to show beside an override that is not set.
+    workspace_models: dict[str, str] = {}
+    for role in config_mod.MODEL_ROLES:
+        value, _ = _safe(lambda r=role: cfg.model_for(r, project=False) if cfg else "", "")
+        workspace_models[role] = value or config_mod.DEFAULTS["models"][role]
+
+    rows: list[dict[str, Any]] = []
+    for project_id, record in sorted((records or {}).items()):
+        state, state_error = _safe(lambda pid=project_id: budget_mod.status(pid), {})
+        resources = (state or {}).get("resources") or {}
+        ceilings = []
+        for resource, flag, caption_text, hint in CEILINGS:
+            node = resources.get(resource) or {}
+            ceiling = node.get("ceiling")
+            render = _CEILING_FORMAT[resource]
+            ceilings.append(
+                {
+                    "resource": resource,
+                    "flag": flag,
+                    "caption": caption_text,
+                    "hint": hint,
+                    "ceiling": ceiling,
+                    "spent": node.get("spent", 0.0),
+                    "fraction": node.get("fraction"),
+                    "over": bool(node.get("over")),
+                    "set": ceiling is not None,
+                    "label": (
+                        f"{render(node.get('spent', 0.0))} spent · no ceiling"
+                        if ceiling is None
+                        else f"{render(node.get('spent', 0.0))} / {render(ceiling)}"
+                    ),
+                }
+            )
+        rows.append(
+            {
+                "id": project_id,
+                "title": _short(record.get("title") or "", 90),
+                "status": record.get("status") or "open",
+                "current": project_id == current,
+                "payer": record.get("payer"),
+                # The date alone. A project list is read for "which of these am I
+                # still working on", and a timestamp to the second answers a
+                # question nobody asked while costing the row half its width.
+                "created": (record.get("created_at") or "")[:10],
+                "spend": _spend_line(state or {}),
+                "run_count": (state or {}).get("run_count", 0),
+                "over_budget": (state or {}).get("over_budget") or [],
+                "raise_count": len(record.get("raises") or []),
+                "ceilings": ceilings,
+                # What this project overrides about how it is run, and what each
+                # role would be without it. The model per role is the main lever
+                # on cost and quality, which is exactly why it should be able to
+                # differ between a cheap exploratory project and one being
+                # written up.
+                "models": [
+                    {
+                        "role": role,
+                        "override": (record.get("models") or {}).get(role),
+                        "workspace": workspace_models[role],
+                        "effective": (record.get("models") or {}).get(role)
+                        or workspace_models[role],
+                    }
+                    for role in config_mod.MODEL_ROLES
+                ],
+                "override_count": len(record.get("models") or {}),
+                "backend": record.get("backend"),
+                "configured_count": len(record.get("configured") or []),
+                # A project with no ceilings bounds nothing and every gate that
+                # reads one passes silently. Surfaced as a flag so the window can
+                # say it where it is true, rather than in a caption under a form.
+                "unbounded": not any(c["set"] for c in ceilings),
+                "memory": _project_memory(project_id),
+                "error": state_error,
+            }
+        )
+
+    # Whether the machine half of setup still has something in it. Cheap -- one
+    # credential-store read -- and it is what lets the create form point at the
+    # wizard instead of containing it.
+    needs_setup, _ = _safe(setup_needed, False)
+
+    return {
+        "root": root,
+        "rows": rows,
+        "current_project": current,
+        "needs_setup": bool(needs_setup),
+        "known_models": list(settings_mod.KNOWN_MODELS),
+        "known_backends": list(settings_mod.BACKENDS),
+        "count": len(rows),
+        "open_count": len([r for r in rows if r["status"] != "closed"]),
+        "unbounded": [r["id"] for r in rows if r["unbounded"] and r["status"] != "closed"],
+        "error": root_error or projects_error,
+    }
+
+
 def update_model() -> dict[str, Any]:
     """What the project menu says about updating, read from the cache only.
 
@@ -206,7 +371,12 @@ def _spend_line(state: dict[str, Any]) -> str:
     """
     resources = state.get("resources") or {}
     parts: list[str] = []
-    for name, render in (("gpu_usd", _usd), ("quota_tokens", _tokens), ("credits_usd", _usd)):
+    # Derived from `CEILINGS` rather than listed again. This held its own copy of
+    # the three resources and their formatters, which is the third place that
+    # list has existed -- and a fourth ceiling added to `core/budget.py` would
+    # have appeared in every meter in the app except this line.
+    for name, _flag, _caption, _hint in CEILINGS:
+        render = _CEILING_FORMAT[name]
         entry = resources.get(name) or {}
         ceiling = entry.get("ceiling")
         if not ceiling:
@@ -240,8 +410,17 @@ def header_model(*, agent_state: str = "idle", step: int | None = None) -> dict[
     window, error = _safe(lambda: _session_window(hours=5), {})
     window = window or {}
     used = float(window.get("credits_usd", 0.0))
+    # The folder, for the appbar's `workspace ▾`. Read here rather than from
+    # `workspaces_model`, which folds every project and its spend to answer a
+    # question the title bar is not asking -- and which the title bar redraws on
+    # every tick.
+    root, root_error = _safe(lambda: paths.root(), None)
     return {
         "project": project or "unassigned",
+        "root": str(root) if root else "",
+        # The basename. An absolute path does not fit an appbar cell, and the
+        # full one is the button's tooltip.
+        "root_name": root.name if root else "—",
         "agent_state": agent_state if agent_state in AGENT_STATES else "idle",
         "accent": AGENT_ACCENT.get(agent_state, "neutral"),
         "step": step,
@@ -254,7 +433,7 @@ def header_model(*, agent_state: str = "idle", step: int | None = None) -> dict[
             "resets_in": window.get("resets_in", "—"),
             "tokens": window.get("tokens", 0),
         },
-        "error": project_error or error,
+        "error": project_error or error or root_error,
         # Repeated wherever a token number appears, per §10. The provider
         # exposes no remaining-quota API; this is our own tally.
         "honesty": "self-measured tally, not the provider's — an estimate within ±5%",
@@ -532,17 +711,51 @@ def sessions_model(current: str | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 0a. credentials
 # ---------------------------------------------------------------------------
-#: What each credential unlocks, and whether the system works without it. The
-#: text matters as much as the flag: "missing" is not the same fact for a token
+#: What each credential unlocks, and which part of the system it belongs to. The
+#: text matters as much as the group: "missing" is not the same fact for a token
 #: that gates GPU submission as for one that raises a rate limit.
-CREDENTIAL_NOTES: dict[str, tuple[str, bool]] = {
-    "hf_token": ("Hugging Face Jobs — submitting and collecting runs", True),
-    "openrouter_key": ("optional second rail for the reranker; Voyage is used by default", False),
-    "voyage_key": ("the reranker and the local index's embeddings (costs credits)", False),
-    "asta_api_key": ("raises Asta's rate limits; discovery works without it", False),
-    "s2_api_key": ("Semantic Scholar direct — only issued to institutional addresses", False),
-    "context7_key": ("raises Context7's rate limits; lookups work without it", False),
-    "claude_oauth_token": ("the funnel's Haiku stages, when the agent runs them", True),
+#:
+#: The group replaced a bare `required` flag, and the flag was making a claim it
+#: could not support. `hf_token` was marked required, so a user who had chosen
+#: Kaggle -- the free backend, and the one a new user is most likely to start on
+#: -- was shown a red MISSING for a token they will never need. What is actually
+#: true is that HF Jobs needs it, which is a fact about a *backend*, and
+#: `tools/setup.py:readiness` is where that belongs.
+CREDENTIAL_GROUPS: dict[str, str] = {
+    # Nothing at all works without this one.
+    "agent": "the agent itself",
+    # Needed by one backend each, and only if you use that backend.
+    "backend": "where runs execute",
+    # Buys or widens retrieval. Everything here degrades rather than fails.
+    "retrieval": "papers and embeddings",
+    "extras": "nice to have",
+}
+
+CREDENTIAL_NOTES: dict[str, tuple[str, str]] = {
+    "claude_oauth_token": (
+        "the agent's own loop, the funnel's Haiku stages and the mutation operator",
+        "agent",
+    ),
+    "hf_token": ("Hugging Face Jobs — submitting and collecting runs", "backend"),
+    # The eighth credential. It was in `credentials.ALL` and not here, so the
+    # panel drew it with an empty purpose column -- the one credential whose row
+    # said nothing about what it was for, and the one belonging to the backend
+    # that costs nothing to try.
+    "kaggle_key": (
+        "Kaggle kernels — the free GPU/TPU backend; useless without the username",
+        "backend",
+    ),
+    "voyage_key": ("the reranker and the local index's embeddings (costs credits)", "retrieval"),
+    "openrouter_key": (
+        "optional second rail for the reranker; Voyage is used by default",
+        "retrieval",
+    ),
+    "asta_api_key": ("raises Asta's rate limits; discovery works without it", "retrieval"),
+    "s2_api_key": (
+        "Semantic Scholar direct — only issued to institutional addresses",
+        "retrieval",
+    ),
+    "context7_key": ("raises Context7's rate limits; lookups work without it", "extras"),
 }
 
 
@@ -559,12 +772,19 @@ def credentials_model() -> dict[str, Any]:
     present, error = _safe(credentials_mod.status, {})
     rows = []
     for name, stored in (present or {}).items():
-        purpose, required = CREDENTIAL_NOTES.get(name, ("", False))
+        purpose, group = CREDENTIAL_NOTES.get(name, ("", "extras"))
+        # Only the agent's own token is unconditionally required: without it
+        # nothing runs at all. A backend credential is required *for that
+        # backend*, which `tools/setup.py:readiness` reports against the backend
+        # rather than against the key.
+        required = group == "agent"
         rows.append(
             {
                 "name": name,
                 "stored": bool(stored),
                 "purpose": purpose,
+                "group": group,
+                "group_label": CREDENTIAL_GROUPS.get(group, group),
                 "required": required,
                 "tone": "ok" if stored else ("broken" if required else "neutral"),
                 "state": "STORED" if stored else ("MISSING" if required else "not set"),
@@ -577,6 +797,174 @@ def credentials_model() -> dict[str, Any]:
         # The store itself, so "nothing is stored" and "nothing can be stored"
         # are distinguishable on screen.
         "service": getattr(credentials_mod, "SERVICE", "grad"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 0a2. setup
+# ---------------------------------------------------------------------------
+#: The steps of the machine half, in order. `id`, the caption, and the one line
+#: saying what answering it buys.
+#:
+#: Machine-scoped, all four of them, which is why they are not asked again when
+#: a project is created. A project's own step -- ceilings, payer, the backend it
+#: reaches for -- is Stage 4 and lives with the project, because it is the only
+#: part of this that differs per project.
+SETUP_STEPS: tuple[tuple[str, str, str], ...] = (
+    ("token", "subscription", "the OAuth token every model call authenticates with"),
+    ("models", "models", "which model runs which of the six roles"),
+    ("backends", "backends", "where a training run actually executes"),
+    ("extras", "extras", "optional keys that widen retrieval or raise a rate limit"),
+)
+
+
+def setup_needed() -> bool:
+    """Whether this install has nothing to run with.
+
+    Deliberately narrow: only the subscription token. An unconfigured backend
+    means no remote training, which is a real limitation and not a reason to put
+    a wizard in front of someone who wanted to read a ledger -- but with no token
+    the main loop cannot authenticate, so the four windows a fresh workspace
+    opens are four windows that can do nothing.
+
+    Both places the token can be are checked, because both work: `credentials`
+    is the durable one and the environment is what a terminal export leaves.
+    Never raises -- `present` already swallows an unreachable store, and a
+    machine with no keyring is a machine with nothing configured, which is the
+    same answer.
+    """
+    from core import credentials as credentials_mod
+
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return False
+    stored, _ = _safe(lambda: credentials_mod.present(credentials_mod.CLAUDE_TOKEN), False)
+    return not stored
+
+
+def setup_model() -> dict[str, Any]:
+    """What is configured, what is not, and what each answer would buy.
+
+    Wrapped reader by reader like every other model here, and this one has the
+    strongest claim to it: the whole point of the window is to be usable on a
+    machine where nothing works yet, which is exactly the machine where a reader
+    is most likely to fail.
+    """
+    from core import config as config_mod, credentials as credentials_mod, settings as settings_mod
+    from tools import setup as setup_tool
+
+    cfg, cfg_error = _safe(config_mod.load)
+    stored, cred_error = _safe(credentials_mod.status, {})
+    stored = stored or {}
+
+    # -- the token ---------------------------------------------------------
+    ambient = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    in_store = bool(stored.get("claude_oauth_token"))
+    token = {
+        "stored": in_store,
+        "ambient": ambient,
+        "state": "stored" if in_store else ("environment" if ambient else "missing"),
+        "ready": in_store or ambient,
+        # The distinction that matters on Windows: a token exported in a shell
+        # authenticates that shell, and the desktop shortcut launches from
+        # Explorer with whatever the user made persistent -- usually nothing.
+        "durable": in_store,
+        "name": credentials_mod.CLAUDE_TOKEN,
+        "mint": "claude setup-token",
+    }
+
+    # -- the six roles -----------------------------------------------------
+    overlay_models, _ = _safe(settings_mod.models, {})
+    overlay_models = overlay_models or {}
+    roles = []
+    for role in config_mod.MODEL_ROLES:
+        configured = ((getattr(cfg, "user", None) or {}).get("models") or {}).get(role)
+        chosen, _ = _safe(lambda r=role: cfg.model_for(r) if cfg else "", "")
+        roles.append(
+            {
+                "role": role,
+                "model": chosen,
+                "source": (
+                    "setup" if role in overlay_models else ("config" if configured else "default")
+                ),
+                "default": config_mod.DEFAULTS["models"][role],
+                "overridden": role in overlay_models,
+            }
+        )
+
+    # -- where a run executes ----------------------------------------------
+    backends, backend_error = _safe(lambda: setup_tool.readiness(cfg) if cfg else [], [])
+    backends = backends or []
+    hosts, _ = _safe(lambda: sorted(cfg.hosts) if cfg else [], [])
+    kaggle_account, _ = _safe(_kaggle_account, {})
+
+    credentials_panel = credentials_model()
+    shadowing, _ = _safe(lambda: settings_mod.shadowing(cfg) if cfg else [], [])
+
+    steps = []
+    for step_id, caption, hint in SETUP_STEPS:
+        if step_id == "token":
+            ready, detail = token["ready"], token["state"]
+        elif step_id == "models":
+            # Always resolvable -- there are defaults for all six. The step is
+            # here to be adjusted, not to be satisfied, so it never blocks.
+            ready, detail = True, f"{len(overlay_models)} of {len(roles)} chosen here"
+        elif step_id == "backends":
+            usable = [b["backend"] for b in backends if b["ready"]]
+            ready = bool(usable)
+            detail = ", ".join(usable) if usable else "none configured"
+        else:
+            optional = [r for r in credentials_panel["rows"] if r["group"] in ("retrieval", "extras")]
+            ready = True
+            detail = f"{len([r for r in optional if r['stored']])} of {len(optional)} stored"
+        steps.append(
+            {
+                "id": step_id,
+                "caption": caption,
+                "hint": hint,
+                "ready": ready,
+                "detail": detail,
+                "tone": "ok" if ready else "attention",
+            }
+        )
+
+    return {
+        "steps": steps,
+        "token": token,
+        "roles": roles,
+        "known_models": list(settings_mod.KNOWN_MODELS),
+        "backends": backends,
+        "default_backend": _safe(settings_mod.default_backend)[0],
+        "known_backends": list(settings_mod.BACKENDS),
+        "hosts": hosts,
+        "kaggle": kaggle_account,
+        "credentials": credentials_panel,
+        "settings_path": str(_safe(settings_mod.path, "")[0] or ""),
+        "config_path": str(_safe(paths.config_path, "")[0] or ""),
+        "shadowing": shadowing or [],
+        # Nothing here blocks the app; this is what the appbar and the first-run
+        # arrangement ask about.
+        "complete": token["ready"] and any(b["ready"] for b in backends),
+        "error": cfg_error or cred_error or backend_error,
+    }
+
+
+def _kaggle_account() -> dict[str, Any]:
+    """The half of the Kaggle credential that is not a secret.
+
+    Its own entry rather than a credential row, for the reason
+    `tools/kaggle.py` gives: only the key is secret, and an account name you
+    cannot read back is a worse answer to "whose kernels are these?" than a file
+    you can.
+    """
+    from core import config as config_mod, credentials as credentials_mod
+    from tools import kaggle as kaggle_tool
+
+    cfg = config_mod.load()
+    username, source = kaggle_tool.resolve_username(cfg)
+    return {
+        "username": username or "",
+        "source": source,
+        "key_stored": credentials_mod.present(credentials_mod.KAGGLE_KEY),
     }
 
 

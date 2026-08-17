@@ -286,6 +286,34 @@ def _shell() -> str:
 .grad-menu-row.disabled:hover { background: transparent; }
 .grad-menu-row.open.disabled { opacity: 1; }
 
+/* The setup window's step row. A tab strip rather than a wizard's forward
+   march: every step stays clickable, because a setup that has to be restarted to
+   change the answer to question two is a setup people abandon at question
+   three. Sticky, so the steps do not scroll away underneath a long form. */
+.grad-steps {
+    display: flex; gap: 0; border-bottom: var(--grad-border);
+    position: sticky; top: 0; z-index: 2; background: var(--grad-paper);
+}
+.grad-step {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+    flex: 1 1 0; min-width: 0; padding: 8px 10px; cursor: pointer;
+    text-align: left; background: transparent; color: var(--grad-ink);
+    border: 0; border-right: var(--grad-border);
+    font: inherit; font-family: var(--grad-font-mono); font-size: 12px;
+}
+.grad-step:last-child { border-right: 0; }
+.grad-step:hover { background: var(--grad-paper-sunk); }
+.grad-step .mark { font-weight: 700; opacity: 0.55; }
+.grad-step .name {
+    font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.grad-step .hint {
+    opacity: 0.55; font-size: 11px; width: 100%;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+}
+.grad-step.open { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-step.open .mark, .grad-step.open .hint { opacity: 0.7; }
+
 .grad-statusbar {
     display: flex; align-items: center; gap: 14px; padding: 0 12px;
     background: var(--grad-ink); color: var(--grad-paper);
