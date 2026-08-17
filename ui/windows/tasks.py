@@ -159,7 +159,10 @@ def _call(row: dict[str, Any]) -> None:
             kit.text("CALL", "", tag="span")
             kit.text(row["name"], "", tag="span")
             if row["subject"]:
-                kit.text(row["subject"], "subject", tag="span")
+                # Shortened for the head, whole in the tooltip: a pane is 320px at
+                # its floor and the end of a path is the part that identifies it.
+                subject = kit.text(kit.shorten_path(row["subject"]), "subject", tag="span")
+                subject.props(f'title="{kit.attr(row["subject"])}"')
             kit.spacer()
             if row["elapsed"]:
                 kit.text(row["elapsed"], "", tag="span")
@@ -174,7 +177,7 @@ def _call(row: dict[str, Any]) -> None:
         elif row["tail"]:
             with kit.el("div", "body"):
                 with kit.el("div", "out"):
-                    kit.text("OUTPUT", "grad-label")
+                    kit.sublabel("output")
                     if row["lines"] > len(row["tail"].splitlines()):
                         kit.text(
                             f"the last {len(row['tail'].splitlines())} of {row['lines']:,} lines — "
@@ -272,14 +275,14 @@ def _task(workspace: Workspace, row: dict[str, Any]) -> None:
             tail = row.get("tail") or []
             if tail:
                 with kit.el("div", "out"):
-                    kit.text("OUTPUT", "grad-label")
+                    kit.sublabel("output")
                     if row.get("dropped"):
                         # A tail that silently forgets reads as complete output.
                         kit.text(
                             f"… {row['dropped']:,} earlier lines scrolled out of the tail",
                             "grad-caption",
                         )
-                    body = kit.el("div", "", style=TAIL_STYLE)
+                    body = kit.el("div", "tail", style=TAIL_STYLE)
                     with body:
                         for tag, line in tail:
                             kit.pre(line, "broken" if tag == "err" else "neutral")

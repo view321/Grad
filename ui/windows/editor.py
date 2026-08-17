@@ -156,7 +156,7 @@ def _preview(model: dict[str, Any]) -> None:
                 with kit.el("div", "body"):
                     kit.text(finding.get("problem") or "", "")
                     if finding.get("fix"):
-                        kit.pre(finding["fix"])
+                        kit.pre(finding["fix"], wrap=True)
 
         if model.get("cited_runs"):
             kit.hr()

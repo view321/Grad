@@ -95,10 +95,16 @@ def render(workspace: Any) -> None:
         kit.text(trace.get("question", ""), "").style("font-size: 15px; margin-bottom: 10px")
 
         for stage in trace.get("bars") or []:
-            tone = {"rerank": "rerank", "context": "context"}.get(stage["tone"], "")
-            indent = (1.0 - stage["width"]) * 100 / 2
-            bar = kit.text(stage["label"], f"grad-stage {tone}".strip())
-            bar.style(f"width: {stage['width'] * 100:.1f}%; margin-left: {indent:.1f}%")
+            with kit.el("div", f"grad-stage {stage['tone']}".strip()):
+                # The fill is the measurement and the label sits over it, so a
+                # stage that kept 5% still says which stage it was.
+                if stage.get("width"):
+                    kit.el("div", "fill", style=f"width: {stage['width'] * 100:.2f}%")
+                kit.text(stage["label"], "name", tag="span")
+                if stage.get("share"):
+                    kit.text(stage["share"], "share", tag="span")
+        if trace.get("scale"):
+            kit.caption(trace["scale"]).style("opacity: 0.6; margin-top: 2px")
 
         expansion = trace.get("expansion") or {}
         if expansion.get("queries"):
@@ -117,6 +123,19 @@ def render(workspace: Any) -> None:
 
         kit.hr()
         kit.label("survivors, in rank order")
+        # A heading over nothing reads as a window that failed to draw. It gets
+        # the design's dashed pending box instead -- and which of the two zeros
+        # this is, because "triage rejected all fifty" and "stage 1 found none"
+        # send you to different ends of the pipeline.
+        if not (trace.get("survivors") or []):
+            kit.text(
+                "nothing reached the context — every candidate is in the dropped "
+                "list below, with its reason"
+                if trace.get("dropped")
+                else "nothing reached the context, and nothing was dropped either — "
+                "stage 1 returned no candidates at all",
+                "grad-empty",
+            )
         for survivor in trace.get("survivors") or []:
             with kit.column("grad-row", gap=2):
                 with kit.row("", gap=9):

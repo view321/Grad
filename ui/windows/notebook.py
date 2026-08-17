@@ -218,7 +218,7 @@ def _failure(verify: dict[str, Any]) -> None:
                         "border: var(--grad-border); background: var(--grad-attention); padding: 9px; margin-top: 9px"
                     ):
                         kit.text("FIX", "grad-label")
-                        kit.pre(verify["fix"])
+                        kit.pre(verify["fix"], wrap=True)
 
 
 #: What the Lab server is told to allow when the page cannot be asked. The port
@@ -365,9 +365,9 @@ def _origin_mismatch(ui: Any, workspace: Any, model: dict[str, Any]) -> None:
             "border: var(--grad-border); background: var(--grad-attention); padding: 9px; margin: 9px 0"
         ):
             kit.text("LAB ALLOWS", "grad-label")
-            kit.pre(str(model.get("lab_origin") or "unknown"))
+            kit.pre(str(model.get("lab_origin") or "unknown"), wrap=True)
             kit.text("THIS WINDOW IS", "grad-label")
-            kit.pre(desktop.origin(models.app_port()))
+            kit.pre(desktop.origin(models.app_port()), wrap=True)
         kit.button("↻ RESTART LAB FOR THIS WINDOW", tone="primary",
                    on_click=lambda: _restart_lab(ui, workspace))
         kit.note(

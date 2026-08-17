@@ -55,6 +55,48 @@ def test_every_state_accent_is_a_real_token():
     assert set(tokens.STATE_ACCENT.values()) <= set(tokens.COLOUR.values())
 
 
+def test_every_series_colour_is_a_real_token():
+    assert set(tokens.SERIES.values()) <= set(tokens.COLOUR.values())
+    for name in tokens.SERIES:
+        assert f"--grad-series-{name}:" in tokens.css_variables()
+
+
+def test_no_chart_series_borrows_a_chromatic_state_accent():
+    """The other half of "one accent per state".
+
+    The rule governed which accent a *state* may use and said nothing about what a
+    chart series may use, so the charts reached for the only fills in the palette
+    and `attention` ended up meaning five things at once -- brand mark, primary
+    action, open-window count, chat spend, new-best candidate. A spend segment is
+    not a state, so it may not wear a state's colour.
+
+    `neutral` is excluded because it is the absence of an accent: ink is the
+    system's text and structure colour, and a series is welcome to it.
+    """
+    chromatic = {
+        tokens.STATE_ACCENT["ok"],
+        tokens.STATE_ACCENT["attention"],
+        tokens.STATE_ACCENT["broken"],
+    }
+    assert set(tokens.SERIES.values()) & chromatic == set()
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [
+        # Every chart fill in the system, and what it must resolve through. A new
+        # one added with a raw `var(--grad-attention)` fails here rather than in
+        # somebody's eye three windows later.
+        ".grad-bar .seg.base", ".grad-bar .seg.chat", ".grad-bar .seg.tool",
+        ".grad-bar .seg.opus", ".grad-lineage .bar.best", ".grad-lineage .bar.champion",
+    ],
+)
+def test_chart_fills_are_drawn_from_the_series_ramp(selector):
+    sheet = tokens.stylesheet()
+    block = sheet.split(selector, 1)[1].split("}", 1)[0]
+    assert "--grad-series-" in block, f"{selector} does not use a series colour: {block}"
+
+
 # ---------------------------------------------------------------------------
 # the structural rules
 # ---------------------------------------------------------------------------
@@ -150,6 +192,7 @@ def test_the_stylesheet_covers_every_component_class_the_kit_emits():
         "grad-cover", "grad-figure", "grad-table", "grad-row", "grad-card",
         "grad-composer", "grad-msg", "grad-pre", "grad-note", "grad-empty",
         "grad-iframe-host", "grad-iframe-anchor", "grad-caret", "grad-label",
+        "grad-sublabel",
     ):
         assert f".{name}" in sheet, name
 

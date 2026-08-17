@@ -107,7 +107,7 @@ def render(workspace: Any) -> None:
         kit.label(f"gpu · rolling {gpu.get('window_days', 30)}d")
         kit.bar(
             [
-                (gpu.get("actual_usd", 0.0) / (gpu.get("monthly_usd") or 1.0), "ink", "collected"),
+                (gpu.get("actual_usd", 0.0) / (gpu.get("monthly_usd") or 1.0), "base", "collected"),
                 (gpu.get("in_flight_usd", 0.0) / (gpu.get("monthly_usd") or 1.0), "tool", "in flight"),
             ]
         )
@@ -133,7 +133,7 @@ def render(workspace: Any) -> None:
                         kit.text("no ceiling set", "grad-caption", tag="span")
                     else:
                         kit.bar(
-                            [(node.get("fraction") or 0.0, "broken" if node.get("over") else "ink", "")]
+                            [(node.get("fraction") or 0.0, "broken" if node.get("over") else "base", "")]
                         ).style("flex: 1 1 auto")
                         kit.text(
                             f"{node.get('spent'):,.4g} / {ceiling_value:,.4g}", "grad-mono", tag="span"
