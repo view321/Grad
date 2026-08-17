@@ -212,6 +212,111 @@ def set_backend(name: str, root: Path | None = None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# the agent's own knobs
+# ---------------------------------------------------------------------------
+#: `[agent]` keys the setup window may write, with the bounds each is checked
+#: against. An allowlist rather than "whatever is passed", because this overlay
+#: outranks `config/grad.toml` for every reader: a typo here would not be a
+#: setting that fails to apply, it would be a setting that applies and is wrong.
+#:
+#: `compact_at_tokens` is the only one so far, and it is the one people ask for.
+#: The *context window* is the model's and is not ours to change -- a live
+#: session reports 967,000 of 1,000,000 -- but where Grad compacts inside it is,
+#: and that is what decides how much conversation the agent carries. 0 disables
+#: compaction and leaves the matter to the CLI underneath.
+#:
+#: The floor is not cosmetic. Compaction costs a turn and the session it seeds
+#: starts on a cold prompt cache, so a threshold small enough to trip after
+#: every turn would compact continuously and cost more than it saves -- see
+#: `core/compaction.py`. 20k is comfortably above a single large tool result.
+AGENT_SETTINGS: dict[str, tuple[float, float]] = {
+    "compact_at_tokens": (20_000, 10_000_000),
+}
+
+
+def agent(root: Path | None = None) -> dict[str, Any]:
+    """Only the `[agent]` keys actually chosen here. A key absent falls through
+    to `grad.toml` and then to the shipped default."""
+    chosen = load(root).get("agent")
+    if not isinstance(chosen, dict):
+        return {}
+    return {str(k): v for k, v in chosen.items() if k in AGENT_SETTINGS}
+
+
+def _check_agent(values: dict[str, Any]) -> dict[str, int]:
+    cleaned: dict[str, int] = {}
+    for key, value in values.items():
+        if key not in AGENT_SETTINGS:
+            raise UsageError(
+                f"unknown agent setting {key!r}",
+                fix=f"settings are: {', '.join(sorted(AGENT_SETTINGS))}",
+            )
+        low, high = AGENT_SETTINGS[key]
+        # Before `float`, because `bool` is an `int` in Python and both survive
+        # the conversion: `True` became 1 and was refused for being under the
+        # floor -- a confusing message for a wrong *kind* -- while `False` became
+        # 0, which is the documented spelling of "off", so passing a boolean by
+        # mistake silently disabled compaction.
+        if isinstance(value, bool):
+            raise UsageError(
+                f"{key} must be a number of tokens, not {value!r}",
+                fix=f"a whole number between {int(low):,} and {int(high):,}, or 0 to disable",
+            )
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise UsageError(
+                f"{key} must be a number, not {value!r}",
+                fix=f"a whole number of tokens between {int(low):,} and {int(high):,}, or 0 to disable",
+            ) from None
+        # NaN fails every comparison below, so it would pass a naive range check
+        # and land in the file as a threshold nothing is ever above.
+        if not math.isfinite(number):
+            raise UsageError(
+                f"{key} must be a finite number, not {value!r}",
+                fix=f"a whole number of tokens between {int(low):,} and {int(high):,}, or 0 to disable",
+            )
+        # 0 is not "below the floor", it is the documented way to turn the
+        # feature off -- the same spelling `compaction.threshold` already reads.
+        if number and not low <= number <= high:
+            raise UsageError(
+                f"{key} of {int(number):,} is outside the usable range",
+                fix=(
+                    f"between {int(low):,} and {int(high):,} tokens, or 0 to leave compaction "
+                    "to the CLI underneath. Below the floor Grad would compact after almost "
+                    "every turn, and a compaction costs a turn plus a cold prompt cache"
+                ),
+            )
+        cleaned[key] = int(number)
+    return cleaned
+
+
+def set_agent(values: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
+    document = load(root)
+    current = dict(document.get("agent") or {})
+    current.update(_check_agent(values))
+    document["agent"] = current
+    return _write(document, root)
+
+
+def clear_agent(keys: list[str], root: Path | None = None) -> dict[str, Any]:
+    """Drop an override so the key resolves exactly as it did before anyone
+    opened the wizard."""
+    unknown = [k for k in keys if k not in AGENT_SETTINGS]
+    if unknown:
+        raise UsageError(
+            f"unknown agent setting(s): {', '.join(sorted(unknown))}",
+            fix=f"settings are: {', '.join(sorted(AGENT_SETTINGS))}",
+        )
+    document = load(root)
+    current = dict(document.get("agent") or {})
+    for key in keys:
+        current.pop(key, None)
+    document["agent"] = current
+    return _write(document, root)
+
+
+# ---------------------------------------------------------------------------
 # ssh hosts
 # ---------------------------------------------------------------------------
 def hosts(root: Path | None = None) -> dict[str, dict[str, Any]]:
@@ -321,6 +426,11 @@ def shadowing(cfg: Any, root: Path | None = None) -> list[dict[str, Any]]:
                     "overlay": value,
                 }
             )
+    configured_agent = (getattr(cfg, "user", None) or {}).get("agent") or {}
+    for key, value in agent(root).items():
+        configured = configured_agent.get(key)
+        if configured is not None and str(configured) != str(value):
+            out.append({"what": f"[agent] {key}", "config": str(configured), "overlay": str(value)})
     configured_hosts = (getattr(cfg, "raw", None) or {}).get("hosts") or {}
     for name in hosts(root):
         if name in configured_hosts:

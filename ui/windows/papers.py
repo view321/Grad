@@ -11,6 +11,11 @@ Matching a basis to a directory needs normalising: a basis cites
 "arXiv:2001.08361", the directory is `2001.08361`, and the corpus stores
 `arxiv_2001.08361`. Comparing them raw yields a claim count of zero, which looks
 like working software.
+
+The two halves live in a `grad-split`, which wraps. They used to be a growing
+list beside a `flex: 0 0 520px` reader, and a rail that cannot shrink in a pane
+that can be 320px wide is a rail that takes all of it: the list collapsed to
+zero width and the window showed "select a paper" over seven invisible rows.
 """
 
 from __future__ import annotations
@@ -78,7 +83,7 @@ def render(workspace: Any) -> None:
         kit.empty("No papers ingested yet.", model.get("empty_fix"))
         return
 
-    active = model.get("filter", "cited")
+    active = model.get("filter") or "cited"
     counts = model.get("counts") or {}
     with kit.row("grad-pad", gap=6).style("border-bottom: var(--grad-border)"):
         for key, caption in FILTERS:
@@ -94,8 +99,8 @@ def render(workspace: Any) -> None:
         return
 
     selected = workspace.selection.get("papers.selected")
-    with kit.row("", gap=0, align="stretch").style("min-height: 0; flex: 1 1 auto"):
-        with kit.column("", gap=0).style("flex: 1 1 auto; min-width: 0; overflow-y: auto"):
+    with kit.row("grad-split", gap=0, align="stretch").style("min-height: 0; flex: 1 1 auto"):
+        with kit.column("main", gap=0):
             for row in rows:
                 _row(workspace, row, selected == row["id"])
         _reader(next((r for r in rows if r["id"] == selected), None))
@@ -116,15 +121,14 @@ def _row(workspace: Any, row: dict[str, Any], selected: bool) -> None:
 
 
 def _reader(row: dict[str, Any] | None) -> None:
-    with kit.column("grad-pad", gap=9).style(
-        "flex: 0 0 520px; background: var(--grad-paper-sunk); "
-        "border-left: var(--grad-border); overflow-y: auto"
-    ):
+    with kit.column("rail grad-pad", gap=9):
         if row is None:
             kit.text("select a paper", "grad-caption")
             return
         kit.label("reader")
         kit.text(row["title"], "grad-serif").style("font-size: 21px")
+        if row.get("authors"):
+            kit.text(row["authors"], "grad-caption")
         kit.text(row["path"], "grad-caption")
         kit.figure_placeholder("page 1", "PDF · not rendered")
         if row.get("claims"):

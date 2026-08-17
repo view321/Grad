@@ -194,6 +194,81 @@ def cmd_backend(args: argparse.Namespace) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# the agent's context budget
+# ---------------------------------------------------------------------------
+def _context_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--compact-at",
+        dest="compact_at_tokens",
+        metavar="TOKENS",
+        help="compact the conversation once it passes this many tokens of context; 0 leaves it to the CLI",
+    )
+    p.add_argument(
+        "--clear",
+        action="store_true",
+        help="drop the override, so the value falls back to the config and then the default",
+    )
+
+
+@cli.command("context", "how much conversation the agent carries before it compacts", setup=_context_args)
+def cmd_context(args: argparse.Namespace) -> dict[str, Any]:
+    """Where Grad compacts, which is the only half of "context length" that is
+    ours to set.
+
+    The *window* belongs to the model and the CLI underneath -- a live session
+    reports 967,000 of 1,000,000 and neither number is reachable from here (see
+    `core/compaction.py`). What is reachable is where Grad compacts inside it,
+    and that is what actually decides how much conversation the agent is
+    carrying: below the threshold nothing is discarded, above it the session is
+    replaced by a handover note.
+
+    Raising it is not free in the direction people expect. Every tool round-trip
+    re-reads the whole context from cache, so a larger budget makes each turn
+    cost more; lowering it is not free either, because a compaction costs a turn
+    and the session it seeds starts on a cold cache. `python -m tools.quota
+    summary --json` is where that trade is visible, which is why this command
+    reports the current reading rather than only the setting.
+    """
+    if args.clear and args.compact_at_tokens is not None:
+        raise UsageError("--compact-at and --clear ask for opposite things", fix="pass one of them")
+    if args.clear:
+        settings.clear_agent(["compact_at_tokens"])
+    elif args.compact_at_tokens is not None:
+        settings.set_agent({"compact_at_tokens": args.compact_at_tokens})
+    else:
+        raise UsageError(
+            "nothing to set",
+            fix="--compact-at 300000   # or --clear to fall back to the config",
+        )
+
+    cfg = config_mod.load(reload=True)
+    from core import compaction  # noqa: PLC0415 - one reader, at point of use
+
+    threshold = compaction.threshold(cfg)
+    # Three layers, named the way the setup window names them. "config" was
+    # reported for anything not in the overlay, which meant `--clear` on a
+    # machine whose `grad.toml` has no `[agent]` section answered "config" for a
+    # value that came from `DEFAULTS` -- pointing whoever read it at a file that
+    # does not mention the setting.
+    configured = (getattr(cfg, "user", None) or {}).get("agent", {}).get("compact_at_tokens")
+    low, high = settings.AGENT_SETTINGS["compact_at_tokens"]
+    return {
+        "compact_at_tokens": threshold,
+        "enabled": bool(threshold),
+        "source": (
+            "setup" if "compact_at_tokens" in settings.agent()
+            else ("config" if configured is not None else "default")
+        ),
+        "default": config_mod.DEFAULTS["agent"]["compact_at_tokens"],
+        "bounds": [int(low), int(high)],
+        "shadowing": settings.shadowing(cfg),
+        "note": (
+            "the context window itself belongs to the model; this is where Grad compacts inside it"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # hosts
 # ---------------------------------------------------------------------------
 def _host_args(p: argparse.ArgumentParser) -> None:

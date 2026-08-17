@@ -31,8 +31,9 @@ import re
 import time as _time
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import quote
 
-from core import paths
+from core import ledger_store as ls_mod, paths
 
 # What "recent" means in the windows that cap their own lists. Deliberately
 # generous: these are ledgers, not feeds.
@@ -812,7 +813,8 @@ def credentials_model() -> dict[str, Any]:
 #: part of this that differs per project.
 SETUP_STEPS: tuple[tuple[str, str, str], ...] = (
     ("token", "subscription", "the OAuth token every model call authenticates with"),
-    ("models", "models", "which model runs which of the six roles"),
+    ("models", "models", "which model runs which role"),
+    ("context", "context", "how much conversation the agent carries before it compacts"),
     ("backends", "backends", "where a training run actually executes"),
     ("extras", "extras", "optional keys that widen retrieval or raise a rate limit"),
 )
@@ -891,6 +893,9 @@ def setup_model() -> dict[str, Any]:
             }
         )
 
+    # -- how much conversation the agent carries ----------------------------
+    context = _context_setting(cfg)
+
     # -- where a run executes ----------------------------------------------
     backends, backend_error = _safe(lambda: setup_tool.readiness(cfg) if cfg else [], [])
     backends = backends or []
@@ -908,6 +913,13 @@ def setup_model() -> dict[str, Any]:
             # Always resolvable -- there are defaults for all six. The step is
             # here to be adjusted, not to be satisfied, so it never blocks.
             ready, detail = True, f"{len(overlay_models)} of {len(roles)} chosen here"
+        elif step_id == "context":
+            # Always satisfied: there is a default, and "off" is a real answer
+            # rather than an unanswered question. The step is here to be adjusted.
+            ready = True
+            detail = (
+                f"compacts at {context['tokens']:,}" if context["enabled"] else "compaction off"
+            )
         elif step_id == "backends":
             usable = [b["backend"] for b in backends if b["ready"]]
             ready = bool(usable)
@@ -932,6 +944,7 @@ def setup_model() -> dict[str, Any]:
         "token": token,
         "roles": roles,
         "known_models": list(settings_mod.KNOWN_MODELS),
+        "context": context,
         "backends": backends,
         "default_backend": _safe(settings_mod.default_backend)[0],
         "known_backends": list(settings_mod.BACKENDS),
@@ -945,6 +958,45 @@ def setup_model() -> dict[str, Any]:
         # arrangement ask about.
         "complete": token["ready"] and any(b["ready"] for b in backends),
         "error": cfg_error or cred_error or backend_error,
+    }
+
+
+#: The choices the context step offers as buttons, in tokens. Not a restriction
+#: -- the field beside them takes any number `settings.AGENT_SETTINGS` accepts --
+#: and not evenly spaced, because the interesting region is the low end: the
+#: difference between 100k and 200k is a different working style, the difference
+#: between 800k and 900k is which side of the CLI's own wall you hit first.
+CONTEXT_PRESETS: tuple[int, ...] = (100_000, 200_000, 300_000, 500_000, 800_000)
+
+
+def _context_setting(cfg: Any) -> dict[str, Any]:
+    """Where Grad compacts, and where that number came from.
+
+    Not the context *window*: that is the model's, the CLI reports it as
+    1,000,000 with its own threshold at 967,000, and `core/compaction.py`
+    explains why neither number is reachable from here. This is the one Grad
+    owns, and it is the one that decides how much conversation the agent is
+    actually carrying.
+    """
+    from core import compaction, config as config_mod, settings as settings_mod
+
+    overlay, _ = _safe(settings_mod.agent, {})
+    overlay = overlay or {}
+    tokens, error = _safe(lambda: compaction.threshold(cfg) if cfg else 0, 0)
+    tokens = int(tokens or 0)
+    configured = ((getattr(cfg, "user", None) or {}).get("agent") or {}).get("compact_at_tokens")
+    return {
+        "tokens": tokens,
+        "enabled": bool(tokens),
+        "source": (
+            "setup" if "compact_at_tokens" in overlay
+            else ("config" if configured is not None else "default")
+        ),
+        "overridden": "compact_at_tokens" in overlay,
+        "default": config_mod.DEFAULTS["agent"]["compact_at_tokens"],
+        "presets": list(CONTEXT_PRESETS),
+        "bounds": list(settings_mod.AGENT_SETTINGS["compact_at_tokens"]),
+        "error": error,
     }
 
 
@@ -1886,11 +1938,12 @@ QUEUE_STATE_ACCENT = {
     "DONE": "neutral",
     "FAILED": "broken",
     "QUEUED": "neutral",
-    # Neither done nor failed: nothing ran. Its own chip because "DONE" beside a
-    # run that produced no result is the one reading that sends someone looking
-    # for metrics that do not exist, and dashed because that is already what the
-    # rest of the design means by written off.
+    # Neither done nor failed: nothing ran. Their own chips because "DONE"
+    # beside a run that produced no result is the one reading that sends someone
+    # looking for metrics that do not exist, and dashed because that is already
+    # what the rest of the design means by written off.
     "ABANDONED": "dashed",
+    "FORGOTTEN": "dashed",
 }
 
 
@@ -1901,18 +1954,30 @@ QUEUE_STATE_ACCENT = {
 RUNNING_STATUSES = ("in_flight", "running", "in_progress")
 FAILED_STATUSES = ("failed", "submit_failed", "error")
 QUEUED_STATUSES = ("queued", "submitted", "pending")
-#: Written off by `ledger abandon`: terminal, but not a result and not a
-#: failure. It is collected in the fold's sense -- that is how it stops holding
-#: the ceiling -- so it has to be caught before the `DONE` branch below, which
-#: would otherwise label a run that never started as one that finished.
-ABANDONED_STATUS = "abandoned"
+#: Written off rather than finished: terminal, but not a result and not a
+#: failure. Both are collected in the fold's sense -- that is how they stop
+#: holding the ceiling -- so they have to be caught before the `DONE` branch
+#: below, which would otherwise label a run that produced nothing as one that
+#: finished.
+#:
+#: Two words because they are two different events, and the difference is the
+#: one a reader of the queue actually wants: `abandoned` (`ledger abandon`) means
+#: the run never reached a backend, `forgotten` (`kaggle forget`) means it did
+#: and the platform no longer has any record of it.
+#:
+#: Read from `core/ledger_store.py` rather than spelled again here: the same
+#: vocabulary decides what `DONE.md` counts as established, and two copies of it
+#: is how a run ends up written off in one surface and finished in another.
+ABANDONED_STATUS = ls_mod.ABANDONED
+FORGOTTEN_STATUS = ls_mod.FORGOTTEN
+WRITTEN_OFF_STATUSES = ls_mod.WRITTEN_OFF_STATUSES
 
 
 def _queue_state(run: Any) -> tuple[str, str]:
     """One run's state chip, and the progress bar variant that goes with it."""
     status = str(run.get("status") or "").lower()
-    if status == ABANDONED_STATUS:
-        return "ABANDONED", "queued"
+    if status in WRITTEN_OFF_STATUSES:
+        return status.upper(), "queued"
     if run.collected:
         if status in FAILED_STATUSES:
             error = run.get("error") or {}
@@ -2129,13 +2194,25 @@ def diff_lines(before: str, after: str, *, context: int = 3) -> list[dict[str, s
 # ---------------------------------------------------------------------------
 # 8. cited papers
 # ---------------------------------------------------------------------------
-def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
+def papers_model(*, filter_name: str | None = None) -> dict[str, Any]:
     """Papers on disk, annotated with what in the ledger depends on them.
 
     The status chips are the reason this window is not a file listing: "3 claims
     depend on this" is computed by walking every expectation's `basis`, and
     "contradicts exp-…" by intersecting that with the falsified set. A paper the
     agent queued but never read is shown as such rather than omitted.
+
+    **Titles come from the corpus**, not from the paper directory. `paper_ingest`
+    records the title it parsed out of the LaTeX in `documents.title` and writes
+    nothing beside the source file, so a window reading only the directory shows
+    seven rows called `2405.21060` -- the id it already knew. This opens that
+    database anyway, for the read/unread split; taking one more column off the
+    same query is free.
+
+    **The filter falls back to one that has rows.** It defaulted to `cited`, and
+    a workspace whose ledger cites nothing yet -- which is every workspace until
+    the first expectation is registered -- opened this window on "Nothing matches
+    cited" with seven papers sitting behind a chip nobody had reason to press.
     """
     from core import ledger_store as ls
 
@@ -2163,19 +2240,20 @@ def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
     # Surfacing "no local index" in the error strip would put a red card on the
     # papers window of every fresh install, which teaches people to ignore the
     # strip -- and then it is no longer useful for the failures that matter.
-    ingested: set[str] = set()
+    ingested: dict[str, dict[str, Any]] = {}
     stats, _ = _safe(_corpus_stats, {})
     for doc in (stats or {}).get("documents", []) or []:
-        key = _paper_key(doc)
+        key = _paper_key(doc.get("id"))
         if key:
-            ingested.add(key)
+            ingested[key] = doc
 
     rows = []
     for path in on_disk:
         key = _paper_key(path.name)
         claims = depends.get(key, [])
         broken = contradicts.get(key, [])
-        read = key in ingested or any(path.glob("*.tex")) or any(path.glob("*.txt"))
+        indexed = ingested.get(key)
+        read = indexed is not None or any(path.glob("*.tex")) or any(path.glob("*.txt"))
         chips = []
         if claims:
             chips.append({"text": f"{len(claims)} CLAIMS DEPEND ON THIS", "tone": "attention"})
@@ -2186,8 +2264,8 @@ def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
         rows.append(
             {
                 "id": path.name,
-                "title": _paper_title(path),
-                "authors": _paper_authors(path),
+                "title": _paper_title(path, indexed),
+                "authors": _paper_authors(path, indexed),
                 "path": str(path),
                 "read": read,
                 "claims": claims,
@@ -2195,6 +2273,19 @@ def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
                 "cited": bool(claims),
             }
         )
+
+    counts = {
+        "cited": len([r for r in rows if r["cited"]]),
+        "read": len([r for r in rows if r["read"]]),
+        "queued": len([r for r in rows if not r["read"]]),
+    }
+    # A chip the user never pressed is not a choice they made, so `None` lands
+    # on one that has something behind it. An explicit selection is left alone
+    # **even when it is empty** -- pressing CITED and being moved to READ would
+    # be the window arguing with the click, and the caller passes `None` rather
+    # than a default precisely so the two can be told apart.
+    if filter_name not in FILTER_KEYS:
+        filter_name = next((k for k in FILTER_KEYS if counts.get(k)), "cited")
 
     if filter_name == "cited":
         visible = [r for r in rows if r["cited"]]
@@ -2209,24 +2300,33 @@ def papers_model(*, filter_name: str = "cited") -> dict[str, Any]:
         "rows": visible,
         "all": rows,
         "filter": filter_name,
-        "counts": {
-            "cited": len([r for r in rows if r["cited"]]),
-            "read": len([r for r in rows if r["read"]]),
-            "queued": len([r for r in rows if not r["read"]]),
-        },
+        "counts": counts,
         "error": error,
         "empty_fix": "python -m tools.paper_ingest arxiv <id> --json",
     }
 
 
+#: The filter chips, in the order they are offered and searched for a default.
+FILTER_KEYS: tuple[str, ...] = ("cited", "read", "queued")
+
+
 def _corpus_stats() -> dict[str, Any]:
+    """The index's counts, plus one row per document.
+
+    `SELECT *`, not a column list. `corpus.connect` creates the schema with
+    `IF NOT EXISTS`, so a database built before a column was added never gains
+    it -- and naming `authors` on an index that predates it raises
+    `OperationalError: no such column`, which `_safe` would turn into "no titles
+    at all" for a reason that has nothing to do with titles. Every reader below
+    uses `.get`, so a row with fewer columns is a row with fewer answers.
+    """
     from core import corpus
 
     con = corpus.connect(create=False)
     try:
         stats = corpus.stats(con)
-        rows = con.execute("SELECT id FROM documents").fetchall()
-        return {**stats, "documents": [r[0] for r in rows]}
+        rows = con.execute("SELECT * FROM documents").fetchall()
+        return {**stats, "documents": [dict(r) for r in rows]}
     finally:
         con.close()
 
@@ -2245,7 +2345,13 @@ def _paper_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9.]", "", text)
 
 
-def _paper_title(path: Path) -> str:
+def _paper_title(path: Path, indexed: dict[str, Any] | None = None) -> str:
+    """The paper's title: the directory's own files, then the corpus, then the id.
+
+    The directory comes first because a `meta.json` beside the source is
+    something a person can correct; the corpus row is what `paper_ingest` parsed
+    out of `\\title{...}` and is right most of the time and mangled the rest.
+    """
     for candidate in ("title.txt", "meta.json"):
         target = path / candidate
         if not target.exists():
@@ -2254,89 +2360,160 @@ def _paper_title(path: Path) -> str:
             if candidate.endswith(".json"):
                 data = json.loads(target.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and data.get("title"):
-                    return str(data["title"])
+                    return _clean_latex(str(data["title"])) or path.name
             else:
-                return target.read_text(encoding="utf-8").strip().splitlines()[0]
+                first = target.read_text(encoding="utf-8").strip().splitlines()[0]
+                return _clean_latex(first) or path.name
         except (OSError, json.JSONDecodeError, IndexError):
             continue
+    if indexed and indexed.get("title"):
+        return _clean_latex(str(indexed["title"])) or path.name
     return path.name
 
 
-def _paper_authors(path: Path) -> str:
+#: Formatting macros that survive `\title{...}` extraction and mean nothing in a
+#: window: `\LARGE \bf Bandwidth-Efficient…` is a title with two font commands in
+#: front of it, not a title about fonts.
+_LATEX_MACRO = re.compile(r"\\[a-zA-Z@]+\s*")
+_LATEX_SPACING = re.compile(r"\\{2,}|\$|~")
+
+
+def _clean_latex(text: str) -> str:
+    """Enough LaTeX stripped for a title to read as one. Not a parser.
+
+    A real one belongs in `tools/paper_ingest.py`, at the point the title is
+    recorded; this is the display side making the best of what is already
+    stored, and it has to be safe on input it does not understand -- so it drops
+    markup and never drops words.
+    """
+    out = _LATEX_SPACING.sub(" ", text)
+    out = _LATEX_MACRO.sub(" ", out)
+    out = out.replace("{", " ").replace("}", " ")
+    out = " ".join(out.split())
+    return re.sub(r"\s+([:;,.!?])", r"\1", out).strip(" .,:;-")
+
+
+def _paper_authors(path: Path, indexed: dict[str, Any] | None = None) -> str:
+    """`authors · arXiv:id · year`, with whichever halves are known."""
+    authors: Any = None
+    year: Any = None
     target = path / "meta.json"
-    if not target.exists():
-        return f"arXiv:{path.name}"
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return f"arXiv:{path.name}"
-    if not isinstance(data, dict):
-        return f"arXiv:{path.name}"
-    authors = data.get("authors")
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            authors, year = data.get("authors"), data.get("year")
+    if authors is None and indexed:
+        authors, year = indexed.get("authors"), year or indexed.get("year")
     if isinstance(authors, list):
-        authors = ", ".join(str(a) for a in authors[:3]) + ("et al." if len(authors) > 3 else "")
-    year = data.get("year")
-    return f"{authors or '—'} · arXiv:{path.name}" + (f" · {year}" if year else "")
+        authors = ", ".join(str(a) for a in authors[:3]) + (" et al." if len(authors) > 3 else "")
+    authors = _clean_latex(str(authors)) if authors else ""
+    # The id alone when nothing else is known, rather than "— · arXiv:…": a dash
+    # standing in for an author list is a row that looks like it failed to load.
+    parts = [p for p in (authors, f"arXiv:{path.name}", str(year) if year else "") if p]
+    return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # 9. wiki + references
 # ---------------------------------------------------------------------------
-def wiki_model() -> dict[str, Any]:
-    """The generated wiki, whether it still matches the source, and its scope.
+def wiki_model(page_id: str | None = None) -> dict[str, Any]:
+    """The selected project's wiki: its pages, the one being read, and whether
+    the code underneath has moved since it was written.
 
-    The design shows a chat pane with a references rail. The references here are
-    the wiki's own scope entries and the files that changed since it was built,
-    because that is what actually exists: `tools/wiki.py` deliberately does not
-    enable `repowiki scan` (the LLM half reads `ANTHROPIC_API_KEY`, the exact
-    variable the credential scrub deletes), so there is no answer engine to
-    quote. Questions go to the agent with an `@wiki` mention instead.
+    The subject is `pipelines/<name>/` -- the research code the agent generated
+    -- rather than Grad's own source, which is `tools/wiki.py`'s job and a
+    different reader's question. The design's chat-plus-references-rail becomes
+    a page-list rail beside the page, because that is what a wiki is: the rail
+    holds the pages and, when the wiki has gone stale, exactly which files
+    differ.
+
+    The prose half is written by `core/wikigen.py`; nothing is generated *here*.
+    This reads what a build wrote, which is what keeps a window that redraws
+    every two seconds from being a window that can spend money.
     """
-    from core import jsonl
-    from tools import wiki as wiki_tool
+    from core import budget as budget_mod, jsonl, projwiki
+    from tools import projwiki as projwiki_tool
 
-    manifest_path = wiki_tool.output_dir() / "manifest.json"
+    project, project_error = _safe(budget_mod.current_project)
+    if not project:
+        return {
+            "built": False,
+            "project": None,
+            "pages": [],
+            "changed": [],
+            "error": project_error,
+            "empty_fix": "python -m tools.budget use <id> --json",
+            "empty_message": "No project is selected, and a wiki is written about one.",
+        }
+
     # Guarded for the same reason as the preflight records: `read_json` returns
     # `None` for missing and malformed, but lets `UnicodeDecodeError` and
     # `OSError` through, and "the manifest is unreadable" must not render as
-    # "no wiki has been generated yet".
-    manifest, manifest_error = _safe(lambda: jsonl.read_json(manifest_path))
+    # "no wiki has been built yet".
+    manifest, manifest_error = _safe(lambda: projwiki_tool.manifest(project))
+    pages_raw, pages_error = _safe(lambda: jsonl.read_json(projwiki_tool.output_dir(project) / "pages.json"))
     if not isinstance(manifest, dict):
         return {
             "built": False,
-            "stale": False,
-            "scopes": [],
+            "project": project,
+            "pages": [],
             "changed": [],
-            "error": manifest_error,
-            "empty_fix": "python -m tools.wiki map --json",
+            "error": manifest_error or pages_error,
+            "empty_fix": f"python -m tools.projwiki build --project {project} --json",
+            "empty_message": f"No wiki has been built for {project} yet.",
         }
 
-    current, error = _safe(wiki_tool.source_hash, {})
+    current, hash_error = _safe(lambda: projwiki.source_hash(project), {})
     current = current or {}
     recorded = manifest.get("source") or {}
     before, after = recorded.get("files") or {}, current.get("files") or {}
     changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
 
-    scopes = manifest.get("scopes")
-    if isinstance(scopes, dict):
-        scope_rows = [{"name": k, "entries": v} for k, v in sorted(scopes.items())]
-    else:
-        scope_rows = [{"name": s, "entries": None} for s in (current.get("scope") or [])]
+    written = pages_raw if isinstance(pages_raw, list) else []
+    by_id = {str(p.get("id")): p for p in written if isinstance(p, dict)}
+    rows = []
+    for entry in manifest.get("pages") or []:
+        page = by_id.get(str(entry.get("id"))) or {}
+        rows.append(
+            {
+                "id": entry.get("id"),
+                "kind": entry.get("kind"),
+                "title": page.get("title") or entry.get("title") or entry.get("id"),
+                "summary": page.get("summary") or "",
+                "written": bool(page.get("sections")),
+                "unverified_refs": page.get("unverified_refs") or [],
+                "error": page.get("error"),
+            }
+        )
 
-    html = wiki_tool.output_dir() / "index.html"
+    # The first *written* page, not the first planned one: opening on an empty
+    # page because its call failed would make a build with one bad page look
+    # like a build that produced nothing.
+    selected = page_id if page_id in by_id else None
+    if selected is None:
+        selected = next((r["id"] for r in rows if r["written"]), rows[0]["id"] if rows else None)
+
     return {
         "built": True,
+        "project": project,
         "stale": bool(changed),
         "generated_at": manifest.get("generated_at"),
-        "output_dir": str(wiki_tool.output_dir()),
-        "html": str(html) if html.exists() else None,
+        "model": manifest.get("model"),
+        "prose": manifest.get("prose", True),
+        "output_dir": manifest.get("output_dir"),
         "source_hash": current.get("hash"),
         "recorded_hash": recorded.get("hash"),
-        "scopes": scope_rows,
+        "pages": rows,
+        "selected": selected,
+        "page": by_id.get(str(selected)) if selected else None,
         "changed": changed[:50],
         "changed_total": len(changed),
-        "error": error,
-        "empty_fix": "python -m tools.wiki map --json",
+        "unverified_total": len({r for p in rows for r in p["unverified_refs"]}),
+        "error": hash_error or pages_error,
+        "empty_fix": f"python -m tools.projwiki build --project {project} --json",
     }
 
 
@@ -2471,6 +2648,15 @@ def parse_message(text: str) -> list[dict[str, Any]]:
     card, a `GATE` line introduces a gate card, everything else stays prose. The
     parser is small on purpose -- a richer one would start inventing structure
     the agent did not intend.
+
+    Figures are the one thing extracted rather than left to the markdown
+    renderer, and the reason is that the renderer cannot draw them: an
+    `![loss](figures/001.png)` becomes an `<img>` whose src resolves against the
+    page origin, and the workspace is not served there. They come out as
+    `figure` blocks *in place*, which is also what fixes the older behaviour --
+    every figure in a turn used to be appended after the last block of it, so a
+    message that put a plot in the middle of its argument showed a broken icon
+    there and the plot itself several paragraphs later.
     """
     blocks: list[dict[str, Any]] = []
     for index, part in enumerate(text.split("```")):
@@ -2485,8 +2671,89 @@ def parse_message(text: str) -> list[dict[str, Any]]:
                 blocks.append({"kind": "code", "language": language or "text", "text": body})
             continue
         for chunk in _split_cards(part):
-            blocks.append(chunk)
-    return [b for b in blocks if b.get("text") or b.get("rows")]
+            if chunk.get("kind") == "text":
+                blocks.extend(_split_figures(chunk["text"]))
+            else:
+                blocks.append(chunk)
+    return [b for b in blocks if b.get("text") or b.get("rows") or b.get("src")]
+
+
+#: `![alt](path)`, the only markdown a figure arrives as. The path stops at the
+#: first whitespace or `)` so a title -- `![alt](p.png "caption")` -- is not
+#: swallowed into the filename.
+_IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\(\s*(?P<src>[^\s)]+)[^)]*\)")
+
+#: A figure path named in prose rather than linked: "wrote figures/001.png".
+#: Anchored on the directory name so an arbitrary `.png` elsewhere is not
+#: hunted for on disk on every redraw of every message.
+_FIGURE_MENTION_RE = re.compile(r"(?<![\w/\\.])((?:[\w.\-]+[/\\])*figures[/\\][\w.\-]+\.(?:png|svg|jpe?g|webp|gif))")
+
+
+def figure_url(token: str) -> str | None:
+    """The URL that serves `token`, or None if nothing here can.
+
+    A path is servable when it resolves inside the workspace's `figures/`
+    directory and exists. Both halves matter: the route serves that directory by
+    *name*, so a figure written anywhere else has no URL, and a link to a file
+    that was never created should keep its markdown -- a visible wrong path is
+    more use than a silently dropped one.
+    """
+    text = (token or "").strip().strip("<>\"'")
+    if not text:
+        return None
+    try:
+        path = Path(text)
+        if not path.is_absolute():
+            path = paths.root() / path
+        path = path.resolve()
+        directory = paths.figures_dir().resolve()
+        if directory not in path.parents or not path.is_file():
+            return None
+    except (OSError, ValueError):  # a path the platform will not even parse
+        return None
+    return f"/__grad/figure/{quote(path.name)}"
+
+
+def _split_figures(text: str) -> list[dict[str, Any]]:
+    """One prose chunk, split at the figures it draws.
+
+    Markdown images split the text -- the image belongs exactly where it was
+    written. A path merely *mentioned* in a sentence does not: the sentence
+    still reads as a sentence and cutting it in half to insert a plot would be
+    worse than putting the plot under it, so those are emitted after the
+    paragraph that named them.
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def flush(chunk: str) -> None:
+        """One run of prose, then any figure it named but did not link."""
+        pending: list[dict[str, Any]] = []
+        for paragraph in re.split(r"\n\s*\n", chunk):
+            if paragraph.strip():
+                out.append({"kind": "text", "text": paragraph.strip()})
+            for match in _FIGURE_MENTION_RE.finditer(paragraph):
+                url = figure_url(match.group(1))
+                if url and url not in seen:
+                    seen.add(url)
+                    pending.append({"kind": "figure", "src": url, "alt": match.group(1)})
+            out.extend(pending)
+            pending = []
+
+    index = 0
+    for match in _IMAGE_RE.finditer(text):
+        url = figure_url(match.group("src"))
+        if url is None:
+            # Left as written, so a link to a figure that does not exist reads
+            # as the broken link it is rather than vanishing.
+            continue
+        flush(text[index : match.start()])
+        if url not in seen:
+            seen.add(url)
+            out.append({"kind": "figure", "src": url, "alt": match.group("alt")})
+        index = match.end()
+    flush(text[index:])
+    return out
 
 
 _CARD_RE = re.compile(

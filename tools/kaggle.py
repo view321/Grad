@@ -50,12 +50,14 @@ from core import (
     gates,
     kaggle_quota,
     ledger_store as ls,
+    paths,
     submit as submit_lib,
 )
 from core.cli import Cli, main
 from core.config import Config
 from core.errors import (
     EXIT_RUNNING,
+    EXIT_USAGE,
     ConfigError,
     GradError,
     UpstreamError,
@@ -148,6 +150,16 @@ _STATUSES = (
     "queued",
 )
 _TERMINAL = {"complete", "error", "cancelAcknowledged"}
+
+#: A kernel that was deleted through the Kaggle UI. Not a `_STATUSES` entry --
+#: Kaggle never reports it, `_status` infers it from a 404 -- and deliberately
+#: not in `_TERMINAL`: a terminal status means there is an outcome to collect,
+#: and this one means there is nothing left to collect from. See `cmd_forget`.
+MISSING = "missing"
+
+#: What ends a wait. Terminal states plus `missing`, because a kernel Kaggle has
+#: no record of will not acquire one by being polled again.
+_SETTLED = _TERMINAL | {MISSING}
 
 
 # ---------------------------------------------------------------------------
@@ -856,7 +868,50 @@ def _parse_status(output: str) -> dict[str, Any]:
     return {"status": "unknown", "message": text[:400]}
 
 
+#: What Kaggle says when the kernel is not there. Matched against the CLI's own
+#: error text, which is where the API's 404 ends up: `kaggle kernels status`
+#: exits non-zero and prints the exception rather than emitting a status.
+#:
+#: This is the difference between "gone" and "we could not tell", and the two
+#: need opposite answers -- one is a run that can be written off, the other is a
+#: run that may be training right now behind a network that is down. **The cost
+#: is asymmetric, so the matching is narrow.** A missed deletion degrades to
+#: `unknown`, which refuses and names `--assume-deleted`; a false positive
+#: writes off a live kernel and hands its hours back to the weekly pool while it
+#: is still burning them.
+#:
+#: So: a `404` as its own token, or a not-found phrase that is *about a kernel*.
+#: A bare `"not found"` was too broad to be safe -- "host not found" is a DNS
+#: failure, which is precisely the network-is-down case that must stay unknown,
+#: and it would have been read as a confirmed 404.
+_MISSING_RE = re.compile(
+    r"""
+      \b404\b                                   # the status code, as a token
+    | \bno\s+such\s+kernel\b
+    | \bkernel\b[^.\n]{0,60}?\b(?:not\s+found|does\s+not\s+exist|no\s+longer\s+exists|has\s+been\s+deleted)\b
+    | \b(?:not\s+found|does\s+not\s+exist|could\s+not\s+find)\b[^.\n]{0,60}?\bkernel\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _reads_as_missing(*texts: str | None) -> bool:
+    """Whether any of these says the kernel does not exist on Kaggle."""
+    return any(_MISSING_RE.search(text) for text in texts if text)
+
+
 def _status(cfg: Config, ref: str) -> dict[str, Any]:
+    """A kernel's state, distinguishing "deleted" from "cannot say".
+
+    Three outcomes rather than the two this had. `unknown` used to absorb both
+    a kernel Kaggle has never heard of and a status call that failed for any
+    other reason, and absorbing them is what made a kernel deleted through the
+    Kaggle UI unclearable: `collect` refuses a non-terminal status forever, and
+    `ledger abandon` refuses anything with a handle, so the run held its
+    estimate against the monthly ceiling and its hours against the weekly pool
+    until someone edited `runs.jsonl` by hand. `missing` is what `forget` acts
+    on; `unknown` is still a refusal, because it might be a live job.
+    """
     try:
         output = _run(
             [_executable(), "kernels", "status", ref],
@@ -864,8 +919,22 @@ def _status(cfg: Config, ref: str) -> dict[str, Any]:
             timeout=float(cfg.get("kaggle", "status_timeout_s", 120)),
         )
     except GradError as exc:
+        # Both, because they are not the same text: `_run` truncates the CLI's
+        # output to 400 characters for the message and keeps 2000 in `detail`,
+        # and a traceback that puts the 404 after a stack would lose it in the
+        # message alone.
+        detail = (exc.detail or {}).get("output") if isinstance(exc.detail, dict) else None
+        if _reads_as_missing(exc.message, detail):
+            return {"status": MISSING, "message": exc.message}
         return {"status": "unknown", "message": exc.message}
-    return _parse_status(output)
+    state = _parse_status(output)
+    # A CLI that exits 0 and still says the kernel is gone -- newer versions
+    # print the API error rather than raising. Only consulted when the output
+    # carried no status token at all, so a real `error` status is never
+    # reinterpreted as a missing kernel.
+    if state["status"] == "unknown" and _reads_as_missing(state.get("message")):
+        state["status"] = MISSING
+    return state
 
 
 @cli.command("status", "report a run's state without collecting it", setup=lambda p: p.add_argument("run_id"))
@@ -1169,9 +1238,16 @@ def _queue_grace(cfg: Config) -> float:
 
 
 def _wait(cfg: Config, ref: str, *, deadline: float) -> dict[str, Any]:
+    """Poll until the kernel settles, gives up, or stops existing.
+
+    `missing` ends the wait as surely as `complete` does: a kernel that Kaggle
+    has no record of is not going to start reporting one, and sleeping thirty
+    seconds at a time until the deadline to confirm that is an hour spent
+    learning nothing.
+    """
     interval = float(cfg.get("kaggle", "poll_interval_s", 30))
     state = _status(cfg, ref)
-    while state.get("status") not in _TERMINAL and time.time() < deadline:
+    while state.get("status") not in _SETTLED and time.time() < deadline:
         time.sleep(interval)
         state = _status(cfg, ref)
     return state
@@ -1275,6 +1351,18 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
     # `_wait` polls once before sleeping, so the non-waiting case is the same
     # call with a deadline already past rather than a second code path.
     state = _wait(cfg, ref, deadline=time.time() + (args.timeout if args.wait else 0))
+    if state.get("status") == MISSING:
+        # Its own refusal, because `still_running` is advice this run can never
+        # take: there is no kernel left to finish, so waiting longer is waiting
+        # forever. `forget` is the exit and this is where the reader learns it.
+        raise GradError(
+            "kernel_missing",
+            f"Kaggle has no kernel {ref}: it was deleted there, so there is nothing left "
+            f"to collect and run {r.id} cannot be finished by collecting it",
+            exit_code=3,
+            fix=f'python -m tools.kaggle forget {r.id} --reason "deleted through the Kaggle UI" --json',
+            detail={"run_id": r.id, "kernel": state, "where": _url(ref)},
+        )
     if state.get("status") not in _TERMINAL:
         raise GradError(
             "still_running",
@@ -1361,6 +1449,197 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
             "--verdict bug|real|inconclusive --note '...' --json"
         ) if unjudged else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# forget: the terminal path for a kernel that is no longer on Kaggle
+# ---------------------------------------------------------------------------
+def _forget_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("run_id")
+    p.add_argument(
+        "--reason",
+        required=True,
+        help="why this run is being written off. Recorded on the ledger, not just printed",
+    )
+    p.add_argument(
+        "--assume-deleted",
+        action="store_true",
+        help="write it off without a confirming 404 -- records that the deletion was asserted, not verified",
+    )
+
+
+@cli.command(
+    "forget",
+    "write off a run whose kernel was deleted through the Kaggle UI",
+    setup=_forget_args,
+)
+def cmd_forget(args: argparse.Namespace) -> dict[str, Any]:
+    """Close out a run whose kernel no longer exists on Kaggle.
+
+    **The dead end this exists to remove.** A kernel deleted through the Kaggle
+    UI leaves a run that neither of the two terminal paths will take. `collect`
+    polls a kernel that is not there, gets a 404, and refuses -- for as long as
+    anyone keeps asking. `ledger abandon` refuses anything carrying a handle,
+    and it is right to: that check is what stops a live job being dropped off
+    the spend ceiling, which is the bypass §6 exists to prevent. So the run sat
+    `in_flight` forever, holding its estimate against the monthly ceiling and
+    its accelerator hours against the weekly pool, and once past the grace
+    window `gates.check_stale` refused *every* later submission on *every*
+    backend. The only way out was editing `runs.jsonl` by hand -- exactly the
+    thing `abandon`'s docstring says it was written to abolish, in the one case
+    `abandon` cannot cover.
+
+    **It is narrow in the same way `abandon` is, and on the same principle.**
+    `abandon` refuses a run that reached a backend because that run may still be
+    spending. This one asks the backend. A kernel that reports any real status
+    -- queued, running, complete, error -- is refused here and sent to `collect`
+    or to Kaggle's own cancel, because a status is proof there is something to
+    collect. Only a *confirmed 404* is written off, and confirming it is a
+    network call this makes rather than a claim the caller supplies.
+
+    **`--assume-deleted` is the escape from that escape**, and it exists because
+    a check that can only be satisfied by a working network is a check that
+    re-creates the dead end the moment Kaggle changes an error string. It
+    records in the run record that no 404 was seen, so a reader can tell a
+    verified write-off from an asserted one. The reason is required either way:
+    a run that leaves the ledger without a result should say who decided that.
+    """
+    cfg = config_mod.load()
+    r = submit_lib.require_uncollected(args.run_id)
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise UsageError(
+            "forgetting a run needs a reason; it is the only record of why this one left "
+            "the ledger without a result",
+            fix='--reason "the kernel was deleted through the Kaggle UI"',
+        )
+
+    handle = r.get("handle") or {}
+    ref = handle.get("kernel_ref")
+    if not ref:
+        # No handle means it never reached Kaggle, which is `abandon`'s case
+        # exactly. Two commands that write off a run is already one more than
+        # ideal; three, with this one quietly covering the other's ground,
+        # would make "which do I use" a question with no principled answer.
+        raise UsageError(
+            f"run {r.id} has no kernel reference, so it never reached Kaggle and there is "
+            "no deletion to confirm",
+            fix=f'python -m tools.ledger abandon {r.id} --reason "{reason}" --json',
+        )
+    if (r.get("platform") or PLATFORM) != PLATFORM:
+        raise UsageError(
+            f"run {r.id} ran on {r.get('platform')}, not on Kaggle",
+            fix=f"python -m tools.ledger show {r.id} --json",
+        )
+
+    state: dict[str, Any] = {"status": "not checked", "message": ""}
+    if not args.assume_deleted:
+        state = _status(cfg, ref)
+        if state.get("status") != MISSING:
+            raise _still_there(r, ref, state)
+
+    verified = state.get("status") == MISSING
+    extra: dict[str, Any] = {
+        "reason": reason,
+        "kernel_ref": ref,
+        "kernel_status": state.get("status"),
+        "kernel_message": state.get("message"),
+        "forget_basis": (
+            "Kaggle reported no such kernel (404), so the run produced nothing and is booked "
+            "at zero hours"
+            if verified
+            else "asserted deleted by the operator: Kaggle was not reachable for a confirming "
+            "404, so this write-off rests on --assume-deleted rather than on a check"
+        ),
+        "deletion_verified": verified,
+        "cost_basis": "Kaggle kernels are free; the metered resource is accelerator hours, not dollars",
+        # The whole point: the weekly pool reads the *estimate* until an actual
+        # is written, so a run finalised without one goes on holding its hours
+        # for a week. Zero is the honest actual for a kernel whose output no
+        # longer exists -- whatever it burned, nothing can be recovered from it,
+        # and the alternative is a pool that never refills.
+        kaggle_quota.F_ACTUAL: 0.0,
+        "accelerator_hours_basis": (
+            "zero: the kernel was deleted, so no log survives to measure execution time against"
+        ),
+    }
+    record = submit_lib.finish(
+        r.id,
+        status=FORGOTTEN_STATUS,
+        results={},
+        cost_usd_actual=0.0,
+        # `paths.run_artifacts`, not `artifacts_dir`: the helper would *create*
+        # the directory, and this run is defined by having produced nothing.
+        # Recorded anyway, because where the artifacts would have been is a fact
+        # about the run either way. Same reasoning as `submit.abandon`.
+        artifacts_dir=paths.run_artifacts(r.id),
+        # No expectation, so no deviations. The prediction was never tested, and
+        # inventing one would put a row in the unjudged list that no verdict can
+        # honestly settle. The binding stands.
+        expectation=None,
+        extra=extra,
+    )
+    remaining = ls.stale_runs(cfg=cfg)
+    return {
+        "run": record,
+        "deletion_verified": verified,
+        "kernel": {"ref": ref, "where": _url(ref), **state},
+        # Reported rather than released, matching `ledger abandon`: §7 has one
+        # spelling of "consumed" and a retry takes a fresh prediction.
+        "expectation_still_bound": r.get("expectation_id"),
+        "quota": kaggle_quota.summary(cfg),
+        "stale_runs_remaining": [x.id for x in remaining],
+        "next": (
+            submit_lib.collect_command(remaining[0])
+            if remaining
+            else "python -m tools.kaggle submit <spec> --expectation <id> --json"
+        ),
+    }
+
+
+#: Terminal, and not a result. Distinct from `abandoned` on purpose: that one
+#: means the run never reached a backend, this one means it did and the record
+#: of it was destroyed there. Both stop holding the ceiling; only one of them
+#: says anything about whether the job ran.
+#:
+#: The word itself lives in `core/ledger_store.py` beside `abandoned`, because
+#: `projects.state` and the queue window both have to know which statuses are
+#: written off and a second spelling here is how one of them stops knowing.
+FORGOTTEN_STATUS = ls.FORGOTTEN
+
+
+def _still_there(r: ls.Run, ref: str, state: dict[str, Any]) -> GradError:
+    """The refusal for a kernel Kaggle still knows about.
+
+    Two shapes, because two very different things are being refused. A kernel
+    with a real status has an outcome and `collect` is how you get it -- writing
+    it off here would throw away a result that exists. A status we could not
+    read at all is the dangerous one: it may be a kernel training right now, and
+    the fix is to look, not to assume.
+    """
+    status = state.get("status")
+    if status == "unknown":
+        return GradError(
+            "kernel_status_unknown",
+            f"could not read the status of kernel {ref}: {state.get('message') or 'no answer'}. "
+            f"That is not the same as the kernel being gone -- run {r.id} may still be "
+            "training, and writing it off would drop a live job off the weekly pool",
+            exit_code=EXIT_RUNNING,
+            fix=(
+                f"python -m tools.kaggle status {r.id} --json   # try again once Kaggle answers\n"
+                f'     python -m tools.kaggle forget {r.id} --reason "..." --assume-deleted --json'
+                "   # if you have confirmed in the Kaggle UI that it is gone"
+            ),
+            detail={"run_id": r.id, "kernel": state, "where": _url(ref)},
+        )
+    return GradError(
+        "kernel_exists",
+        f"kernel {ref} is {status} on Kaggle, so there is something to collect and run "
+        f"{r.id} is not a write-off",
+        exit_code=EXIT_USAGE,
+        fix=f"python -m tools.kaggle collect {r.id} --json",
+        detail={"run_id": r.id, "kernel": state, "where": _url(ref)},
+    )
 
 
 # ---------------------------------------------------------------------------

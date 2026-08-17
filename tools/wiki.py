@@ -1,4 +1,10 @@
-"""grad-wiki -- RepoWiki, the human's map (HANDOFF-2 §20).
+"""grad-wiki -- RepoWiki, the human's map of *Grad's own source* (HANDOFF-2 §20).
+
+Not `tools/projwiki.py`, which documents the research code the agent generates
+under `pipelines/`. This one is about the machine: `core/` and `tools/`, for a
+person maintaining Grad. Two different codebases, two different readers, and the
+wiki *window* shows the other one -- a researcher opening a pane wants the
+experiment explained, not the ledger store.
 
 **Scope: human-facing only.** Not in the agent's tool list, not in
 `prompts/system.md`, no context cost. Its job is letting a person reacquire the
@@ -84,13 +90,28 @@ def _manifest_path() -> Path:
     return output_dir() / "manifest.json"
 
 
+def source_root() -> Path:
+    """Where `core/` and `tools/` actually are.
+
+    The **installation**, not the workspace. This resolved against
+    `paths.root()`, and the two are the same directory only in a checkout you
+    are developing in -- which is exactly where this was written and tested. In
+    every installed configuration the workspace is a research folder holding
+    `ledger/`, `notes/` and `data/`, so `_scope_paths` raised "none of core,
+    tools exist under C:\\Users\\…\\Grad" and `source_hash` covered zero files:
+    the map could not be generated at all, and the staleness check compared two
+    digests of nothing and reported the absent wiki as current.
+    """
+    return paths.install_dir()
+
+
 def source_hash(root: Path | None = None) -> dict[str, Any]:
     """A digest over exactly the files the wiki was generated from.
 
     Returned with its inputs listed rather than as a bare string, so a staleness
     report can say *which* file moved instead of only that something did.
     """
-    root = root or paths.root()
+    root = root or source_root()
     digests: dict[str, str] = {}
     for name in SCOPE:
         directory = root / name
@@ -135,8 +156,16 @@ def _scope_paths(root: Path) -> list[str]:
     present = [str(root / name) for name in SCOPE if (root / name).is_dir()]
     if not present:
         raise ConfigError(
-            f"none of {', '.join(SCOPE)} exist under {root}",
-            fix="run this from the workspace root",
+            f"none of {', '.join(SCOPE)} exist under {root}, which is where Grad is installed",
+            # Not "run this from the workspace root" -- that was the advice while
+            # the scope was resolved against `paths.root()`, and following it now
+            # cannot help: this maps the *installation*, and an installation
+            # missing `core/` is one to repair rather than a command to re-run
+            # from somewhere else.
+            fix=(
+                "reinstall or repair the installation at that path "
+                "(pip install -e . from a checkout), then run this again"
+            ),
         )
     return present
 
@@ -163,7 +192,7 @@ def cmd_map(args: argparse.Namespace) -> dict[str, Any]:
     is rendered here from that JSON.
     """
     executable = _repowiki()
-    root = paths.root()
+    root = source_root()
     out = output_dir()
     out.mkdir(parents=True, exist_ok=True)
 
@@ -216,6 +245,10 @@ def cmd_map(args: argparse.Namespace) -> dict[str, Any]:
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "commands": commands,
+        # How many entries each scope produced. Recorded because a reader of the
+        # manifest asking "what is in this wiki" should not have to open the
+        # 2MB `map.json` beside it to find out.
+        "scopes": {name: len(_entries(payload) or []) for name, payload in scopes.items()},
         "duration_s": round(time.time() - started, 1),
         "source": source_hash(root),
         "output_dir": str(out),
@@ -246,19 +279,29 @@ def _render_html(out: Path, scopes: dict[str, Any]) -> Path:
     """
     rows = []
     for scope, payload in sorted(scopes.items()):
-        files = payload.get("files") if isinstance(payload, dict) else None
+        # `entries` is what repowiki 0.3.1 emits; `files` was a guess at the key
+        # and it is the wrong one, so this fell through to dumping raw JSON into
+        # a `<pre>` every single time -- the table below had never once been
+        # rendered. Both are read, because a version that renames it back should
+        # not silently return the map to a JSON dump.
+        entries = _entries(payload)
         rows.append(f"<h2>{_esc(scope)}/</h2>")
-        if not isinstance(files, list) or not files:
+        if entries is None:
             rows.append(f"<pre>{_esc(json.dumps(payload, indent=2, default=str)[:20000])}</pre>")
             continue
-        rows.append("<table><tr><th>file</th><th>rank</th><th>lang</th><th>lines</th></tr>")
-        for entry in files:
+        rows.append("<table><tr><th>file</th><th>rank</th><th>score</th><th>lang</th><th>lines</th></tr>")
+        for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            score = entry.get("score")
             rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
                     _esc(str(entry.get("path", entry.get("file", "")))),
-                    _esc(str(round(entry["rank"], 5) if isinstance(entry.get("rank"), float) else entry.get("rank", ""))),
+                    _esc(str(entry.get("rank", ""))),
+                    # `rank` is the position (1, 2, 3…) and `score` is the
+                    # PageRank value. The old table printed the position under a
+                    # heading that read like the score and dropped the score.
+                    _esc(f"{score:.5f}" if isinstance(score, float) else str(score or "")),
                     _esc(str(entry.get("language", ""))),
                     _esc(str(entry.get("lines", ""))),
                 )
@@ -280,6 +323,17 @@ def _render_html(out: Path, scopes: dict[str, Any]) -> Path:
     path = out / "index.html"
     path.write_text(html, encoding="utf-8")
     return path
+
+
+def _entries(payload: Any) -> list[Any] | None:
+    """The ranked file list out of one scope's payload, whatever it is called."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("entries", "files"):
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            return value
+    return None
 
 
 def _esc(text: str) -> str:

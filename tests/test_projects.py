@@ -270,3 +270,83 @@ def test_the_cli_refuses_a_project_that_does_not_exist(workspace):
     _project(workspace)
     with pytest.raises(GradError):
         project_cli.cmd_sync(argparse.Namespace(project="no-such-project", force=False, json=True))
+
+
+# ---------------------------------------------------------------------------
+# runs that were written off rather than finished
+# ---------------------------------------------------------------------------
+def _stranded(project_id, *, task="widths"):
+    """A run recorded at submit time whose submitter never came back."""
+    run_id = ls.new_id("run")
+    ls.append_run_event(
+        {
+            "type": ls.T_RUN_SUBMITTED, "id": run_id, "task": task, "status": "in_flight",
+            "smoke": False, "submitted_at": ls.now_iso(), "project": project_id,
+            "platform": "hf_jobs", "estimate_usd": 4.0, "estimated_duration_s": 60,
+        }
+    )
+    return run_id
+
+
+def test_a_written_off_run_is_not_listed_as_established(workspace):
+    """It produced nothing, so it has no deviations -- and a run with no
+    deviations fell through to `done`, putting a job that never returned a
+    number under "Established" in DONE.md. That is the same "DONE beside a run
+    with no result" reading the queue window's own chip exists to prevent."""
+    project_id = _project(workspace)
+    run_id = _stranded(project_id)
+    submit.abandon(run_id, reason="the submitter was killed mid-submit")
+
+    state = projects.state(project_id)
+    assert [r.id for r in state["written_off"]] == [run_id]
+    assert run_id not in [r.id for r in state["done"]]
+    assert run_id not in [r.id for r in state["awaiting_verdict"]]
+    # Still collected, which is how it stops holding the ceiling.
+    assert run_id in [r.id for r in state["collected"]]
+
+
+def test_done_md_shows_a_written_off_run_with_its_reason(workspace):
+    """Visible, and not counted. A run that left the ledger without a result
+    belongs in the record -- with the reason someone gave for writing it off --
+    but listing it beside results would make the count of what this project
+    established wrong in the direction that flatters it."""
+    project_id = _project(workspace)
+    run_id = _stranded(project_id)
+    submit.abandon(run_id, reason="the submitter was killed mid-submit")
+    projects.sync(project_id)
+
+    text = (projects.resolve_dir(project_id) / "DONE.md").read_text(encoding="utf-8")
+    assert "## Written off" in text
+    assert "**0 done" in text
+    assert "1 written off**" in text
+    assert "the submitter was killed mid-submit" in text
+    assert "## Established" in text and "*Nothing yet.*" in text
+
+
+def test_a_forgotten_kaggle_run_is_written_off_the_same_way(workspace):
+    """Two commands write these and they must not disagree about what they
+    mean. `abandoned` never reached a backend; `forgotten` reached Kaggle and
+    Kaggle no longer has any record of it. Both are terminal, neither is a
+    result."""
+    project_id = _project(workspace)
+    run_id = _stranded(project_id)
+    submit.finish(
+        run_id, status=ls.FORGOTTEN, results={}, cost_usd_actual=0.0,
+        artifacts_dir=submit.artifacts_dir(run_id), expectation=None,
+        extra={"reason": "deleted through the Kaggle UI"},
+    )
+
+    state = projects.state(project_id)
+    assert [r.id for r in state["written_off"]] == [run_id]
+    assert state["done"] == []
+
+
+def test_a_real_result_is_still_established(workspace):
+    """The regression this must not cause."""
+    project_id = _project(workspace)
+    expectation = _expectation(project_id)
+    run_id = _run(project_id, expectation, results={"val_loss": 3.0})
+
+    state = projects.state(project_id)
+    assert [r.id for r in state["done"]] == [run_id]
+    assert state["written_off"] == []

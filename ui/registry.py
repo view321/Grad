@@ -43,7 +43,7 @@ WINDOWS: tuple[WindowSpec, ...] = (
     WindowSpec("notebook", "notebook", "ui.windows.notebook", "JupyterLab, and the verify banner", default=True, persistent=True),
     WindowSpec("ledger", "ledger", "ui.windows.ledger", "expectations against outcomes", default=True),
     WindowSpec("quota", "quota", "ui.windows.quota", "the 5-hour window and today's spend", default=True),
-    WindowSpec("wiki", "wiki", "ui.windows.wiki", "the generated codebase wiki"),
+    WindowSpec("wiki", "wiki", "ui.windows.wiki", "this project's generated code, explained"),
     WindowSpec("papers", "papers", "ui.windows.papers", "papers, and what depends on them"),
     WindowSpec("evolve", "evolve", "ui.windows.evolve", "ShinkaEvolve campaigns"),
     WindowSpec("editor", "editor", "ui.windows.editor", "the LaTeX paper and its claim bindings"),

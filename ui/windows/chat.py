@@ -38,6 +38,7 @@ file, and a redraw would take the transcript's scroll position with it.
 
 from __future__ import annotations
 
+import html
 import time
 from typing import Any
 
@@ -772,8 +773,6 @@ def _message(record: dict[str, Any], workspace: Any) -> None:
             # re-render once each, and not worth one 15 times a second.
             for part in models.parse_message(block.get("text") or ""):
                 _block(ui, part, workspace)
-        for figure in models.figures_in(text):
-            ui.image(figure).classes("w-full max-w-2xl")
 
 
 def _block(ui: Any, block: dict[str, Any], workspace: Any) -> None:
@@ -790,6 +789,8 @@ def _block(ui: Any, block: dict[str, Any], workspace: Any) -> None:
     elif kind == "thinking":
         with _reasoning_card():
             ui.markdown(block.get("text") or "").classes("body")
+    elif kind == "figure":
+        _figure(ui, block)
     elif kind == "expectation":
         with kit.el("div", "grad-card"):
             with kit.row("head attention", gap=9):
@@ -800,6 +801,33 @@ def _block(ui: Any, block: dict[str, Any], workspace: Any) -> None:
                 kit.kv(_rows(block))
     elif kind == "gate":
         _gate_card(block, workspace)
+
+
+def _figure(ui: Any, block: dict[str, Any]) -> None:
+    """A figure the agent drew, at the point in the message where it drew it.
+
+    A bare `<img>`, not `ui.image`. `ui.image` is Quasar's `QImg`, which wraps
+    the picture in a fixed-ratio box, cross-fades it in and shows a spinner
+    first -- three things the design rules out in one component, and the ratio
+    box letterboxes a plot whose aspect nobody chose. It also lazy-loads, which
+    read as "the figure did not render" every time one sat below the fold.
+
+    A **URL**, not a path: `ui.image(Path)` copies the file into NiceGUI's media
+    registry under a content-addressed url, so a transcript would keep showing
+    the plot as it was when the message was first drawn -- and a figure is
+    exactly the file the next run of the same cell overwrites.
+    """
+    # `html.escape`, not `kit.attr`: this is interpolated into markup rather than
+    # into a NiceGUI props string, and the two want opposite treatments -- attr
+    # swaps the double quote for an apostrophe and doubles backslashes for
+    # `literal_eval`, both of which would reach the screen here. The alt text is
+    # whatever the agent wrote between the brackets.
+    src = html.escape(block["src"], quote=True)
+    alt = html.escape(block.get("alt") or "figure", quote=True)
+    ui.html(
+        f'<img class="grad-figure-img" src="{src}" alt="{alt}" decoding="async">',
+        sanitize=False,
+    )
 
 
 def _tool_card(block: dict[str, Any]) -> dict[str, Any]:

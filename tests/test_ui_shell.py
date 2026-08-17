@@ -1058,7 +1058,6 @@ def seed_everything() -> None:
         budget as budget_mod, campaign as campaign_mod, jsonl,
         ledger_store as ls, paths, report as report_mod,
     )
-    from tools import wiki as wiki_tool
     from ui import models
 
     ls.append_expectation(
@@ -1134,11 +1133,35 @@ def seed_everything() -> None:
                                            "cell_index": 4, "traceback": "Traceback ...",
                                            "fix": "pip install torch"})
 
-    wiki_tool.output_dir().mkdir(parents=True, exist_ok=True)
-    jsonl.write_json(wiki_tool.output_dir() / "manifest.json",
-                     {"generated_at": ls.now_iso(), "output_dir": str(wiki_tool.output_dir()),
-                      "source": {"hash": "stale00", "files": {"core/x.py": "aaa"}},
-                      "scopes": {"core": 12, "tools": 9}})
+    # The wiki window's subject is the selected project's generated code, so it
+    # is `tools/projwiki.py`'s output that has to exist here -- and it is seeded
+    # stale on purpose, because the staleness card is the part of that window
+    # most worth knowing still renders.
+    from core import projects as projects_mod
+    from tools import projwiki as projwiki_tool
+
+    projects_mod.scaffold("proj")
+    pipeline = paths.root() / "pipelines" / "proj"
+    pipeline.mkdir(parents=True, exist_ok=True)
+    (pipeline / "spec.toml").write_text('entrypoint = "train.py"\nimage = "x@sha256:0"\n', encoding="utf-8")
+    (pipeline / "train.py").write_text('"""Train it."""\n\n\ndef main():\n    return 1\n', encoding="utf-8")
+
+    out = projwiki_tool.output_dir("proj")
+    out.mkdir(parents=True, exist_ok=True)
+    jsonl.write_json(out / "pages.json", [
+        {"id": "overview", "kind": "overview", "title": "proj — overview",
+         "summary": "What this project is for.",
+         "sections": [{"heading": "The question", "body": "Whether depth helps.",
+                       "refs": ["train.py:4", "spec.toml"]}],
+         "open_questions": ["Has the main grid been submitted?"],
+         "unverified_refs": []},
+    ])
+    jsonl.write_json(out / "manifest.json",
+                     {"project": "proj", "generated_at": ls.now_iso(), "output_dir": str(out),
+                      "model": "claude-sonnet-5", "prose": True,
+                      "source": {"hash": "stale00", "files": {"pipelines/proj/train.py": "aaa"}},
+                      "pages": [{"id": "overview", "kind": "overview", "title": "proj — overview",
+                                 "written": True, "unverified_refs": []}]})
 
 
 def test_every_window_renders_with_real_data(rendered):

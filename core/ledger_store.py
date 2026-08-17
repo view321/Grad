@@ -34,6 +34,25 @@ T_VERDICT = "verdict"
 VERDICTS = ("bug", "real", "inconclusive")
 CONFIDENCES = ("low", "medium", "high")
 
+#: Terminal statuses that are *not* results. A written-off run is collected in
+#: the fold's sense -- that is how it stops holding the spend ceiling and the
+#: weekly pool -- but nothing was measured, so anything counting what a project
+#: has established has to exclude it.
+#:
+#: Here rather than beside either writer, because there are now two of them and
+#: a third spelling of "written off" is how a run ends up counted as an
+#: established result in one file and not in another. `core/submit.py:abandon`
+#: writes the first (never reached a backend); `tools/kaggle.py:cmd_forget` the
+#: second (reached Kaggle, and Kaggle no longer has any record of it).
+ABANDONED = "abandoned"
+FORGOTTEN = "forgotten"
+WRITTEN_OFF_STATUSES: frozenset[str] = frozenset({ABANDONED, FORGOTTEN})
+
+
+def is_written_off(run: Any) -> bool:
+    """Was this run closed without a result? Reads the status, not `collected`."""
+    return str(run.get("status") or "").lower() in WRITTEN_OFF_STATUSES
+
 
 def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")

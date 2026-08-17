@@ -69,6 +69,35 @@ def resolve(name: str) -> Path:
     return target
 
 
+#: What `/__grad/figure/<name>` will serve. Matplotlib writes PNG here and SVG
+#: is the other thing a plotting call produces; anything else named `.png` by an
+#: agent is not a figure, and an allowlist is the cheap half of not serving the
+#: workspace over HTTP.
+FIGURE_SUFFIXES: tuple[str, ...] = (".png", ".svg", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def resolve_figure(name: str) -> Path:
+    """The figure `name` refers to, or `NotAllowed`.
+
+    `resolve`'s two checks, for the same reason and against a different
+    directory: the name has to have no directory part at all, and the resolved
+    path has to still be inside `figures/` once symlinks are followed. `..` is
+    caught by the first; a symlink pointing out of the workspace only by the
+    second.
+
+    Deliberately *not* cached and not resolved once at import: the workspace
+    root moves when someone switches folders, so the directory is re-derived on
+    every call. A figure is a few tens of kilobytes off a local disk.
+    """
+    if Path(name).name != name or not name.lower().endswith(FIGURE_SUFFIXES):
+        raise NotAllowed(name)
+    directory = paths.figures_dir().resolve()
+    target = (directory / name).resolve()
+    if directory not in target.parents or not target.is_file():
+        raise NotAllowed(name)
+    return target
+
+
 def notebook_html(name: str) -> str:
     """A complete, script-free HTML document for one notebook."""
     path = resolve(name)

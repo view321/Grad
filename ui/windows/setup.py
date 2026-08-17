@@ -69,6 +69,7 @@ def render(workspace: Any) -> None:
     body = {
         "token": _token,
         "models": _models,
+        "context": _context,
         "backends": _backends,
         "extras": _extras,
     }.get(active)
@@ -208,6 +209,104 @@ def _models(workspace: Any, model: dict[str, Any]) -> None:
                             ),
                         )
 
+        _shadowing(model)
+
+
+# ---------------------------------------------------------------------------
+# 3. how much conversation the agent carries
+# ---------------------------------------------------------------------------
+def _context(workspace: Any, model: dict[str, Any]) -> None:
+    """The context budget, stated as what it actually is.
+
+    The window is careful not to promise what it cannot deliver. The *context
+    window* belongs to the model -- the CLI underneath reports 1,000,000 with
+    its own threshold at 967,000, and `core/compaction.py` explains why neither
+    is reachable from here. What this sets is where Grad compacts inside it,
+    which is the number that decides how much conversation the agent is
+    carrying. Calling that "context length" in the caption and explaining the
+    difference in the note is more honest than a slider labelled with a number
+    nothing here controls.
+    """
+    from nicegui import ui
+
+    context = model.get("context") or {}
+    tokens = int(context.get("tokens") or 0)
+    low, high = (context.get("bounds") or [0, 0])[:2]
+
+    with kit.pad():
+        kit.label("context budget")
+        with kit.row("", gap=9).style("margin: 6px 0 2px"):
+            kit.text(
+                f"{tokens:,} tokens" if tokens else "compaction off",
+                "grad-mono",
+                tag="span",
+            ).style("font-size: 19px; font-weight: 700")
+            kit.chip(context.get("source", "default"), "ok" if context.get("overridden") else "neutral")
+            kit.spacer()
+        kit.text(
+            "Where Grad compacts. Past this many tokens the conversation is replaced by a "
+            "handover note the next session reads.",
+            "grad-caption",
+        )
+
+        with kit.row("", gap=6).style("margin-top: 10px; flex-wrap: wrap"):
+            for preset in context.get("presets") or []:
+                kit.button(
+                    f"{preset // 1000}K",
+                    tone="active" if preset == tokens else "neutral",
+                    disabled=preset == tokens,
+                    on_click=lambda _=None, value=preset: workspace.spawn(
+                        workspace.set_context_budget(str(value)), "context budget"
+                    ),
+                )
+            kit.button(
+                "OFF",
+                tone="active" if not tokens else "neutral",
+                disabled=not tokens,
+                title="leave compaction to the CLI underneath, which compacts at its own threshold",
+                on_click=lambda: workspace.spawn(
+                    workspace.set_context_budget("0"), "context budget"
+                ),
+            )
+
+        with kit.row("", gap=6).style("margin-top: 6px"):
+            entry = (
+                ui.input(placeholder=f"or any number between {int(low):,} and {int(high):,}")
+                .props("borderless dense")
+                .classes("field")
+                .style("flex: 1 1 auto; padding: 0 8px")
+            )
+            entry.on(
+                "keydown.enter.prevent",
+                lambda _=None: workspace.spawn(
+                    workspace.set_context_budget(entry.value or ""), "context budget"
+                ),
+            )
+            kit.button(
+                "SET",
+                tone="primary",
+                on_click=lambda _=None: workspace.spawn(
+                    workspace.set_context_budget(entry.value or ""), "context budget"
+                ),
+            )
+            kit.button(
+                "RESET",
+                tone="neutral",
+                disabled=not context.get("overridden"),
+                title=f"fall back to the config, then to {int(context.get('default') or 0):,}",
+                on_click=lambda: workspace.spawn(
+                    workspace.clear_context_budget(), "context budget reset"
+                ),
+            )
+
+        kit.note(
+            "The window itself is the model's, not Grad's: the CLI underneath runs a "
+            "1,000,000-token context and compacts at 967,000 of it. This is where Grad "
+            "compacts first, and it is a trade in both directions — a larger budget means "
+            "every tool round-trip re-reads more cached context, while a smaller one "
+            "compacts more often and each compaction costs a turn plus a cold prompt cache. "
+            "`python -m tools.quota summary --json` is where the trade becomes visible."
+        )
         _shadowing(model)
 
 

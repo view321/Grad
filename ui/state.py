@@ -120,8 +120,11 @@ MODEL_BUILDERS: dict[str, Callable[["Workspace"], Any]] = {
     "notebook": lambda w: models.notebook_model(),
     "ledger": lambda w: models.ledger_model(),
     "quota": lambda w: models.quota_model(),
-    "wiki": lambda w: models.wiki_model(),
-    "papers": lambda w: models.papers_model(filter_name=w.selection.get("papers.filter", "cited")),
+    "wiki": lambda w: models.wiki_model(w.selection.get("wiki.page")),
+    # `None`, not a default: the model has to be able to tell "nobody has
+    # pressed a chip" from "someone pressed CITED", because it falls back to a
+    # chip with rows in the first case and must not in the second.
+    "papers": lambda w: models.papers_model(filter_name=w.selection.get("papers.filter")),
     "evolve": lambda w: models.evolve_model(w.selection.get("evolve.campaign")),
     "editor": lambda w: models.editor_model(w.project),
     "preflight": lambda w: models.preflight_model(),
@@ -665,6 +668,18 @@ class Workspace:
 
     async def set_backend(self, name: str) -> None:
         await self.run_and_reload("tools.setup", "backend", "--default", name, "--json")
+
+    async def set_context_budget(self, tokens: str) -> None:
+        """Where the agent compacts. Through the CLI, like every other setting
+        here, so the window cannot grow a second way to write one."""
+        value = (tokens or "").strip().replace(",", "").replace("_", "")
+        if not value:
+            self.say("no number given — type a token count, or pick one of the buttons")
+            return
+        await self.run_and_reload("tools.setup", "context", "--compact-at", value, "--json")
+
+    async def clear_context_budget(self) -> None:
+        await self.run_and_reload("tools.setup", "context", "--clear", "--json")
 
     async def add_host(self, name: str, hostname: str, user: str, rate: str) -> None:
         if not name or not hostname:

@@ -372,14 +372,27 @@ def test_a_vanished_record_does_not_break_the_listing(workspace, monkeypatch):
     assert isinstance(models.preflight_model(), dict)
 
 
-def test_an_unreadable_wiki_manifest_is_not_reported_as_never_generated(workspace):
-    from tools import wiki as wiki_tool
+def test_an_unreadable_wiki_manifest_is_not_reported_as_never_built(workspace):
+    from core import budget as budget_mod
+    from tools import projwiki as projwiki_tool
 
-    wiki_tool.output_dir().mkdir(parents=True, exist_ok=True)
-    (wiki_tool.output_dir() / "manifest.json").write_bytes(b"\xff\xfe{}")
+    budget_mod.create("proj", title="P", budget={})
+    budget_mod.set_current("proj")
+    projwiki_tool.output_dir("proj").mkdir(parents=True, exist_ok=True)
+    (projwiki_tool.output_dir("proj") / "manifest.json").write_bytes(b"\xff\xfe{}")
     model = models.wiki_model()
     assert model["built"] is False
     assert "UnicodeDecodeError" in model["error"]
+
+
+def test_the_wiki_window_says_so_when_no_project_is_selected(workspace):
+    """A wiki is written *about* a project, so there is nothing to show without
+    one -- and "no wiki built yet" would send the reader to a build command that
+    would refuse for a different reason."""
+    model = models.wiki_model()
+    assert model["built"] is False
+    assert model["project"] is None
+    assert "budget use" in model["empty_fix"]
 
 
 def test_hash_warnings_survive_into_the_window(workspace):
@@ -477,6 +490,54 @@ def test_a_workspace_with_no_corpus_is_not_an_error(workspace):
     teaches people to ignore the strip."""
     (paths.papers_dir() / "2001.08361").mkdir(parents=True, exist_ok=True)
     assert models.papers_model()["error"] is None
+
+
+def test_an_unpressed_filter_lands_on_one_with_rows(workspace):
+    """`cited` is zero until the first expectation is registered, so defaulting
+    to it opened this window on "Nothing matches cited" with every paper in the
+    workspace one unmotivated click away."""
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
+
+    model = models.papers_model(filter_name=None)
+    assert model["counts"] == {"cited": 0, "read": 1, "queued": 0}
+    assert model["filter"] == "read"
+    assert len(model["rows"]) == 1
+
+
+def test_a_filter_the_user_pressed_is_left_alone_even_when_empty(workspace):
+    """The other half, and the one that matters more: being moved to READ after
+    pressing CITED is the window arguing with the click. The builder passes
+    `None` rather than a default precisely so the two can be told apart."""
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
+
+    model = models.papers_model(filter_name="cited")
+    assert model["filter"] == "cited"
+    assert model["rows"] == []
+
+
+def test_the_window_asks_for_no_filter_until_one_is_chosen(workspace):
+    """The state builder has to pass `None`, not `"cited"` -- a default there
+    makes "nobody pressed a chip" and "someone pressed CITED" the same value,
+    and the fallback then cannot fire for the case it exists for.
+
+    Asserted as the concrete answer rather than "one of the three": with a read
+    paper and nothing cited, `read` is the only correct one, and a membership
+    check would have passed on the `cited` this is meant to catch.
+    """
+    from ui import state as state_mod
+
+    paper = paths.papers_dir() / "2001.08361"
+    paper.mkdir(parents=True, exist_ok=True)
+    (paper / "source.tex").write_text("x", encoding="utf-8")
+
+    class _Space:
+        selection: dict = {}
+
+    assert state_mod.MODEL_BUILDERS["papers"](_Space())["filter"] == "read"
 
 
 # ---------------------------------------------------------------------------

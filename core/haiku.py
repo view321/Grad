@@ -246,6 +246,47 @@ def _with_retry(make_coro: Callable[[], Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # public API
 # ---------------------------------------------------------------------------
+def structured(
+    *,
+    stage: str,
+    tool_name: str,
+    tool_description: str,
+    tool_schema: dict[str, Any],
+    validate: Callable[[dict[str, Any]], str | None],
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    role: str,
+    log_name: str,
+) -> dict[str, Any]:
+    """One structured call through the SDK, retried once if it produces nothing.
+
+    The named entry point for `_call`, which is the only thing in this system
+    that knows how to get validated JSON out of a model without the Messages
+    API, how to tell an unauthenticated CLI from a failed one, and where the
+    tokens are booked. `core/wikigen.py` needs all three, and the alternative --
+    a second copy of that hundred lines -- is how two code paths end up
+    disagreeing about what "not logged in" looks like.
+
+    Not restricted to Haiku despite the module name: `model` is the caller's,
+    and the funnel's two stages happen to pass a Haiku id.
+    """
+    return _with_retry(
+        lambda: _call(
+            stage=stage,
+            tool_name=tool_name,
+            tool_description=tool_description,
+            tool_schema=tool_schema,
+            validate=validate,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model,
+            role=role,
+            log_name=log_name,
+        )
+    )
+
+
 def expand(question: str, *, model: str, log_name: str) -> dict[str, Any]:
     """Stage 0: one question -> keyword queries for the tier-1 retriever, plus
     one HyDE abstract.

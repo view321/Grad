@@ -968,6 +968,43 @@ def build() -> None:
             },
         )
 
+    @nicegui_app.get("/__grad/figure/{name}")
+    def _figure(name: str) -> Any:
+        """One figure out of the workspace's `figures/`, for the transcript.
+
+        A route rather than `add_static_files`, for two reasons that both come
+        from where the directory is. It is inside `paths.root()`, and the root
+        *moves* -- switching workspace folders is a button in the app bar, while
+        a static mount binds one absolute path at startup and would go on
+        serving the folder the user left. And the name arrives from a markdown
+        link the *agent* wrote, which makes it untrusted input to a filesystem
+        read: `render.resolve_figure` re-derives the directory per request and
+        checks containment after symlinks, exactly as the notebook route does.
+
+        Without this, an inline `![loss](figures/001.png)` resolved against the
+        page origin, 404ed, and drew a broken-image icon where the agent had put
+        a figure -- while a second copy of the same image was appended at the
+        bottom of the message by a different code path.
+        """
+        from fastapi.responses import FileResponse, PlainTextResponse  # noqa: PLC0415
+
+        try:
+            path = render.resolve_figure(name)
+        except render.NotAllowed:
+            return PlainTextResponse("no such figure in this workspace", status_code=404)
+        return FileResponse(
+            path,
+            headers={
+                # The workspace is a working directory: a figure is overwritten
+                # by the next run of the cell that drew it, under the same name.
+                # A cached copy is the previous experiment's result shown beside
+                # this one's numbers.
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": "default-src 'none'; img-src 'self' data:",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @ui.page("/")
     def index() -> None:
         from nicegui import context  # noqa: PLC0415 - page scope, not import scope
