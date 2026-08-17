@@ -842,6 +842,56 @@ def build() -> None:
         """
         return {"shown": desktop.show_window()}
 
+    @nicegui_app.post("/__grad/wake")
+    async def _wake(payload: dict) -> Any:
+        """A watcher reporting that something the agent armed has happened.
+
+        **This is the one endpoint on this port that is authenticated, and the
+        asymmetry is the point.** `/__grad/show` is unauthenticated because its
+        entire effect is that a window the user already owns becomes visible.
+        This one *starts a turn for an agent with Bash access*, so anything that
+        can open a loopback socket -- which is every process on the machine --
+        would otherwise be able to drive it. The token is a mode-600 file in the
+        app directory; see `core/wakeups.py:token`.
+
+        `compare_digest` rather than `==`, because a token compared with early
+        exit is a token that can be guessed a byte at a time by something already
+        able to time it.
+
+        Queued rather than run here. A route has no client in scope and the turn
+        has to be drawn into one; `ui/state.py:accept_wake` explains the seam.
+
+        **The body is taken as a plain `dict`, not as an injected `Request`.**
+        This module runs under `from __future__ import annotations`, so every
+        annotation reaches FastAPI as a *string* which it resolves against the
+        module's globals -- and `Request` imported inside this function is not
+        one. The result is not an error: FastAPI decides the unresolvable
+        parameter must be a query parameter, and every POST is rejected with a
+        422 asking for a missing query field called `request`. `dict` is a
+        builtin, so it resolves, and FastAPI reads it from the body.
+        """
+        from core import wakeups as wk  # noqa: PLC0415
+
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        body = payload if isinstance(payload, dict) else {}
+        offered = str(body.get("token") or "")
+        if not offered or not secrets.compare_digest(offered, wk.token()):
+            log.warning("refused a wake with a bad token")
+            return JSONResponse({"error": "bad token"}, status_code=403)
+
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            return JSONResponse({"error": "nothing to say"}, status_code=400)
+
+        for workspace in list(_WAKE_TARGETS):
+            if workspace.accept_wake(prompt):
+                return {"queued": True, "wake": body.get("wake")}
+        # No window open, or every one of them is already holding a queue. The
+        # watcher records this as undelivered and `wakeup list` surfaces it, so
+        # the wake is deferred rather than lost.
+        return JSONResponse({"queued": False}, status_code=503)
+
     @nicegui_app.get("/__grad/notebook/{name}")
     def _notebook(name: str) -> Any:
         """One notebook, rendered read-only, for the pane's iframe.
@@ -887,6 +937,10 @@ def build() -> None:
         # interrupt the SDK refused, a client that had to be taken down -- which
         # have no turn to be written into.
         session.notify = workspace.say
+        # Where a wake can land. A list rather than one slot because there can
+        # be several windows open on one workspace, and the wake belongs to
+        # whichever of them can take it -- see `/__grad/wake`.
+        _WAKE_TARGETS.append(workspace)
         # Per client, not `app.on_shutdown`: that would accumulate one handler
         # per connection and hold every session's subprocess open until the app
         # itself exits. Graced, not immediate: NiceGUI fires this on any socket
@@ -894,7 +948,9 @@ def build() -> None:
         # miss -- and the busiest moment this loop has is spawning the CLI for
         # the session's own first turn. Releasing right then closed the client
         # mid-connect; see `Session._lifecycle` for what that corrupted.
-        context.client.on_disconnect(lambda: _release_when_gone(context.client, session))
+        context.client.on_disconnect(
+            lambda: _release_when_gone(context.client, session, workspace)
+        )
         shell.build(workspace)
 
 
@@ -909,8 +965,14 @@ RELEASE_GRACE_S = 10.0
 #: is not the only one. Entries remove themselves when they finish.
 _RELEASES: set[Any] = set()
 
+#: Workspaces a wakeup can be delivered to, oldest window first. Module-level
+#: because the delivering end is an HTTP route with no client in scope -- see
+#: `/__grad/wake` -- and per-process because that is what a wake reaches: one
+#: app, holding one single-instance lock, on one published port.
+_WAKE_TARGETS: list[Any] = []
 
-def _release_when_gone(client: Any, session: Session) -> None:
+
+def _release_when_gone(client: Any, session: Session, workspace: Any = None) -> None:
     """Hand the session back only if this client's socket stays gone.
 
     NiceGUI's disconnect handlers run on every socket drop, and a drop is not a
@@ -924,6 +986,12 @@ def _release_when_gone(client: Any, session: Session) -> None:
         await asyncio.sleep(RELEASE_GRACE_S)
         if getattr(client, "has_socket_connection", False):
             return
+        # Withdrawn on the same condition as the session, not on the disconnect:
+        # a window that reconnects inside the grace never stopped being somewhere
+        # a wake could land, and dropping it early would send a wake that had
+        # waited four hours to a 503.
+        if workspace is not None and workspace in _WAKE_TARGETS:
+            _WAKE_TARGETS.remove(workspace)
         await session.release()
 
     try:
@@ -1065,6 +1133,31 @@ def _install_desktop(native: bool) -> None:
         icon = desktop.icon_path()
         if icon:
             nicegui_app.native.start_args["icon"] = icon
+        # Where the window was last time, and how big. Spliced into
+        # `create_window`'s arguments *after* NiceGUI's own `width`/`height`, so
+        # this is what decides the size and `window_size` below is only the
+        # fallback the first launch on a machine gets. `track_window` is what
+        # keeps the file current; it has to be registered before `ui.run`,
+        # because `ui.run` starts the bridge that delivers the events.
+        nicegui_app.native.window_args.update(desktop.window_args())
+        desktop.track_window(nicegui_app)
+
+    @nicegui_app.on_connect
+    def _drop_splash() -> None:
+        """The workspace is on screen, so the loading mark can go.
+
+        On *connect*, not on startup: `on_startup` fires when the server is
+        listening, which is several seconds before the webview process has
+        rendered anything -- taking the splash down there would put the gap back
+        exactly where it was. A connected client is a page that has loaded and
+        opened its socket, which is the first moment there is something to look
+        at instead.
+
+        Fires per client and `stop` is idempotent, so a reload costs a no-op.
+        """
+        from ui import splash  # noqa: PLC0415
+
+        splash.stop()
 
     @nicegui_app.on_startup
     def _wire() -> None:
@@ -1159,7 +1252,12 @@ def run(*, native: bool = True, port: int | None = None) -> None:
     # nicety: NiceGUI turns `native` on whenever a window size is given, so
     # passing it unconditionally made `native=False` unreachable and the
     # documented browser fallback impossible to actually take.
-    extra = {"window_size": (1600, 1000)} if native else {}
+    #
+    # It is no longer what decides the size. `_install_desktop` puts the
+    # remembered geometry in `native.window_args`, which NiceGUI merges over
+    # these values -- so this is the size of a window nobody has moved yet, and
+    # it is spelled once, in `desktop.DEFAULT_SIZE`.
+    extra = {"window_size": desktop.DEFAULT_SIZE} if native else {}
     ui.run(
         native=native,
         title="Grad",

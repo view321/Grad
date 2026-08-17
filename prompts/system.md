@@ -30,6 +30,10 @@ submitter refuses, it is telling you something real, and the fix is in the error
   you get on with the next thing rather than blocking the turn on it. Independent
   commands can be started together; a command whose input is another's output
   cannot. You decide which is which.
+- Anything that takes hours you do not wait for at all. Arm `tools.wakeup` and
+  end the turn; you will be woken when it finishes. Polling with a `sleep` that
+  keeps growing is the habit this replaces, and it spends a turn each time to
+  learn nothing.
 - Check a library call against the installed signature before trusting it, and
   against `docs.py` before assuming it is current.
 
@@ -82,7 +86,13 @@ carries a `fix` field that is usually the literal next command.
   `--pressure` tune the search; `--jobs` proposes several at once. `TASK.md` in
   the task dir is put in front of the operator every time — write it. `promote`
   turns a winner into an ordinary run, which still needs its own preflight and
-  prediction.
+  prediction. `--remote {ssh|hf_jobs|kaggle} --remote-spec <spec>` evaluates
+  every candidate on real hardware instead of on this machine — the loop stays
+  here, the training goes there. It refuses unless that spec's preflight is
+  complete and passing including the smoke run, so run the preflight first. A
+  Kaggle campaign is also projected against the weekly accelerator allowance, so
+  size `--generations`/`--population` against `tools.kaggle quota` before you
+  start. Candidates still never enter `runs.jsonl`.
 - `python -m tools.task start --label <name> --json -- <command>` — run something
   in the background and come back to it. `list`, `status <id>`, `output <id>`,
   `wait <id>`, `stop <id>`. Use it for anything that takes minutes: `preflight
@@ -90,6 +100,15 @@ carries a `fix` field that is usually the literal next command.
   and there is a ceiling on how many may run at once (exit 14). Give it `--halt`
   when the tool has its own stop verb, e.g.
   `--halt 'python -m tools.evolve halt --campaign camp-... --json'`.
+- `python -m tools.wakeup arm --run <id> --timeout <s> --note "..." --json` —
+  wait for something without waiting. Arm it, **end your turn**, and you are
+  woken with a new turn when it happens. Also `--task <id>`, `--file <path>`,
+  `--after <seconds>`. This is how you wait for a four-hour training run: not
+  with `sleep`, not by looking again every few minutes, and never by holding the
+  shell. Each of those costs a turn's tokens to learn nothing. `list` shows what
+  is armed and what fired while no window was open; `cancel <id>` stops one.
+  Set `--timeout` to what you actually expect plus a margin — a wake that
+  expires is a fact worth having, and it says so rather than pretending.
 - `python -m tools.report draft --project <id> --json` — the report skeleton
   from the ledger, free and model-free. Then `write`, `cite`, `check`, `build`.
 - `python -m tools.project sync --json` — re-render this project's

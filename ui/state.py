@@ -163,6 +163,14 @@ class Workspace:
         #: routing it through here keeps the gate card from having to reach into
         #: another window's closure.
         self.chat_send: Callable[[str], Any] | None = None
+        #: Wakes that have arrived and not yet been turned into a prompt.
+        #:
+        #: A queue rather than a direct call, because the two ends are in
+        #: different worlds: a wake arrives on a FastAPI route with no client in
+        #: scope, and `chat_send` draws into elements that belong to one. The
+        #: poll already runs in that client's context on a two-second tick, and
+        #: two seconds is nothing next to the hours a wake waits.
+        self.pending_wakes: list[str] = []
         self._fingerprints: dict[str, str] = {}
         self._redraw: dict[str, Callable[[], None]] = {}
         #: Titlebar redraws, kept apart from the bodies: a titlebar reports live
@@ -332,6 +340,7 @@ class Workspace:
         try:
             if self._caught_up_after_move():
                 return
+            await self._deliver_wakes()
             # Snapshotted, because the rebuilds below await: a retile landing
             # mid-pass would otherwise have this iterating a list that changed
             # under it. A window that opened during the pass is picked up by the
@@ -345,6 +354,60 @@ class Workspace:
             self._redraw_chrome()
         finally:
             self._ticking = False
+
+    # -- wakeups ------------------------------------------------------------
+    #: More than this many wakes waiting is a runaway watcher, not a research
+    #: session. They are dropped at the door with a line in the status bar
+    #: rather than queued into a conversation nobody asked for.
+    MAX_PENDING_WAKES = 8
+
+    def accept_wake(self, prompt: str) -> bool:
+        """Take a wake for delivery on the next tick. Returns whether it was kept.
+
+        Called from the HTTP route, so it must do nothing that needs a client:
+        no elements, no drawing, no `say`.
+        """
+        if not prompt.strip():
+            return False
+        if len(self.pending_wakes) >= self.MAX_PENDING_WAKES:
+            log.warning("dropping a wake: %d already queued", len(self.pending_wakes))
+            return False
+        self.pending_wakes.append(prompt)
+        return True
+
+    async def _deliver_wakes(self) -> bool:
+        """Turn one queued wake into a turn, if now is a moment that can take it.
+
+        One per tick and never while the session is busy. A wake is a prompt, and
+        `Session.ask` refuses a prompt during a turn -- so delivering into a
+        running turn would consume the wake and answer nothing, which is exactly
+        the silent loss this whole mechanism exists to prevent. Held instead, and
+        the next tick tries again.
+        """
+        if not self.pending_wakes:
+            return False
+        if getattr(self.session, "busy", False):
+            return False
+        send = self.chat_send
+        if send is None:
+            # The chat window is closed, so there is nowhere for a turn to be
+            # drawn. Opening it is the honest response: something is trying to
+            # wake this session and the window that shows sessions is shut.
+            self.open("chat")
+            self.say("a wakeup arrived — opening the session window for it")
+            return False
+
+        prompt = self.pending_wakes.pop(0)
+        self.set_agent_state("running")
+        try:
+            result = send(prompt)
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:  # noqa: BLE001 - a failed wake must not stop the poll
+            log.exception("could not deliver a wakeup")
+            self.set_agent_state("idle")
+            return False
+        return True
 
     # -- layout moves -------------------------------------------------------
     def toggle(self, window_id: str) -> None:

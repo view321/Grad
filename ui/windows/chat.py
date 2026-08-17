@@ -272,8 +272,13 @@ def render(workspace: Any) -> None:
         statusline.sync_context()
 
     ui.timer(CONTEXT_POLL_S, poll_context)
-    # Once, at build: keep the transcript pinned to the bottom while a turn
-    # streams. Doing it from here instead would be a `run_javascript` per flush.
+    # Keep the transcript pinned to the bottom while a turn streams. Doing it
+    # from the flush instead would be a `run_javascript` fifteen times a second.
+    #
+    # This is the *registration*, and it is no longer the only arming: the node
+    # behind this id is replaced whenever the pane tree is rebuilt, so
+    # `ui/shell.py:retile` re-arms through `gradRearm` afterwards. What this call
+    # does that the retile cannot is name the id in the window that owns it.
     kit.run_js("window.gradStickBottom && window.gradStickBottom('grad-transcript')")
 
 

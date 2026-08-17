@@ -32,10 +32,46 @@ what to propose, and both are ours. **`--mutator shinka` still exists** and stil
 works the moment upstream grows a per-generation entry point: a path that already
 works should not stop working because a better one arrived.
 
-**Phase 1 is local only, and that is not a placeholder.** A campaign evaluated
-entirely through local subprocesses proves the campaign records, the sub-run
-bookkeeping and the budget integration while the blast radius is zero. `--remote`
-is refused here until phase 2.
+**Remote evaluation is phase 2, and the gate is what made it safe to enable.**
+Phase 1 was local-only on purpose: a campaign evaluated through local
+subprocesses proves the campaign records, the sub-run bookkeeping and the budget
+integration while the blast radius is zero. Those are proven, so `--remote` now
+puts candidates on real hardware -- behind a refusal that is stricter than the
+one for an ordinary job. `--remote-spec` names a pipeline whose preflight must be
+complete and passing *including the smoke run*, which is the only check that sees
+the real driver stack, the real data path and the real per-device batch size. The
+config's `[preflight] checks` list is deliberately not consulted: a machine
+configured without `smoke` would otherwise let a loop with no human in it put
+forty candidates on hardware nothing had ever run one step on.
+
+**All three backends, because a candidate is a training run.** A mutation here
+changes an architecture or an optimiser, so evaluating one takes minutes to
+hours -- which is what makes a fresh container or kernel per candidate a
+reasonable unit rather than an absurd one. Each backend owns its own adapter,
+because they differ in the one thing that matters: how the mutated program
+reaches the machine. `gpu.py` copies the pipeline directory to a host that stays
+up; `kaggle.py` swaps one file inside the base64 payload already embedded in the
+generated notebook; `jobs.py` has no upload step at all -- the pipeline is in the
+image -- so the candidate rides in as a gzipped tar in one environment variable,
+unpacked by a prelude in front of the command.
+
+Every adapter bounds the work *where it runs*, not only where it is watched. A
+poll that gives up ends the function; it does not end a detached training run,
+and an abandoned candidate keeps holding the GPU that the next one is about to be
+measured on -- which would make the next score a measurement of this one's
+overrun.
+
+**Kaggle gets a second gate, because the dollar gate cannot see it.** That
+backend rations *hours*, so a campaign priced at zero passes `_campaign_gate`
+unconditionally. `_kaggle_hours_gate` projects the campaign against the weekly
+allowance before generation 0, and `core/kaggle_quota.py` folds candidate rows
+beside runs so the hours are visible afterwards as well -- without that fold a
+campaign would burn real GPU hours nothing could account for, and the first
+symptom would be an ordinary submission refused.
+
+A candidate still never becomes a run: no adapter writes a ledger row, the
+campaign remains the ledgered unit, and its expectation remains the bound
+prediction.
 
 **Models.** Sonnet 5 by default, from `[models] evolve`. The ensemble Shinka
 built its bandit around is replaced by a bandit over *patch types* -- `diff`,
@@ -67,6 +103,7 @@ from core import (
     quota_log,
 )
 from core.cli import Cli, main
+from core.submission import Submission
 from core.errors import (
     EXIT_CHECK_FAILED,
     EXIT_PROJECT_BUDGET,
@@ -92,15 +129,33 @@ cli = Cli(
         "metered in ledger/quota.jsonl under the `evolve.mutate` stage and bounded by the\n"
         "project's token allocation. --mutator shinka switches to ShinkaEvolve, which\n"
         "refuses unless the installed release exposes a per-generation entry point.\n\n"
-        "Phase 1 is local only. --remote is refused: doing the ledger work and the spend\n"
-        "work simultaneously against live GPU jobs is how you learn about exit 7 the\n"
-        "hard way."
+        "--remote {ssh|hf_jobs|kaggle} --remote-spec <spec> evaluates every candidate on\n"
+        "real hardware. It refuses unless that spec's preflight is complete and passing --\n"
+        "tests, dry run, and a real smoke run on that hardware -- because a search is a\n"
+        "loop with no human in it and the environment it lands in has to be proven once,\n"
+        "before generation 0, rather than rediscovered forty times.\n\n"
+        "A Kaggle campaign is projected against the weekly accelerator allowance as well,\n"
+        "since that backend rations hours and the dollar gate cannot see them."
     ),
 )
 
 MUTATOR_CLAUDE = "claude"
 MUTATOR_SHINKA = "shinka"
 STAGE_EVOLVE = quota_log.STAGE_EVOLVE
+
+#: Where a candidate can be evaluated. The names are the `platform` strings the
+#: run records already use, so a campaign's `backend` and a run's `platform` are
+#: the same vocabulary rather than two spellings of one idea.
+BACKEND_SSH = "ssh"
+BACKEND_HF = "hf_jobs"
+BACKEND_KAGGLE = "kaggle"
+REMOTE_BACKENDS = (BACKEND_SSH, BACKEND_HF, BACKEND_KAGGLE)
+
+#: The checks a remote campaign's spec must have passed. Not `[preflight] checks`
+#: from the config, and that is the point: a machine configured to skip `smoke`
+#: would otherwise let a campaign put forty candidates on hardware nothing had
+#: ever run one step on. The gate names what it needs.
+REMOTE_REQUIRED_CHECKS = ("tests", "dry_run", "smoke")
 
 
 # ---------------------------------------------------------------------------
@@ -382,9 +437,27 @@ def _run_args(p: argparse.ArgumentParser) -> None:
         "--local",
         action="store_true",
         default=True,
-        help="evaluate locally (phase 1; the only supported mode)",
+        help="evaluate locally, in a subprocess on this machine (the default)",
     )
-    p.add_argument("--remote", action="store_true", help="refused: phase 2, behind the campaign gate")
+    p.add_argument(
+        "--remote",
+        choices=REMOTE_BACKENDS,
+        help=(
+            "evaluate every candidate on real hardware instead of locally. Requires "
+            "--remote-spec, and refuses unless that spec has a complete, passing "
+            "preflight -- tests, dry run, and a real smoke run on the hardware."
+        ),
+    )
+    p.add_argument(
+        "--remote-spec",
+        help="the pipeline spec whose preflighted environment candidates run in",
+    )
+    p.add_argument(
+        "--remote-timeout-s",
+        type=int,
+        default=0,
+        help="wall clock per remote candidate; defaults to --timeout-s",
+    )
     p.add_argument(
         "--set",
         dest="overrides",
@@ -398,14 +471,6 @@ def _run_args(p: argparse.ArgumentParser) -> None:
 
 @cli.command("run", "run a budgeted campaign", setup=_run_args)
 def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
-    if args.remote:
-        raise UsageError(
-            "--remote is phase 2 and is not enabled: the campaign budget gate must be "
-            "proven against zero-blast-radius local evaluation first. "
-            "Do not run a single remote generation before that.",
-            fix="drop --remote; a local campaign exercises the same records and the same gate",
-        )
-
     cfg = config_mod.load()
     paths.ensure_workspace()
     task_dir = Path(args.task_dir)
@@ -428,6 +493,11 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             "of a region, and a file with none has nothing to give it",
             fix=f"wrap the mutable region in {camp.BLOCK_START} / {camp.BLOCK_END} comments",
         )
+
+    # Before the expectation is bound and before a campaign id exists, because
+    # every refusal in here is a configuration problem and none of them should
+    # cost an expectation that then has to be re-minted.
+    remote = _remote_target(args, cfg)
 
     # The campaign is the unit of prediction (§21 collision 2). The expectation
     # is bound here, once, and the candidates below are exempt from the per-run
@@ -460,7 +530,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
         "max_candidates": max_candidates,
         "estimate_per_candidate_usd": args.estimate_per_candidate_usd,
         "projected_cost_usd": round(projected, 4),
-        "mode": "local",
+        **_remote_note(remote),
         "mutator": args.mutator,
         "model": cfg.model_for("evolve"),
         "seed": seed,
@@ -489,6 +559,7 @@ def cmd_run(args: argparse.Namespace) -> dict[str, Any]:
             project_id=project_id,
             seed=seed,
             cfg=cfg,
+            remote=remote,
         )
     except BaseException as exc:  # noqa: BLE001 - including KeyboardInterrupt
         camp.close_campaign(
@@ -564,6 +635,188 @@ def _campaign_gate(
 
 
 # ---------------------------------------------------------------------------
+# where candidates run
+# ---------------------------------------------------------------------------
+def _remote_target(args: argparse.Namespace, cfg: config_mod.Config) -> dict[str, Any] | None:
+    """Resolve and gate `--remote`. `None` means the campaign evaluates locally.
+
+    **The gate is the whole function.** Everything below the first two refusals
+    exists to answer one question: has the environment these candidates will land
+    in already been through the ordinary §6 path? A remote campaign is the one
+    place in this system where a loop with no human in it spends money in a
+    tight cycle, so the answer has to be yes *before* generation 0, for the same
+    reason `_campaign_gate` runs there rather than at generation 40.
+    """
+    if not args.remote:
+        if args.remote_spec:
+            raise UsageError(
+                "--remote-spec names an environment but no --remote backend to run it on",
+                fix=f"--remote {BACKEND_SSH} --remote-spec {args.remote_spec}",
+            )
+        return None
+
+    if not args.remote_spec:
+        raise UsageError(
+            "--remote needs the spec whose preflighted environment candidates run in: "
+            "there is no such thing as 'the remote' in general, only a pipeline that has "
+            "been proven on one",
+            fix="--remote-spec pipeline/spec.toml",
+        )
+
+    sub = Submission.load(args.remote_spec)
+    _remote_gate(sub, cfg)
+
+    target: dict[str, Any] = {
+        "backend": args.remote,
+        "spec": str(sub.spec_path),
+        "submission_hash": sub.hash(),
+        "sub": sub,
+    }
+
+    if args.remote == BACKEND_SSH:
+        host_name = str(sub.target.get("host") or "")
+        if not host_name:
+            raise ConfigError(
+                f"{sub.spec_path} names no [target] host, so there is nowhere to send candidates",
+                fix="add `host = \"<name>\"` under [target], matching a [hosts.*] entry",
+            )
+        # Resolved here rather than per candidate: an unknown host is a
+        # configuration error and it should be one before generation 0, not
+        # forty evaluations in. Every backend below resolves the equivalent for
+        # the same reason.
+        host = cfg.host(host_name)
+        target.update({"host": host.name, "rate_usd_per_hour": host.rate_usd_per_hour})
+        return target
+
+    if args.remote == BACKEND_KAGGLE:
+        from tools import kaggle as kaggle_tool  # noqa: PLC0415 - optional deps
+
+        accelerator = kaggle_tool.resolve_accelerator(None, sub, cfg)
+        kind = cfg.accelerator_kind(accelerator)
+        target.update({"accelerator": accelerator, "accelerator_kind": kind})
+        _kaggle_hours_gate(cfg, args, sub, accelerator=accelerator, kind=kind)
+        return target
+
+    from tools import jobs as jobs_tool  # noqa: PLC0415 - optional deps
+
+    flavor = sub.target.get("flavor") or cfg.get("hf", "default_flavor", "a10g-small")
+    # Refused before generation 0 rather than priced at zero: an unpriced flavor
+    # makes the campaign's projected cost a fiction, and the campaign budget gate
+    # is the only thing standing between a search and an allocation.
+    if jobs_tool.flavor_rate(flavor, cfg) is None:
+        raise ConfigError(
+            f"flavor {flavor!r} has no rate in [hf.flavor_rates], so a campaign on it "
+            "cannot be priced",
+            fix=f'add `"{flavor}" = <usd_per_hour>` under [hf.flavor_rates] in config/grad.toml',
+        )
+    target.update({"flavor": flavor, "rate_usd_per_hour": jobs_tool.flavor_rate(flavor, cfg)})
+    return target
+
+
+def _kaggle_hours_gate(
+    cfg: config_mod.Config,
+    args: argparse.Namespace,
+    sub: Submission,
+    *,
+    accelerator: str,
+    kind: str,
+) -> None:
+    """Refuse a campaign that cannot fit in the week's accelerator hours.
+
+    **The dollar gate cannot see this one.** Kaggle rations *hours*, not money,
+    so a campaign priced at zero passes `_campaign_gate` unconditionally and
+    would then spend the whole weekly GPU allowance -- with the first symptom
+    being an ordinary submission refused for hours nothing could account for.
+    `core/kaggle_quota.py` folds candidate rows beside runs so the hours are
+    visible after the fact; this is what stops them being spent in the first
+    place.
+
+    Projected the same way the dollar gate projects: the per-candidate estimate
+    times the whole campaign, checked before generation 0 rather than at
+    generation 40. The per-candidate number is the spec's own estimate, which is
+    the same one a submission of this pipeline would be gated on.
+    """
+    from core import kaggle_quota  # noqa: PLC0415
+    from tools import kaggle as kaggle_tool  # noqa: PLC0415
+
+    per_candidate = kaggle_tool.estimated_hours(sub)
+    candidates = max(1, args.generations) * max(1, args.population)
+    projected = per_candidate * candidates
+
+    # Two ceilings, and they take *different* numbers -- which is the whole
+    # reason this is not one call to `kaggle_quota.check`. The session cap is
+    # what Kaggle stops a single kernel at, so it is asked about one candidate;
+    # handing it the campaign total would refuse a perfectly ordinary search of
+    # twenty one-hour candidates for exceeding a twelve-hour session. The weekly
+    # allowance is the opposite: it is about the pool, so it gets the projection
+    # for the whole campaign.
+    #
+    # Both *raise* rather than return a refusal, and their messages and fixes are
+    # already the right ones -- `quota_weekly` names what is holding the hours
+    # and points at `kaggle quota --json`. The session cap passes through
+    # untouched for that reason. Only the weekly one is re-framed, because "this
+    # run estimates 160h" is a confusing way to describe forty four-hour
+    # candidates, and the number a reader needs is the shape of the campaign.
+    kaggle_quota.check_session(cfg, kind, per_candidate, accelerator=accelerator)
+
+    try:
+        kaggle_quota.check_quota(cfg, kind, projected, accelerator=accelerator)
+    except GateRefusal as exc:
+        raise GateRefusal(
+            exc.code,
+            f"a campaign of {candidates} candidates at {per_candidate:.2f}h each projects "
+            f"{projected:.1f} {kind} hours, which does not fit the week's allowance. "
+            f"{exc.message}",
+            exc.exit_code,
+            fix=(
+                "lower --generations/--population, shorten the evaluation, or wait for the "
+                "rolling week to move: python -m tools.kaggle quota --json"
+            ),
+            detail=exc.detail,
+        ) from None
+
+
+def _remote_gate(sub: Submission, cfg: config_mod.Config) -> None:
+    """Refuse unless this spec has a complete, passing preflight including smoke.
+
+    `gates.check_preflight` is reused rather than reimplemented, and the required
+    list is named here rather than read from `[preflight] checks`. That is
+    deliberate: the config's list is a machine's policy for ordinary
+    submissions, and a machine configured without `smoke` would otherwise let a
+    campaign put every candidate it has on hardware that nothing has ever run a
+    single step on. The smoke run is the only check that sees the real driver
+    stack, the real data path and the real per-device batch size, which is
+    exactly the set of things a search will otherwise discover forty times.
+    """
+    from core import gates  # noqa: PLC0415
+
+    gates.check_preflight(sub, cfg, required=list(REMOTE_REQUIRED_CHECKS))
+
+
+def _remote_note(target: dict[str, Any] | None) -> dict[str, Any]:
+    """The target as it goes into the campaign record -- without the Submission.
+
+    `Submission` is a live object with paths and a resolved config in it; the
+    campaign record is JSON that outlives this process and gets read by hand.
+    """
+    if target is None:
+        return {"mode": "local"}
+    note = {
+        "mode": "remote",
+        "backend": target["backend"],
+        "remote_spec": target["spec"],
+        "submission_hash": target["submission_hash"],
+    }
+    # Only what this backend actually resolved. A record carrying `host: null`
+    # on a Kaggle campaign reads as a host that could not be found rather than
+    # as a dimension that does not apply.
+    for key in ("host", "rate_usd_per_hour", "accelerator", "accelerator_kind", "flavor"):
+        if target.get(key) is not None:
+            note[key] = target[key]
+    return note
+
+
+# ---------------------------------------------------------------------------
 # the loop
 # ---------------------------------------------------------------------------
 def _drive(
@@ -576,6 +829,7 @@ def _drive(
     seed: int,
     cfg: config_mod.Config,
     mutator: Any = None,
+    remote: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generation by generation, with the gate between each.
 
@@ -683,6 +937,9 @@ def _drive(
             timeout_s=args.timeout_s,
             per_candidate=per_candidate,
             jobs=max(1, args.eval_jobs),
+            remote=remote,
+            cfg=cfg,
+            remote_timeout_s=int(args.remote_timeout_s or args.timeout_s),
         )
         evaluated += len(records)
         scores = [
@@ -742,6 +999,9 @@ def _evaluate_generation(
     timeout_s: int,
     per_candidate: float,
     jobs: int,
+    remote: dict[str, Any] | None = None,
+    cfg: Any = None,
+    remote_timeout_s: int = 0,
 ) -> list[dict[str, Any]]:
     """Evaluate one generation, at most `jobs` at once.
 
@@ -750,6 +1010,11 @@ def _evaluate_generation(
     default of one is not timidity -- a local evaluation on this machine may be
     the thing holding the GPU, and four of those at once is four out-of-memory
     failures recorded as four bad mutations.
+
+    That default is *local* reasoning, and it is why `--eval-jobs` is worth
+    raising on a remote campaign: an ssh evaluation blocks the thread on the
+    network rather than on this machine's GPU, and the host's own capacity is
+    the thing to size it against instead.
 
     Results come back in plan order rather than completion order, so a campaign
     with the same seed produces the same `candidate_id` for the same slot. The
@@ -767,6 +1032,9 @@ def _evaluate_generation(
             task_dir=task_dir,
             timeout_s=timeout_s,
             per_candidate=per_candidate,
+            remote=remote,
+            cfg=cfg,
+            remote_timeout_s=remote_timeout_s or timeout_s,
         )
 
     items = list(enumerate(proposals))
@@ -786,13 +1054,25 @@ def _evaluate_candidate(
     task_dir: Path,
     timeout_s: int,
     per_candidate: float,
+    remote: dict[str, Any] | None = None,
+    cfg: Any = None,
+    remote_timeout_s: int = 0,
 ) -> dict[str, Any]:
-    """Evaluate one candidate locally and record it as a sub-run.
+    """Evaluate one candidate and record it as a sub-run.
 
     Candidates go to `ledger/candidates.jsonl`, never to `runs.jsonl`: a
     100-generation campaign is thousands of rows and would dominate a ledger
     meant to be read by hand (§23 item 4). Only a promoted candidate becomes a
-    run.
+    run. **That holds on a remote campaign too** -- see
+    `tools/gpu.py:evaluate_candidate` for why a per-candidate ledger row would
+    undo the rule the moment the search left this machine, and where the gate
+    sits instead.
+
+    Everything up to the point of execution is identical either way: the same
+    escape check, the same two files written into the same local working
+    directory. A remote candidate then runs those files on the host instead of
+    in a subprocess, and its `cost_usd` becomes a measurement rather than the
+    campaign's per-candidate estimate.
     """
     candidate_id = candidate_id_for(campaign_id, generation, index)
     source = proposal.get("source") or ""
@@ -860,6 +1140,22 @@ def _evaluate_candidate(
         camp.append_candidate(record)
         return record
 
+    if remote is not None:
+        record.update(
+            _evaluate_remotely(
+                remote=remote,
+                cfg=cfg,
+                candidate_id=candidate_id,
+                source=source,
+                evaluator=evaluate_src,
+                timeout_s=remote_timeout_s or timeout_s,
+                workdir=workdir,
+                started=started,
+            )
+        )
+        camp.append_candidate(record)
+        return record
+
     try:
         proc = subprocess.run(
             [sys.executable, "evaluate.py"],
@@ -907,6 +1203,158 @@ def _evaluate_candidate(
 
     camp.append_candidate(record)
     return record
+
+
+def _evaluate_remotely(
+    *,
+    remote: dict[str, Any],
+    cfg: Any,
+    candidate_id: str,
+    source: str,
+    evaluator: str,
+    timeout_s: int,
+    workdir: Path,
+    started: float,
+) -> dict[str, Any]:
+    """Run one candidate on the campaign's host and read its metrics back.
+
+    The returned dict is the same set of fields the local path fills in, plus
+    where it ran. Two of them differ in meaning and both differences are the
+    point of going remote at all:
+
+    * `cost_usd` is measured -- wall clock against the host's rate -- rather
+      than the campaign's flat per-candidate estimate. The estimate is what the
+      budget gate projects with; this is what was actually spent.
+    * `error` can now be a transport failure rather than a bad mutation. Those
+      are recorded distinctly, because a search that reads "the host refused the
+      connection" as "this idea scored nothing" will quietly select against
+      whatever was being proposed when the network wobbled.
+    """
+    result = _run_on_backend(
+        remote,
+        cfg or config_mod.load(),
+        candidate_id=candidate_id,
+        files={"initial.py": source, "evaluate.py": evaluator},
+        timeout_s=int(timeout_s),
+        artifacts=workdir,
+    )
+
+    output = str(result.get("output") or "")
+    (workdir / "evaluate.log").write_text(output, encoding="utf-8")
+
+    fields: dict[str, Any] = {
+        "duration_s": round(time.time() - started, 3),
+        "cost_usd": float(result.get("cost_usd") or 0.0),
+        "ran_on": result.get("where"),
+        "backend": remote["backend"],
+    }
+    # Kaggle rations hours rather than dollars, so the number that bounds a
+    # campaign there is not `cost_usd`. Recorded under the field names
+    # `core/kaggle_quota.py` folds, which is what lets a campaign's candidates
+    # count against the weekly allowance at all -- they never reach `runs.jsonl`,
+    # so the fold has nowhere else to read them from.
+    if result.get("hours") is not None:
+        from core import kaggle_quota  # noqa: PLC0415
+
+        fields[kaggle_quota.F_ACTUAL] = float(result["hours"])
+        fields[kaggle_quota.F_ACCELERATOR] = result.get("accelerator")
+        fields[kaggle_quota.F_KIND] = result.get("accelerator_kind")
+
+    if result.get("exit_code") is None:
+        # The candidate never ran. Recorded as `skipped` for the same reason an
+        # operator that produced nothing is: it has no score, and folding it into
+        # the population as a zero would teach the next generation that whatever
+        # was proposed here is bad.
+        fields.update(
+            {
+                "skipped": True,
+                "metrics": None,
+                "error": f"the host could not run it: {result.get('error')}",
+            }
+        )
+        return fields
+
+    metrics, problem = _metrics_from(output)
+    if not result.get("ok") and problem is None:
+        problem = str(result.get("error") or "the candidate exited non-zero")
+    fields.update({"metrics": metrics if problem is None else None, "error": problem})
+    return fields
+
+
+def _run_on_backend(
+    remote: dict[str, Any],
+    cfg: Any,
+    *,
+    candidate_id: str,
+    files: dict[str, str],
+    timeout_s: int,
+    artifacts: Path,
+) -> dict[str, Any]:
+    """Hand one candidate to whichever backend the campaign is running on.
+
+    The three adapters answer the same question and return the same shape -- ok,
+    exit code, output, error, cost, where -- but they get there differently
+    enough that a shared implementation would be a lie: `gpu.py` copies a
+    directory to a machine that stays up, `kaggle.py` packs the pipeline into a
+    notebook, and `jobs.py` has no upload step at all because the pipeline is
+    already in the image. Each one's own module owns that difference, which is
+    the same division `core/submit.py` already draws for real submissions.
+
+    Imported at the point of use, because each backend brings optional
+    dependencies and a campaign on one of them must not need the others
+    installed.
+    """
+    backend = remote["backend"]
+    common = {
+        "candidate_id": candidate_id,
+        "files": files,
+        "command": ["python", "evaluate.py"],
+        "timeout_s": int(timeout_s),
+    }
+
+    if backend == BACKEND_SSH:
+        from tools import gpu as gpu_tool  # noqa: PLC0415
+
+        return gpu_tool.evaluate_candidate(remote["sub"], cfg, **common)
+
+    if backend == BACKEND_KAGGLE:
+        from tools import kaggle as kaggle_tool  # noqa: PLC0415
+
+        return kaggle_tool.evaluate_candidate(
+            remote["sub"], cfg, artifacts=artifacts,
+            accelerator=remote.get("accelerator"), **common,
+        )
+
+    from tools import jobs as jobs_tool  # noqa: PLC0415
+
+    return jobs_tool.evaluate_candidate(
+        remote["sub"], cfg, artifacts=artifacts, flavor=remote.get("flavor"), **common
+    )
+
+
+def _metrics_from(output: str) -> tuple[Any, str | None]:
+    """The evaluator's one JSON object, out of a combined stdout/stderr stream.
+
+    The local path can read stdout on its own; over ssh the two are merged so a
+    traceback is not lost, and `_ssh` appends the `EXIT:` line the exit code is
+    read from. So the marker is dropped and the *last* line is taken -- the same
+    rule the local path uses, deliberately, rather than a more forgiving scan.
+    A search whose metric can be found anywhere in the output is a search that
+    can be fed a number by a log line.
+    """
+    lines = [
+        line for line in output.strip().splitlines() if not line.startswith("EXIT:")
+    ]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None, "the candidate printed nothing"
+    try:
+        metrics = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        tail = lines[-1].strip()[:300]
+        return None, f"evaluate.py did not print a JSON object of metrics: {tail}"
+    return metrics, camp.validate_metrics(metrics)
 
 
 # ---------------------------------------------------------------------------

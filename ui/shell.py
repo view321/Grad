@@ -97,6 +97,24 @@ def build(workspace: Workspace) -> None:
                         with kit.el("div", "grad-slot", style=f"--grad-fraction: {slot.fraction:.6f}"):
                             _frame(workspace, slot.window, roots, bars, attic, draw_window)
 
+            # Every root above has just been through `Element.move()`, and a
+            # moved root comes back as a *new DOM node* on the client -- which
+            # silently discards anything a window attached to its own node
+            # rather than to a NiceGUI element. The sticky transcript is the one
+            # that mattered: it was armed once at chat render and died on the
+            # first retile, so opening any window once stopped the chat
+            # scrolling for the rest of the session. `gradRearm` is idempotent
+            # and knows which ids to re-arm, so the shell does not have to know
+            # that `grad-transcript` exists.
+            #
+            # Inside `with tiles`, and that is not stylistic. This runs from a
+            # titlebar button, and by here the retile has deleted that button
+            # along with the slot it belonged to -- so at this point there is no
+            # current slot, no way to reach the client through one, and
+            # `kit.run_js` raises into `_guard` rather than sending anything.
+            # `tiles` is built once in `build` and outlives every retile.
+            kit.run_js("window.gradRearm && window.gradRearm()")
+
     workspace.bind_chrome(draw_appbar)
     workspace.bind_chrome(draw_status)
     workspace.bind_retile(retile)

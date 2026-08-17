@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -468,6 +469,205 @@ def run_smoke(
         "fix": None if ok else f"read {artifacts / 'smoke.log'} -- this is the environment the real job would have used",
         "scope": "remote; the only check that exercises the real image, data path, and hardware",
     }
+
+
+# ---------------------------------------------------------------------------
+# evolve candidates
+# ---------------------------------------------------------------------------
+#: How many bytes of a candidate's output are kept, matching `tools/gpu.py`.
+CANDIDATE_OUTPUT_BYTES = 8000
+#: The environment variable the candidate's files ride in. Named rather than
+#: positional so a person reading a job's configuration on the Hub can see what
+#: it is.
+CANDIDATE_ENV = "GRAD_CANDIDATE_B64"
+#: How large that blob may get. This is a *container environment variable*, not
+#: a file: the practical ceiling is the platform's, it is not documented, and
+#: discovering it by exceeding it means a job that fails for a reason with
+#: nothing to do with the research. A couple of Python modules gzip to a few
+#: kilobytes, so anything approaching this is a pipeline being smuggled through
+#: the wrong door.
+MAX_CANDIDATE_B64 = 200_000
+
+
+def evaluate_candidate(
+    sub: Submission,
+    cfg: Config,
+    *,
+    candidate_id: str,
+    files: dict[str, str],
+    command: list[str],
+    timeout_s: int,
+    artifacts: Path,
+    flavor: str | None = None,
+    namespace: str | None = None,
+) -> dict[str, Any]:
+    """Run one evolve candidate as a Hugging Face Job, and read its metrics back.
+
+    **The delivery path is the interesting part, and it is different from the
+    other two backends.** `gpu.py` copies the pipeline directory to a host and
+    `kaggle.py` packs it into the notebook; on HF Jobs the pipeline is *in the
+    image*, and there is no upload step at all -- `_command_for` just runs the
+    entrypoint the image already contains. So a candidate, which is by definition
+    a program the image does not contain, needs a way in.
+
+    It rides as a gzipped tar in one environment variable, unpacked by a prelude
+    in front of the command. That is the same shape as Kaggle's embedded payload
+    and it is deliberately the *small* version of it: only the candidate's own
+    files travel, because everything else is already in the image that the
+    preflight proved. If that starts to look like a way to ship a pipeline, the
+    size refusal above says so rather than letting it half-work.
+
+    The files land in the container's working directory, which is the image's
+    `WORKDIR` -- the same place `_command_for` runs the entrypoint from. A spec
+    whose image puts the pipeline somewhere else needs `[target] command` to say
+    so, exactly as it already would for a submission.
+
+    Like the other adapters: no ledger row, cost measured rather than estimated,
+    and a transport failure reported as one rather than as a candidate that
+    scored nothing.
+    """
+    flavor = flavor or sub.target.get("flavor") or cfg.get("hf", "default_flavor", "a10g-small")
+    project = budget.current_project()
+    if namespace is None:
+        namespace = resolve_namespace(None, sub, cfg, project)
+    artifacts.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+
+    def _failed(message: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "exit_code": None,
+            "output": "",
+            "error": message,
+            "cost_usd": round(_elapsed_cost(started, flavor, cfg), 4),
+            "flavor": flavor,
+            "namespace": namespace,
+            "where": f"hf:{namespace or ''}",
+            **extra,
+        }
+
+    try:
+        blob = _candidate_blob(files)
+    except GradError as exc:
+        return _failed(exc.message)
+
+    # Everything that can fail for a configuration reason resolves before the
+    # job exists, for the reason `run_smoke` gives about phantom estimates.
+    try:
+        hub = _hub()
+        ns_kwargs = _ns_kwargs(namespace)
+        token = _token()
+    except GradError as exc:
+        return _failed(exc.message)
+
+    try:
+        job = hub.run_job(
+            image=sub.image,
+            command=_candidate_command(command),
+            flavor=flavor,
+            env={**_job_env(sub), CANDIDATE_ENV: blob, "GRAD_CANDIDATE": candidate_id},
+            token=token,
+            timeout=int(timeout_s),
+            **ns_kwargs,
+        )
+    except Exception as exc:  # noqa: BLE001 - a refused submission is not a bad mutation
+        return _failed(f"the candidate could not be submitted: {exc}")
+
+    job_id = getattr(job, "id", None) or getattr(job, "job_id", None) or str(job)
+    state, info = _poll(job_id, deadline=time.time() + int(timeout_s), namespace=namespace)
+    logs = _logs(job_id, namespace=namespace)
+    (artifacts / "candidate.log").write_text(logs, encoding="utf-8")
+    cost, _warning = _actual_cost(info, flavor, cfg, estimate_usd=0.0)
+
+    ok = state == "COMPLETED"
+    return {
+        "ok": ok,
+        # HF reports a *state*, not an exit code. `0` on COMPLETED and `1`
+        # otherwise would be inventing a number nobody measured, so the state is
+        # what is reported and `exit_code` stays None -- which the driver already
+        # distinguishes from a candidate that never ran.
+        "exit_code": 0 if ok else None,
+        "output": logs[-CANDIDATE_OUTPUT_BYTES:],
+        "error": None if ok else f"the candidate's job ended in state {state}",
+        "cost_usd": cost,
+        "flavor": flavor,
+        "namespace": namespace,
+        "job_state": state,
+        "where": f"hf:{namespace}/{job_id}" if namespace else f"hf:{job_id}",
+    }
+
+
+def _elapsed_cost(started: float, flavor: str, cfg: Config) -> float:
+    rate = flavor_rate(flavor, cfg) or 0.0
+    return (time.time() - started) / 3600.0 * float(rate)
+
+
+def _candidate_blob(files: dict[str, str]) -> str:
+    """The candidate's files as one base64 gzipped tar.
+
+    Deterministic in the same way `kaggle.py:_payload_b64` is -- sorted names,
+    `mtime=0` -- so the same candidate produces the same blob, which is what
+    makes two job configurations comparable when one of them misbehaves.
+    """
+    import base64  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    import tarfile  # noqa: PLC0415
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", compresslevel=9) as tar:
+        for name in sorted(files):
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise UsageError(
+                    f"refusing to send {name!r}: a candidate file is a path inside the workdir",
+                    fix="pass a name relative to the image's working directory",
+                )
+            data = str(files[name]).encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            tar.addfile(info, io.BytesIO(data))
+    blob = base64.b64encode(buffer.getvalue()).decode("ascii")
+    if len(blob) > MAX_CANDIDATE_B64:
+        raise UsageError(
+            f"the candidate packs to {len(blob):,} base64 bytes, past the "
+            f"{MAX_CANDIDATE_B64:,} this backend will put in an environment variable",
+            fix=(
+                "keep the evolve block to code -- the pipeline belongs in the image the "
+                "preflight proved, not in the candidate"
+            ),
+        )
+    return blob
+
+
+#: Unpacks `CANDIDATE_ENV` into the working directory. A `python -c` rather than
+#: a shell one-liner because the payload is base64 and `base64 -d` is not on
+#: every image; Python is, by construction, since the entrypoint is Python.
+_UNPACK = (
+    "import base64,io,os,tarfile;"
+    f"b=os.environ['{CANDIDATE_ENV}'];"
+    "t=tarfile.open(fileobj=io.BytesIO(base64.b64decode(b)));"
+    # `filter='data'` where the interpreter has it. The image's Python is not
+    # this machine's, so the version that matters cannot be checked from here --
+    # the same reason `kaggle.py` names it conditionally.
+    "t.extractall('.', filter='data') if hasattr(tarfile,'data_filter') else t.extractall('.');"
+    "print('grad: unpacked', len(t.getnames()), 'candidate files')"
+)
+
+
+def _candidate_command(command: list[str]) -> list[str]:
+    """The command with the unpack in front of it.
+
+    `sh -c` with the two joined by `&&`, so a failed unpack is a failed job
+    rather than a job that runs the image's *own* entrypoint against the
+    candidate's name and reports a score for the wrong program. That is the
+    failure worth engineering against here: it would not look like an error, it
+    would look like every candidate scoring the same.
+    """
+    inner = " ".join(shlex.quote(c) for c in command)
+    return ["sh", "-c", f"python -c {shlex.quote(_UNPACK)} && {inner}"]
 
 
 def _smoke_command(sub: Submission, caps: dict[str, Any]) -> list[str]:

@@ -1025,6 +1025,11 @@ def main() -> None:
         default=None,
         help="pin the --ui port; by default 8080, or the next free port above it",
     )
+    parser.add_argument(
+        "--no-splash",
+        action="store_true",
+        help="do not show the loading mark while --ui starts",
+    )
     parser.add_argument("--check", action="store_true", help="report environment and auth posture, then exit")
     parser.add_argument(
         "--update",
@@ -1075,6 +1080,16 @@ def main() -> None:
                 f"{running}\nIt is not answering on that port. If it is wedged, end the "
                 "`python` process holding it and start again."
             ) from None
+
+        # After the instance check and before the first expensive import, which
+        # is the only window where this is both correct and useful: a second
+        # launch that handed over above has nothing to load and must flash
+        # nothing, and everything below this line is the wait being covered.
+        # `ui/app.py` takes it down when the workspace's first client connects.
+        if not args.no_splash:
+            from ui import splash  # noqa: PLC0415 - a docstring-only package
+
+            splash.start()
 
         from ui.app import run as run_ui  # noqa: PLC0415
 

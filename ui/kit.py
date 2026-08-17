@@ -409,6 +409,21 @@ def run_js(code: str) -> None:
     zero-delay timer is NiceGUI's own answer -- it defers to the first tick
     after the page is live, and it makes the render function synchronous and
     testable rather than quietly scheduling background tasks.
+
+    **It must be called with a live slot in scope, and that is a real trap.** The
+    timer is an element, so it is created in the enclosing slot -- and inside an
+    event handler the enclosing slot belongs to the element the handler was bound
+    to, which a handler that rebuilds the UI has usually just deleted. There is
+    no way to recover from here: `context.client` is itself reached *through* the
+    current slot, so a deleted one takes the client with it and the code is never
+    sent. All of it raises `RuntimeError: The parent element this slot belongs to
+    has been deleted` before the socket is touched.
+
+    It is also quiet. `ui/shell.py:retile` runs from a titlebar button and
+    deletes every titlebar including the one that was clicked; the raise landed
+    in `ui/state.py:_guard`, which logs and carries on, so the JavaScript simply
+    never ran on any path but the first page build -- see `gradRearm`'s call
+    site, which enters a long-lived container precisely for this reason.
     """
     ui = _ui()
     ui.timer(0.05, lambda: ui.run_javascript(code), once=True)

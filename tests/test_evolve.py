@@ -108,7 +108,8 @@ def make_expectation(quantity="combined_score"):
 def run_args(task_dir, expectation_id, **overrides):
     base = dict(
         task_dir=str(task_dir), expect=expectation_id, project=None, generations=2,
-        population=2, estimate_per_candidate_usd=0.0, local=True, remote=False,
+        population=2, estimate_per_candidate_usd=0.0, local=True, remote=None,
+        remote_spec=None, remote_timeout_s=0,
         overrides=[], timeout_s=30, json=True,
         # The search knobs. `islands=1` and no migration by default so the tests
         # that are about the *gate* are not also about the selection policy;
@@ -402,12 +403,22 @@ def test_promoting_an_unevaluated_candidate_refuses(workspace, monkeypatch):
 # ---------------------------------------------------------------------------
 # phasing and scaffolding
 # ---------------------------------------------------------------------------
-def test_remote_is_refused_in_phase_one(workspace):
-    """"Do not run a single remote generation before this exists." """
+def test_remote_needs_a_spec_to_be_remote_on(workspace):
+    """There is no such thing as 'the remote' in general, only a pipeline that
+    has been proven on one."""
     task_dir = scaffold(workspace)
     with pytest.raises(UsageError) as exc:
-        evolve.cmd_run(run_args(task_dir, make_expectation(), remote=True))
-    assert "phase 2" in str(exc.value)
+        evolve.cmd_run(run_args(task_dir, make_expectation(), remote="ssh"))
+    assert "--remote-spec" in str(exc.value.fix or "")
+
+
+def test_a_spec_with_no_backend_is_refused(workspace):
+    """The mirror of the above: naming an environment without saying what to run
+    it on is a flag that would otherwise be silently ignored."""
+    task_dir = scaffold(workspace)
+    with pytest.raises(UsageError) as exc:
+        evolve.cmd_run(run_args(task_dir, make_expectation(), remote_spec="pipeline/spec.toml"))
+    assert "no --remote backend" in str(exc.value)
 
 
 def test_a_task_without_markers_is_refused(workspace):
