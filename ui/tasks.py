@@ -206,11 +206,27 @@ def start(
     `on_done` runs once the task settles, however it settled -- a verify has to
     write its record whether it passed, failed or was stopped, because "we do
     not know" is a different notebook state from "it was fine before".
+
+    **There has to be a running loop.** This was `get_event_loop()`, which until
+    Python 3.14 silently *created* one when none was running -- and a loop nobody
+    runs never drives the coroutine it was handed, so a task started outside a
+    loop was registered, shown as running, and then sat there forever. That is
+    the exact failure `_driver` exists to prevent, arriving through the other
+    door. 3.14 made it raise, which is the better behaviour and is now asked for
+    by name: every real caller is a NiceGUI click handler and already has one.
     """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"tasks.start({label!r}) needs a running event loop: it hands `_run` to one, "
+            "and a task with no loop to run it would be registered, drawn as running, "
+            "and never execute"
+        ) from exc
     task = _register(Task(_next_id(), label, tuple(argv), tuple(halt) if halt else None))
     task.on_done = on_done
     task.note(f"$ python -m {' '.join(argv)}")
-    task._driver = asyncio.get_event_loop().create_task(_run(task))  # noqa: SLF001 - its own field
+    task._driver = loop.create_task(_run(task))  # noqa: SLF001 - its own field
     return task
 
 

@@ -217,9 +217,26 @@ def render(workspace: Any) -> None:
         scroller.props('id="grad-transcript"')
         scroller.style("flex: 1 1 auto; overflow-y: auto; min-height: 0")
         with scroller:
+            # `flex: 0 0 auto` on both, and it is not decoration. The scroller is
+            # a *flex column*, so these two are flex items and arrive with
+            # `flex-shrink: 1`; `kit.column` then sets `min-height: 0`, which is
+            # what a nested scroll container needs and which also removes the
+            # automatic minimum size that otherwise stops a flex item shrinking
+            # below its own content.
+            #
+            # So once the conversation grew past the pane, the browser did not
+            # scroll it -- it shrank these two boxes to fit and let their
+            # messages spill out, one turn painted over the next, with no
+            # scrollbar to say anything had overflowed. It showed up "sometimes
+            # while moving a tile around" because that is what changes the pane's
+            # height: the same transcript overlaps at one pane size and is fine
+            # at another. Refusing to shrink makes the overflow the scroller's,
+            # which is the one element here equipped to have any.
             transcript = kit.column("", gap=0)
+            transcript.style("flex: 0 0 auto")
             tail_root = kit.column("", gap=0)
             tail_root.props('id="grad-tail"')
+            tail_root.style("flex: 0 0 auto")
         tail = _Tail(tail_root)
 
         with transcript:
@@ -312,11 +329,62 @@ class _Statusline:
             # when nothing is running.
             self.context = kit.text("", "context", tag="span")
             self.clock = kit.text("", "clock", tag="span")
+            # Its own click, and `stopPropagation` is what keeps it separate:
+            # the whole strip is one button, so without it every change of
+            # effort would also toggle the reasoning panel. NiceGUI has no Vue
+            # modifier passthrough -- `on("click.stop")` is camel-cased into an
+            # event name nothing fires -- so the stop happens in `js_handler`,
+            # which then emits to the Python handler as usual.
+            self.effort = kit.text("", "effort", tag="span")
+            self.effort.props(
+                'title="how hard the agent thinks -- click to change" '
+                # Still a span, deliberately: the strip around it is itself a
+                # click target, and a real <button> nested inside one is invalid
+                # markup that browsers resolve by unnesting it -- which moves the
+                # control out of the strip it belongs to. So the semantics are
+                # spelled out instead, and the keyboard handler below is what
+                # makes them true rather than merely announced.
+                'role="button" tabindex="0"'
+            )
+            self.effort.on(
+                "click",
+                self.cycle_effort,
+                js_handler="(e) => { e.stopPropagation(); emit(); }",
+            )
+            self.effort.on(
+                "keydown",
+                self.cycle_effort,
+                # Enter and Space, which is what `role="button"` promises. The
+                # same `stopPropagation` as the click, and for the same reason:
+                # the strip would otherwise toggle the reasoning panel too.
+                js_handler=(
+                    "(e) => { if (e.key === 'Enter' || e.key === ' ') {"
+                    " e.preventDefault(); e.stopPropagation(); emit(); } }"
+                ),
+            )
             self.reasoning = kit.text("", "reasoning", tag="span")
         self.bar = bar
         self._context_mark: tuple[Any, ...] | None = None
         self._paint_reasoning()
+        self._paint_effort()
         self.sync_context()
+
+    def cycle_effort(self) -> None:
+        self.workspace.cycle_effort()
+        self._paint_effort()
+
+    def _paint_effort(self) -> None:
+        from core import effort as effort_mod  # noqa: PLC0415
+
+        level = effort_mod.current()
+        kit.set_text(self.effort, effort_mod.label(level))
+        # `auto` is the absence of a choice, and the chip says so by staying
+        # dashed. Without the distinction the strip reads as though someone had
+        # deliberately selected "auto", which is the one level nobody selects.
+        if level == effort_mod.AUTO:
+            self.effort.classes(remove="set")
+        else:
+            self.effort.classes(add="set")
 
     def toggle(self) -> None:
         showing = self.workspace.toggle_reasoning()
@@ -629,8 +697,13 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
 
         with kit.row("", gap=6, align="flex-end").style("margin-top: 8px"):
             entry = (
+                # No `autogrow`. It grows by CSS now -- see `field-sizing` in
+                # `ui/tokens.py`, which is also where the measurement that
+                # removed this prop is written down. Quasar's version reads
+                # `scrollHeight` back inside the input handler, and that read is
+                # a full-document layout whose cost is the transcript's size.
                 ui.textarea(placeholder="ask, or paste a result to interrogate")
-                .props("autogrow borderless dense")
+                .props("borderless dense")
                 .classes("field")
                 .style("flex: 1 1 auto; padding: 0 8px")
             )

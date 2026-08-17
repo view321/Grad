@@ -283,6 +283,12 @@ def shutdown() -> None:
     if _quitting.is_set():
         return
     _quitting.set()
+    # First, and before anything asks the window to go away: NiceGUI's own
+    # shutdown calls `destroy()` on it, pywebview raises `closing` for that
+    # exactly as it does for the close button, and a veto there would have the
+    # app answer Quit by hiding. Clearing the flag is what makes this close a
+    # close. See `hold_window_open`.
+    set_tray_flag(False)
     from core import instance  # noqa: PLC0415
 
     instance.release()
@@ -374,6 +380,49 @@ def write_icon(path: str) -> str:
     return str(target)
 
 
+def icon_file() -> Any:
+    """Where the mark lives on disk.
+
+    The exact path `install.ps1` already writes, so the shortcut, the
+    notification area and the taskbar button read one file rather than three.
+    """
+    from core import appdata  # noqa: PLC0415 - import cycle if hoisted
+
+    return appdata.app_dir() / "grad.ico"
+
+
+def icon_path(*, refresh: bool = False) -> str | None:
+    """The `.ico` for the window's taskbar button, rendered if it is not there.
+
+    **Why the window needs one at all.** pywebview's Windows backend sets the
+    form's icon from `start()`'s `icon=` argument, and where that is missing it
+    falls back to `ExtractIconW(..., sys.executable, 0)` -- the icon of the
+    interpreter hosting us. So an app that passes nothing does not get a default
+    Grad icon, it gets Python's, which is the one thing on the taskbar that says
+    this is somebody's script rather than an application.
+
+    Rendered on demand rather than only at install time, because the file is
+    reachable by three routes that do not all run the installer: a dev checkout,
+    a `pip install` with no shortcut, and an installation whose icon step failed
+    on a missing Pillow. `refresh=True` redraws over an existing file, which is
+    what a change to `_icon_image` needs to take effect on a machine that already
+    has one.
+
+    Returns None rather than raising. Pillow is declared by the `ui` extra but a
+    machine can still be missing it, and refusing to open a window because the
+    icon could not be drawn trades a cosmetic problem for a fatal one -- which is
+    exactly the trade `start_tray` already declines to make.
+    """
+    try:
+        target = icon_file()
+        if refresh or not target.is_file():
+            write_icon(str(target))
+        return str(target)
+    except Exception:  # noqa: BLE001 - see the docstring; cosmetic, never fatal
+        log.exception("could not render the application icon")
+        return None
+
+
 def _available_tag() -> str | None:
     """The release the last check found, or None. Cheap enough for a menu draw.
 
@@ -399,8 +448,8 @@ def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
     Optional by construction: `pystray` is in the `ui` extra, but a machine
     without a working tray (a bare Windows Server session, most Linux desktops
     without an AppIndicator host) must still get a usable app. The only thing
-    lost is the way back from a hidden window, so `hide_to_tray` refuses to hide
-    when this returned None.
+    lost is the way back from a hidden window, which is why this writes the flag
+    `hold_window_open` reads: without an icon, closing the window closes it.
     """
     global _tray
 
@@ -408,6 +457,7 @@ def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
         import pystray  # noqa: PLC0415
     except ImportError:
         log.info("pystray is not installed; the app will not show in the notification area")
+        set_tray_flag(False)
         return None
 
     def _menu() -> Any:
@@ -435,16 +485,48 @@ def start_tray(*, on_restart_lab: Callable[[], Any] | None = None) -> Any:
         items.append(pystray.MenuItem("Quit Grad", lambda: request_quit()))
         return pystray.Menu(*items)
 
+    def _serve() -> None:
+        """`icon.run`, plus what happens when it stops.
+
+        It can stop two ways: `request_quit` tears the icon down, or the backend
+        fails. Either way the flag has to come back down -- left true, it tells
+        the window process that hiding is recoverable when there is no longer
+        anything in the notification area to bring the window back, which is a
+        window that vanishes with no way to reach it.
+
+        Guarded by `_tray is icon`, because a later `start_tray` may already have
+        installed its own. A dying thread must retract its own promise and not
+        its successor's.
+        """
+        global _tray
+        try:
+            icon.run()
+        except Exception:  # noqa: BLE001 - a tray thread must not die silently
+            log.exception("the tray icon stopped")
+        finally:
+            if _tray is icon:
+                _tray = None
+                set_tray_flag(False)
+
     try:
         icon = pystray.Icon("grad", _icon_image(), "Grad", _menu())
+        # Both set before the thread starts, and that is the whole point of the
+        # ordering: the menu is live the instant `run` does, so a `_tray` still
+        # None at that moment is `has_tray()` answering False about an icon that
+        # is already on screen -- and `hide_to_tray` refusing to hide into a tray
+        # that exists. The icon the flag promises is the object above, which
+        # exists by here; `run` makes it visible, it does not make it real.
+        _tray = icon
+        set_tray_flag(True)
         # `run_detached` would be the tidier call, but it is not implemented on
         # every backend; a daemon thread around `run` works on all of them and
         # dies with the process either way.
-        threading.Thread(target=icon.run, name="grad-tray", daemon=True).start()
+        threading.Thread(target=_serve, name="grad-tray", daemon=True).start()
     except Exception:  # noqa: BLE001 - see the docstring
         log.exception("could not start the tray icon")
+        _tray = None
+        set_tray_flag(False)
         return None
-    _tray = icon
     return icon
 
 
@@ -452,18 +534,86 @@ def has_tray() -> bool:
     return _tray is not None
 
 
-def hide_to_tray() -> bool:
-    """Hide the window, if there is a way back to it.
+# ---------------------------------------------------------------------------
+# closing the window is not quitting
+# ---------------------------------------------------------------------------
+def tray_flag() -> Any:
+    """The file that says an icon is in the notification area right now.
 
-    Returns whether it hid. Without a tray icon this refuses: a hidden window
-    with no icon and no taskbar entry is an app that is running, consuming a
-    port, holding the single-instance lock, and unreachable by any means short
-    of Task Manager.
+    A file, and not a variable, because the two ends of this question are in
+    different processes: the tray runs here, and the only code that can veto a
+    window close runs in the window's own process. See `hold_window_open`.
     """
-    if not has_tray():
+    from core import appdata  # noqa: PLC0415
+
+    return appdata.state_dir() / "tray.flag"
+
+
+def set_tray_flag(up: bool) -> None:
+    """Record whether there is a way back from a hidden window."""
+    path = tray_flag()
+    try:
+        if up:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("1", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:  # noqa: BLE001 - the flag is an optimisation, not a lock
+        log.debug("could not write the tray flag", exc_info=True)
+
+
+def hold_window_open(flag_path: str) -> None:
+    """Reinterpret the close button as "hide". **Runs in the window process.**
+
+    This is the module docstring's second decision -- closing the window hides
+    it -- and for months it was a decision nothing implemented. The attempt
+    lived in `ui/app.py` and bound `window.events.closing`, which cannot work in
+    native mode: NiceGUI runs pywebview in a *separate process*, and what the
+    app holds is a `WindowProxy` that forwards method calls over a queue and has
+    no `events` attribute at all. The bind raised `AttributeError` into a
+    `log.debug`, so the only trace of it was a line nobody was logging. The
+    close went through, the window process died, and NiceGUI's own watchdog --
+    a thread polling `process.is_alive()` -- hard-exited the app a second later.
+    That is the reported symptom exactly: the icon vanishes from the
+    notification area a couple of seconds after the window closes.
+
+    pywebview *does* support vetoing a close: a `closing` handler returning
+    False cancels it, and the event is synchronous precisely so that the answer
+    arrives in time to matter. It just has to be registered on the real window,
+    which means running inside the child -- and `webview.start(func=...)` is the
+    door NiceGUI leaves open for that. The function crosses the process boundary
+    by pickle, so it is a module-level function taking a string, and it reaches
+    the window through `webview.windows` rather than through anything it would
+    have to be handed.
+
+    The flag file is what keeps this from stranding the app. A hidden window
+    with no icon and no taskbar entry is a process that is running, holding the
+    port and the single-instance lock, and unreachable by any means short of
+    Task Manager -- so with no tray, the close is allowed to be a close. It is
+    read at close time rather than at startup, which is what makes it immune to
+    the order the tray and the window happen to come up in.
+    """
+    import webview  # noqa: PLC0415 - the window process has it by definition
+    from pathlib import Path  # noqa: PLC0415
+
+    windows = getattr(webview, "windows", None)
+    if not windows:
+        return
+    window = windows[0]
+
+    def _closing() -> bool:
+        # False cancels the close, which is how pywebview spells "hide". True
+        # lets it through -- and every path that cannot hide *must* return True,
+        # because a veto with no hide is a close button that does nothing.
+        if not Path(flag_path).exists():
+            return True
+        try:
+            window.hide()
+        except Exception:  # noqa: BLE001 - a window that will not hide must close
+            return True
         return False
-    hide_window()
-    return True
+
+    window.events.closing += _closing
 
 
 def bind_loop(loop: asyncio.AbstractEventLoop) -> None:

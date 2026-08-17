@@ -94,13 +94,39 @@ class Cli:
         self._handlers: dict[str, Handler] = {}
 
     def command(
-        self, name: str, help: str, *, setup: Setup | None = None, description: str | None = None
+        self,
+        name: str,
+        summary: str | None,
+        *,
+        setup: Setup | None = None,
+        description: str | None = None,
     ) -> Callable[[Handler], Handler]:
+        """Register a subcommand. `summary=None` hides it from the command list.
+
+        Named `summary` rather than `help`: every call site passes it
+        positionally, so the builtin it used to shadow bought nothing and cost a
+        reader of this file the word `help` inside it.
+
+        Hidden rather than absent, because some commands exist for the tool to
+        call and not for a person to type: `tools/task.py`'s supervisor is the
+        first, and it has to be reachable by name because it is spawned as
+        `python -m tools.task _supervise`. `argparse.SUPPRESS` does not do this
+        for a subparser -- it renders as the literal string `==SUPPRESS==` in the
+        listing -- and the only mechanism that works is not passing `help` at all.
+        """
+
         def decorate(fn: Handler) -> Handler:
+            listing = {} if summary is None else {"help": summary}
             p = self.sub.add_parser(
                 name,
-                help=help,
-                description=description or fn.__doc__ or help,
+                **listing,
+                # `summary`, not `help`. While this parameter *was* named `help`
+                # the fallback read it; renaming it left this line resolving the
+                # builtin instead, which is truthy -- so every command with no
+                # `description` and no docstring described itself as
+                # "<built-in function help>" in `--help`. The exact failure
+                # A002 exists to prevent, produced by the fix for A002.
+                description=description or fn.__doc__ or summary or name,
                 formatter_class=argparse.RawDescriptionHelpFormatter,
             )
             p.set_defaults(_parser=p)

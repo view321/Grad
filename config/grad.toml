@@ -30,6 +30,29 @@ test_command = ["pytest", "-q"]
 dry_run_timeout_s = 900
 test_timeout_s = 900
 
+[execution]
+# How much may be in flight at once. Three numbers because they bound three
+# different resources.
+#
+# `max_concurrent_runs` is the one with teeth, and it is the reason the other two
+# are safe. Gate 4 refuses *every* later submission while *any* uncollected run
+# is past its window — so each extra job in flight is another collection window
+# open, and one wedged backend takes the successors of all the others down with
+# it. Running things in parallel is precisely what turns exit 7 from an
+# occasional annoyance into the normal state; this is what stops it. Refuses with
+# exit 14, never 6 or 7: nothing has gone wrong, and the fix is to collect one or
+# to wait. Two is deliberately low — enough to overlap a long job with a short
+# one, not enough to lose track. A spec can raise it for itself with
+# `[execution] max_concurrent`, which is not in the submission hash.
+max_concurrent_runs = 2
+# Local background commands (`tools/task.py`). A different number because it
+# bounds this machine's CPU rather than a backend's willingness to be polled.
+max_concurrent_tasks = 4
+# What `--jobs` defaults to where a tool parallelises inside itself: the funnel's
+# stage 1 (twelve independent HTTP requests), preflight's independent local
+# checks. The largest of the three because that work is network-bound.
+default_jobs = 4
+
 [notebook]
 # The kernel is the agent's only interactive compute channel; a training loop in
 # a cell blocks it with no way to observe progress.
@@ -43,11 +66,21 @@ kernel_name = "python3"
 # cost. The Claude 5 family is Fable 5 / Opus 5 / Sonnet 5; there is no Haiku 5,
 # and 4.5 is the latest Haiku.
 research = "claude-opus-5"      # the main loop (§3)
-evolve   = "claude-sonnet-5"    # ShinkaEvolve mutation operators (§21)
+evolve   = "claude-sonnet-5"    # the mutation operator, core/mutate.py (§21)
 expand   = "claude-haiku-4-5"   # funnel stage 0 (§5)
 triage   = "claude-haiku-4-5"   # funnel stage 3 (§5)
 report   = "claude-opus-5"      # prose synthesis (§22)
 cite     = "claude-haiku-4-5"   # citation resolution -- mechanical matching (§22)
+
+[evolve]
+# Wall clock for one mutation proposal's whole turn. This is a deadlock guard,
+# not a performance budget: a `full` rewrite of a long block is legitimately a
+# slow turn, and killing a working operator costs a candidate. What it is here
+# to stop is a `claude` that stops yielding without ending its turn -- which,
+# unbounded, holds a `--jobs` slot for the rest of the campaign and takes every
+# remaining generation with it. A proposal that hits this is recorded as one
+# failed candidate, and its tokens are still metered.
+propose_timeout_s = 900
 
 [retrieval]
 # rerank_model and embed_model stay here on purpose: a different provider on a
@@ -55,7 +88,22 @@ cite     = "claude-haiku-4-5"   # citation resolution -- mechanical matching (§
 # and the reranker is a dedicated cross-encoder that is better at pairwise
 # relevance than a generative model is. Do not fold these into [models]; that is
 # exactly the substitution §16 argues against.
+#
+# Voyage serve rerank-2.5 themselves, so stage 2 no longer needs an OpenRouter
+# account for weights the embed key already reaches: "auto" uses Voyage when
+# voyage_key is stored and OpenRouter when it is the only key present. Set
+# "voyage" or "openrouter" to pin one. The model id below is rewritten to suit
+# whichever is chosen, so it does not have to change with the provider.
+rerank_provider = "auto"
 rerank_model = "voyageai/rerank-2.5"
+# Tier-1 discovery sources that are switched off, whatever asks for them. Both
+# entries here are doors onto the Semantic Scholar corpus and both are shut for
+# one reason: measured live, Asta takes ~121s to answer a search and ~283s to
+# report that its own backend refused a connection, and s2's anonymous pool is
+# shared and near-permanently rate limited. Papers with Code answers the same
+# query in one to two seconds. Empty the list to have them back — nothing else
+# has to change, and --tier1 asta refuses with that instruction while it is here.
+tier1_disabled = ["asta", "s2"]
 embed_model = "voyage-4"
 embed_dim = 1024
 rrf_k = 60
@@ -110,6 +158,76 @@ t4-medium = 0.60
 a10g-small = 1.05
 a10g-large = 1.50
 a100-large = 4.13
+
+[kaggle]
+# Kaggle kernels: free GPU/TPU, rationed in hours rather than dollars. Every run
+# here costs $0.00, so the [spend] ceilings above pass every one of them --
+# `[kaggle.quota]` below is the gate that actually bounds this backend, and it
+# refuses with exit 13 so "out of GPU hours" is never read as "out of money".
+#
+# The username is not a secret and is readable; the API key is, and lives in
+# Windows Credential Manager:
+#   python -m tools.kaggle account --set <username> --json
+#   python -m tools.jobs credential set kaggle_key
+#   python -m tools.kaggle account --check --json   # does the pair authenticate
+#
+# The command stores the account under the app directory and that selection wins
+# over this key -- a command that silently did nothing because a config file
+# disagreed would be worse than one that overrides it, and `account` says when it
+# is shadowing a value set here. Left empty, this is simply unused.
+username = ""
+default_accelerator = "NvidiaTeslaP100"
+kernel_prefix = "grad"
+# Private by default. A public kernel publishes the pipeline, the data pointer
+# and the results the moment it is pushed.
+is_private = true
+# Off by default. A kernel with internet can pip install and pull weights; it can
+# also send anything it can read anywhere. Turn it on per spec with
+# `[target] internet = true`, not here.
+enable_internet = false
+poll_interval_s = 30
+push_timeout_s = 900
+status_timeout_s = 120
+output_timeout_s = 1800
+# How long a smoke run may sit in Kaggle's queue before the poll gives up. Queue
+# time is Kaggle being busy, so it is not charged against the smoke's own
+# wall-clock cap -- failing a check for that reason says nothing about the code.
+queue_grace_s = 900
+
+[kaggle.quota]
+# Kaggle's published allowances are roughly these, and it varies them with demand
+# while exposing no remaining balance -- so these are ceilings you control, not a
+# mirror of Kaggle's. Set them at or under the real ones and they bind first,
+# which is the useful direction to be wrong in: refusing at 30h when Kaggle would
+# have allowed 34 costs four hours, refusing at 34 when Kaggle stops at 30 loses
+# a run mid-training.
+gpu_hours_per_week = 30.0
+tpu_hours_per_week = 20.0
+window_days = 7
+# A single session's cap, which is a different failure from the weekly one:
+# Kaggle stops the kernel here and only what was checkpointed survives.
+max_session_hours = 12.0
+max_tpu_session_hours = 9.0
+
+[kaggle.accelerators]
+# Which weekly pool each accelerator id draws from. An id that is not in this
+# table is a configuration error rather than a guess: "gpu" would charge a TPU
+# run to the wrong pool and "cpu" would charge it to none, and a run that draws
+# no pool is how a weekly ceiling quietly stops counting. Kaggle adds hardware --
+# a new id is a one-line edit here, not a code change.
+none = "cpu"
+NvidiaTeslaP100 = "gpu"
+NvidiaTeslaT4 = "gpu"
+NvidiaTeslaT4Highmem = "gpu"
+NvidiaTeslaA100 = "gpu"
+NvidiaL4 = "gpu"
+NvidiaL4X1 = "gpu"
+NvidiaH100 = "gpu"
+NvidiaRtxPro6000 = "gpu"
+TpuV38 = "tpu"
+Tpu1VmV38 = "tpu"
+TpuV5E8 = "tpu"
+TpuV6E8 = "tpu"
 
 # SSH hosts are a fixed inventory; an unknown name is a configuration error,
 # never an ad-hoc connection. Uncomment and fill in for a real host.

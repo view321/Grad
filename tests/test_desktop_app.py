@@ -367,6 +367,235 @@ def test_an_unreachable_lab_does_not_block_the_quit(workspace, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# closing the window is not quitting
+# ---------------------------------------------------------------------------
+class _FakeClosingEvent:
+    """pywebview's `closing`: a list of handlers, and False means "cancel"."""
+
+    def __init__(self) -> None:
+        self.handlers: list = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class _FakeWindow:
+    def __init__(self, *, hides: bool = True) -> None:
+        self.events = type("E", (), {})()
+        self.events.closing = _FakeClosingEvent()
+        self.hidden = 0
+        self._hides = hides
+
+    def hide(self) -> None:
+        if not self._hides:
+            raise RuntimeError("this window will not hide")
+        self.hidden += 1
+
+
+def _closing_handler(monkeypatch, window):
+    """Run `hold_window_open` against a fake pywebview and return its handler.
+
+    The real thing runs in the window's own process, which is the whole reason
+    the bug existed: nothing in this process could bind that event, and the
+    attempt to raised into a debug log nobody was reading.
+    """
+    import sys
+    import types
+
+    fake = types.ModuleType("webview")
+    fake.windows = [window]
+    monkeypatch.setitem(sys.modules, "webview", fake)
+    desktop.hold_window_open(str(desktop.tray_flag()))
+    assert window.events.closing.handlers, "no closing handler was registered"
+    return window.events.closing.handlers[0]
+
+
+def test_closing_the_window_hides_it_when_the_tray_can_bring_it_back(workspace, monkeypatch):
+    """The app's second load-bearing decision, and for months it did nothing:
+    the close went through, the window process died, and NiceGUI's watchdog took
+    the whole app down a second later -- the icon vanishing from the
+    notification area is the reported symptom."""
+    desktop.set_tray_flag(True)
+    window = _FakeWindow()
+    handler = _closing_handler(monkeypatch, window)
+
+    assert handler() is False, "the close was not cancelled"
+    assert window.hidden == 1
+
+
+def test_closing_the_window_closes_it_when_there_is_no_way_back(workspace, monkeypatch):
+    """A hidden window with no icon is a process holding the port and the
+    single-instance lock, unreachable short of Task Manager. Without a tray the
+    close is allowed to be a close."""
+    desktop.set_tray_flag(False)
+    window = _FakeWindow()
+    handler = _closing_handler(monkeypatch, window)
+
+    assert handler() is True
+    assert window.hidden == 0
+
+
+def test_a_window_that_will_not_hide_is_allowed_to_close(workspace, monkeypatch):
+    """A veto with no hide is a close button that does nothing at all."""
+    desktop.set_tray_flag(True)
+    window = _FakeWindow(hides=False)
+    handler = _closing_handler(monkeypatch, window)
+
+    assert handler() is True
+
+
+def test_quitting_clears_the_flag_before_the_window_is_destroyed(workspace, monkeypatch):
+    """NiceGUI's shutdown calls `destroy()`, pywebview raises `closing` for that
+    exactly as for the close button -- so a flag left set would have Quit answer
+    by hiding."""
+    desktop.set_tray_flag(True)
+    monkeypatch.setattr(desktop, "_tray", None)
+    desktop._quitting.clear()
+    monkeypatch.setattr("core.instance.release", lambda: None)
+
+    desktop.shutdown()
+    assert not desktop.tray_flag().exists()
+    desktop._quitting.clear()
+
+
+def test_the_veto_is_actually_handed_to_the_window_process(workspace):
+    """The connecting wire, tested because its absence is silent: every other
+    test here would pass with `hold_window_open` never reaching a window.
+
+    `_split_picklable` is NiceGUI's own filter -- it drops whatever cannot cross
+    the spawn boundary and only warns -- so this asserts the keys survive it
+    rather than merely that they were set.
+    """
+    from nicegui import app as nicegui_app
+    from nicegui.native.native_mode import _split_picklable
+
+    from ui import app as grad_app
+
+    nicegui_app.native.start_args.clear()
+    grad_app._install_desktop(True)
+
+    kept, dropped = _split_picklable(nicegui_app.native.start_args)
+    assert kept.get("func") is desktop.hold_window_open
+    assert kept.get("args") == (str(desktop.tray_flag()),)
+    assert not dropped
+    nicegui_app.native.start_args.clear()
+
+
+def test_the_window_is_handed_an_icon(workspace):
+    """Without one, pywebview falls back to `ExtractIconW(..., sys.executable, 0)`
+    and the app sits on the taskbar wearing Python's icon. Measured: the
+    fallback rasterises to Python's blue, the icon here to the brand yellow.
+
+    Travels through `_split_picklable` for the reason `func` does -- the form
+    that owns the icon lives in the spawned window process, so a value that
+    cannot cross the boundary is the same as no icon at all.
+    """
+    from nicegui import app as nicegui_app
+    from nicegui.native.native_mode import _split_picklable
+
+    from ui import app as grad_app
+
+    nicegui_app.native.start_args.clear()
+    grad_app._install_desktop(True)
+
+    kept, dropped = _split_picklable(nicegui_app.native.start_args)
+    assert Path(kept["icon"]).is_file()
+    assert not dropped
+    nicegui_app.native.start_args.clear()
+
+
+def test_the_icon_carries_every_size_windows_asks_for(workspace):
+    """Windows picks a size per context -- 16px on the taskbar, 32px on the
+    desktop, 256px in the large-icon view -- and an `.ico` carrying one of them
+    gets the others by scaling."""
+    # Skipped, not errored, without Pillow. It is in the `ui` extra rather than
+    # the base install, and `write_icon` already treats its absence as a warning
+    # and falls back -- so a suite that errors here reports a missing optional
+    # dependency as a broken icon.
+    Image = pytest.importorskip("PIL.Image")
+
+    path = desktop.icon_path(refresh=True)
+    with Image.open(path) as image:
+        assert set(image.ico.sizes()) >= {(16, 16), (32, 32), (48, 48), (256, 256)}
+        master = image.ico.getimage((256, 256)).convert("RGB")
+        taskbar = image.ico.getimage((32, 32)).convert("RGB")
+
+    # The 256px entry is the drawing itself, so it matches `_icon_image` exactly.
+    assert master.getpixel((128, 24)) == (255, 212, 0)
+    assert master.getpixel((128, 112)) == (20, 16, 12)
+
+    # 32px is resampled from it, so the colours shift a little. What has to hold
+    # is that it is still recognisably this mark and not the interpreter's --
+    # Python's icon rasterises to blue, which no tolerance around yellow reaches.
+    ground = taskbar.getpixel((16, 3))
+    assert ground[0] > 240 and ground[1] > 190 and ground[2] < 40, ground
+    glyph = taskbar.getpixel((16, 14))
+    assert max(glyph) < 60, glyph
+
+
+def test_the_shortcut_and_the_window_read_one_file(workspace):
+    """`install.ps1` writes `%LOCALAPPDATA%\\Grad\\grad.ico` and the window reads
+    it. Two paths would be two marks that drift."""
+    from core import appdata
+
+    assert desktop.icon_file() == appdata.app_dir() / "grad.ico"
+
+
+def test_a_missing_pillow_costs_the_icon_and_not_the_app(workspace, monkeypatch):
+    """Pillow is declared by the `ui` extra, and a machine can still be missing
+    it -- that is exactly how this file's `start_tray` note came about. Refusing
+    to open a window because the icon could not be drawn trades a cosmetic
+    problem for a fatal one."""
+    monkeypatch.setattr(desktop, "write_icon", _raise_no_pillow)
+    target = desktop.icon_file()
+    if target.exists():
+        target.unlink()
+
+    assert desktop.icon_path() is None
+
+    # And the app still wires up: the key is simply absent.
+    from nicegui import app as nicegui_app
+
+    from ui import app as grad_app
+
+    nicegui_app.native.start_args.clear()
+    grad_app._install_desktop(True)
+    assert "icon" not in nicegui_app.native.start_args
+    assert nicegui_app.native.start_args["func"] is desktop.hold_window_open
+    nicegui_app.native.start_args.clear()
+
+
+def _raise_no_pillow(*_args, **_kwargs):
+    raise ImportError("No module named 'PIL'")
+
+
+def test_browser_mode_hands_over_no_window_veto(workspace):
+    """There is no window to hide and no tray to hide it to; the tab is the
+    affordance and closing it is the user's business."""
+    from nicegui import app as nicegui_app
+
+    from ui import app as grad_app
+
+    nicegui_app.native.start_args.clear()
+    grad_app._install_desktop(False)
+    assert "func" not in nicegui_app.native.start_args
+
+
+def test_the_close_veto_crosses_the_process_boundary(workspace):
+    """It is handed to a *spawned* process, so it travels by pickle: a closure
+    over anything here, or a lambda, would fail at window creation -- which is
+    the app failing to open at all."""
+    import pickle
+
+    payload = {
+        "func": desktop.hold_window_open,
+        "args": (str(desktop.tray_flag()),),
+    }
+    assert pickle.loads(pickle.dumps(payload))["func"] is desktop.hold_window_open
+
+
+# ---------------------------------------------------------------------------
 # the poll
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio

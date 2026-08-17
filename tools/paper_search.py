@@ -23,6 +23,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from core import config as config_mod, corpus, credentials, haiku, http, paths, quota_log
@@ -38,9 +39,10 @@ cli = Cli(
         "read; tier 2 (the local index) answers 'where did I see that lemma'.\n"
         "A local index cannot do discovery by construction, which is why both exist.\n\n"
         "Tier 1 defaults to pwc (Papers with Code): anonymous, fast, title-only rows\n"
-        "with abstracts backfilled from arXiv. --tier1 asta serves the Semantic Scholar\n"
-        "corpus over MCP without an institutional email; --tier1 s2 uses the REST API\n"
-        "directly (shared anonymous pool, usually rate limited).\n\n"
+        "with abstracts backfilled from arXiv. The two doors onto the Semantic Scholar\n"
+        "corpus -- asta over MCP, s2 over the REST API -- are switched off in\n"
+        "[retrieval] tier1_disabled because both answer in minutes rather than seconds;\n"
+        "empty that list to have them back.\n\n"
         "The retriever sets the ceiling: query expansion and neighbour/citation\n"
         "expansion buy more than reranker shopping does."
     ),
@@ -82,6 +84,73 @@ class _Budget:
         return bool(self.limit) and self.elapsed >= self.limit
 
 
+def _discover(
+    queries: list[str],
+    tier1: list[tuple[str, Any]],
+    *,
+    per_query: float,
+    budget: _Budget,
+    jobs: int,
+) -> tuple[list[dict[str, Any]], set[tuple[str, str]], int]:
+    """Stage 1's calls, `jobs` at a time. Returns (results, dropped, queries tried).
+
+    Every call here is an independent read-only HTTP request against a public
+    endpoint, so this is the cheapest concurrency in the project and the one that
+    buys the most: six expanded queries against two verbs on one client is twelve
+    round trips, and at `pwc`'s one-to-two seconds that is the difference between
+    a funnel that answers in three seconds and one that answers in twenty.
+
+    Two invariants survive the change, and both were load-bearing:
+
+    * **A source that fails once is dropped for the rest of the run.** An endpoint
+      that is down is down for every query, and finding that out costs a request
+      -- a live `snippet_search` took 283 seconds to report that Asta's backend
+      had refused a connection. The check is racy under concurrency, in the
+      benign direction: the calls already in flight when the first failure lands
+      still run, and nothing after them does.
+    * **The budget stops the tail.** Workers check it as they start, so a spent
+      budget means the queued items return "not attempted" rather than being
+      cancelled mid-request. Cancelling would leave sockets open and lose hits
+      that had already been paid for.
+
+    Results come back in submission order so the caller's merge is deterministic.
+    """
+    work: list[tuple[int, str, str, Any, str]] = []
+    for q_index, query in enumerate(queries):
+        for name, client in tier1:
+            for verb in ("snippet_search", "paper_search"):
+                work.append((q_index, query, name, client, verb))
+
+    dropped: set[tuple[str, str]] = set()
+    attempted_queries: set[int] = set()
+    total = len(work)
+
+    def one(item: tuple[int, str, str, Any, str]) -> dict[str, Any]:
+        q_index, query, name, client, verb = item
+        base = {"source": name, "verb": verb, "query": query, "hits": [], "error": None}
+        if (name, verb) in dropped or budget.spent:
+            return {**base, "skipped": True}
+        attempted_queries.add(q_index)
+        _progress(f"stage 1: {name}.{verb} q{q_index + 1}/{len(queries)}")
+        try:
+            hits = getattr(client, verb)(query, limit=per_query)
+        except GradError as exc:
+            dropped.add((name, verb))
+            _progress(f"stage 1: {name}.{verb} failed; not retried this run")
+            return {**base, "error": f"{name}.{verb}: {exc}"}
+        _progress(f"stage 1: {name}.{verb} returned {len(hits)}")
+        return {**base, "hits": hits}
+
+    if jobs <= 1 or total <= 1:
+        results = [one(item) for item in work]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(jobs, total), thread_name_prefix="grad-funnel"
+        ) as pool:
+            results = list(pool.map(one, work))
+    return results, dropped, len(attempted_queries)
+
+
 def _progress(message: str) -> None:
     """A line of progress on stderr, where a `--json` contract cannot see it.
 
@@ -92,6 +161,30 @@ def _progress(message: str) -> None:
     all three places, and that is how a slow stage got read as a broken tool.
     """
     print(message, file=sys.stderr, flush=True)
+
+
+def disabled_tier1(cfg: Any) -> frozenset[str]:
+    """Sources switched off in config, whatever asks for them.
+
+    Asta and `s2` ship switched off, and the reason is latency rather than
+    correctness -- both serve the Semantic Scholar corpus, and the corpus is
+    fine. Measured live, Asta answers a search in ~121 seconds and takes ~283
+    seconds to report that its own backend refused a connection; `s2`'s
+    anonymous pool is shared and near-permanently rate limited. Stage 0 turns
+    one question into six queries and each goes to two verbs, so either of them
+    is twenty minutes of discovery before anything is ranked, and every caller
+    -- the agent's Bash tool at 120s, a shell `timeout`, a person -- gives up
+    first. Papers with Code answers the same query in one to two seconds.
+
+    `_Budget` already bounds the damage, but bounding it still means spending
+    the whole stage-1 budget discovering that a door is slow, on every run. This
+    stops paying that at all, and it is a switch rather than a deletion: empty
+    `[retrieval] tier1_disabled` and both are back, unchanged.
+    """
+    raw = cfg.get("retrieval", "tier1_disabled", ()) or ()
+    if isinstance(raw, str):
+        raw = [raw]
+    return frozenset(str(name).lower() for name in raw)
 
 
 def tier1_clients(cfg: Any, override: str | None = None) -> list[tuple[str, Any]]:
@@ -118,13 +211,39 @@ def tier1_clients(cfg: Any, override: str | None = None) -> list[tuple[str, Any]
             f"unknown tier-1 source {chosen!r}",
             fix=f"one of: {', '.join(TIER1_SOURCES)}",
         )
+    disabled = disabled_tier1(cfg)
+    # Asked for by name, and switched off. Quietly substituting the default here
+    # would answer a question nobody asked: `--tier1 asta` is how you compare
+    # two retrievers, and a comparison that silently ran the same one twice is
+    # worse than one that refused.
+    if chosen in disabled:
+        raise UsageError(
+            f"tier-1 source {chosen!r} is switched off in config",
+            fix=(
+                f"remove {chosen!r} from [retrieval] tier1_disabled in config/grad.toml "
+                "to use it, or --tier1 pwc"
+            ),
+        )
     out: list[tuple[str, Any]] = []
-    if chosen in ("pwc", "all"):
+    if chosen in ("pwc", "all") and "pwc" not in disabled:
         out.append(("pwc", http.PapersWithCode(cfg)))
-    if chosen in ("asta", "both", "all"):
+    if chosen in ("asta", "both", "all") and "asta" not in disabled:
         out.append(("asta", http.Asta(cfg)))
-    if chosen in ("s2", "both", "all"):
+    if chosen in ("s2", "both", "all") and "s2" not in disabled:
         out.append(("s2", http.SemanticScholar(cfg)))
+    # `both` means the two Semantic Scholar doors, and both of them ship shut.
+    # Returning nothing would run the funnel with no tier 1 at all -- discovery
+    # silently downgraded to the local index, which `--local-only` already says
+    # explicitly and which nobody asking for `both` wanted.
+    if not out and chosen != "none":
+        raise UsageError(
+            f"--tier1 {chosen} selects only sources that are switched off "
+            f"({', '.join(sorted(disabled))})",
+            fix=(
+                "--tier1 pwc, or empty [retrieval] tier1_disabled in config/grad.toml. "
+                "--local-only searches the papers already ingested."
+            ),
+        )
     return out
 
 
@@ -133,7 +252,10 @@ def _search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--tier1",
         choices=list(TIER1_SOURCES),
-        help="which discovery client to use (default from config; pwc unless changed)",
+        help=(
+            "which discovery client to use (default from config; pwc unless changed). "
+            "asta and s2 are switched off -- see [retrieval] tier1_disabled"
+        ),
     )
     p.add_argument("--top", type=int, help="how many to return (default from config)")
     p.add_argument("--candidates", type=int, help="stage-1 candidate ceiling")
@@ -144,6 +266,14 @@ def _search_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-local", action="store_true", help="tier 1 only: discovery")
     p.add_argument("--no-citations", action="store_true", help="skip citation-graph expansion")
     p.add_argument("--full", action="store_true", help="include full snippets in the output")
+    p.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "stage-1 requests in flight at once (default from [execution] default_jobs). "
+            "Six expanded queries against two verbs is twelve round trips."
+        ),
+    )
 
 
 @cli.command("search", "run the funnel end to end", setup=_search_args)
@@ -183,38 +313,32 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     if tier1:
         per_query = max(5, ceiling // max(1, len(queries) * 2 * len(tier1)))
         budget = _Budget(float(cfg.get("retrieval", "stage1_budget_s", 300)))
-        #: `(source, verb)` pairs that have already failed once. See `_Budget`.
-        dropped: set[tuple[str, str]] = set()
-        searched = 0
-        for query in queries:
-            if budget.spent:
-                break
-            searched += 1
-            for name, client in tier1:
-                for verb in ("snippet_search", "paper_search"):
-                    if (name, verb) in dropped or budget.spent:
-                        continue
-                    _progress(f"stage 1: {name}.{verb} q{searched}/{len(queries)}")
-                    try:
-                        hits = getattr(client, verb)(query, limit=per_query)
-                    except GradError as exc:
-                        # Dropped for the rest of the run, not merely skipped for
-                        # this query. A tier-1 endpoint that is down is down for
-                        # every query, and finding that out costs a *request* --
-                        # a live snippet_search took 283 seconds to report that
-                        # Asta's own backend had refused a connection, so trying
-                        # it once per expanded query spent 28 minutes learning
-                        # the same thing six times and got the run killed before
-                        # the stages that were working could return anything.
-                        dropped.add((name, verb))
-                        trace.setdefault("warnings", []).append(f"{name}.{verb}: {exc}")
-                        upstream_failures.append(f"{name}.{verb}: {exc}")
-                        _progress(f"stage 1: {name}.{verb} failed; not retried this run")
-                        continue
-                    rankings.append(hits)
-                    _progress(f"stage 1: {name}.{verb} returned {len(hits)}")
-                    for hit in hits:
-                        candidates.setdefault(hit["id"], hit)
+        jobs = args.jobs if args.jobs is not None else int(cfg.get("execution", "default_jobs", 4))
+        if jobs < 1:
+            # Refused rather than clamped. `_discover` reads `jobs <= 1` as
+            # "serial", so a configured 0 or -1 ran and looked like it worked --
+            # and a `--jobs 0` typed on the command line meant the opposite of
+            # what anyone typing it intended.
+            raise UsageError(
+                f"--jobs must be at least 1, not {jobs}",
+                fix="drop the flag for the configured default, or set [execution] default_jobs",
+            )
+        found, dropped, searched = _discover(
+            queries, tier1, per_query=per_query, budget=budget, jobs=jobs
+        )
+        for item in found:
+            if item["error"]:
+                trace.setdefault("warnings", []).append(item["error"])
+                upstream_failures.append(item["error"])
+                continue
+            # Merged in *work-item order*, not completion order. `setdefault`
+            # keeps the first row seen for an id, so merging as results arrive
+            # would make which copy of a paper's metadata survives depend on
+            # which endpoint happened to answer first -- a funnel whose output
+            # changed run to run for no reason anyone could see.
+            rankings.append(item["hits"])
+            for hit in item["hits"]:
+                candidates.setdefault(hit["id"], hit)
         # Both caps are reported rather than left to be inferred from a thin
         # result set: a funnel that quietly searched two of six queries looks
         # exactly like a corpus that had little to say.
@@ -233,6 +357,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             "queries_searched": searched,
             "queries": len(queries),
             "dropped": sorted(f"{n}.{v}" for n, v in dropped),
+            "jobs": jobs,
             "seconds": round(budget.elapsed, 1),
         }
         if not args.no_citations and not budget.spent:
@@ -305,7 +430,9 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             raise UpstreamError(
                 "every retrieval call failed, so the search returned nothing: "
                 + "; ".join(dict.fromkeys(upstream_failures)),
-                fix=_tier1_fix(trace["stages"]["1_sources"], upstream_failures),
+                fix=_tier1_fix(
+                    trace["stages"]["1_sources"], upstream_failures, disabled_tier1(cfg)
+                ),
             )
         return {
             "question": args.question,
@@ -388,7 +515,11 @@ def apply_rerank(pool: list[dict[str, Any]], scored: list[dict[str, Any]]) -> li
     ]
 
 
-def _tier1_fix(sources: list[str], failures: list[str] | None = None) -> str:
+def _tier1_fix(
+    sources: list[str],
+    failures: list[str] | None = None,
+    disabled: frozenset[str] | None = None,
+) -> str:
     """What to actually do when discovery is down, per source *and per failure*.
 
     This used to say "store a Semantic Scholar API key -- it is free", which
@@ -402,13 +533,29 @@ def _tier1_fix(sources: list[str], failures: list[str] | None = None) -> str:
     a live run failed with `ConnectionRefusedError` raised inside Asta's own
     backend, which no key affects. So the advice is now chosen by what the
     failures actually say rather than assumed.
+
+    `disabled` is the third round of the same lesson. Every branch below that
+    sends the reader to another tier-1 source has to know whether that source is
+    switched off, because `tier1_clients` refuses one that is -- and advice
+    whose next step is a usage error is exactly what the two paragraphs above
+    are about.
     """
     joined = " ".join(failures or [])
+    off = disabled or frozenset()
     local = "Meanwhile --local-only searches what is already ingested."
-    elsewhere = (
-        "python -m tools.paper_search search '<question>' --tier1 {} --json   "
-        '(or set [retrieval] tier1 = "{}" in config/grad.toml)'
-    )
+
+    def elsewhere(name: str) -> str:
+        """Point at another source, or at the switch that would allow it."""
+        if name in off:
+            return (
+                f"{name} serves the same literature more slowly and is switched off -- "
+                f'remove "{name}" from [retrieval] tier1_disabled in config/grad.toml '
+                "to try it"
+            )
+        return (
+            f"python -m tools.paper_search search '<question>' --tier1 {name} --json   "
+            f'(or set [retrieval] tier1 = "{name}" in config/grad.toml)'
+        )
     # The cause first where there is one, because a rate limit has a fix of its
     # own and it is not the same fix as an endpoint being down.
     if "rate-limited" in joined or "429" in joined:
@@ -422,18 +569,18 @@ def _tier1_fix(sources: list[str], failures: list[str] | None = None) -> str:
             return (
                 "retry -- discovery is rate limited, not broken. This catalogue is "
                 "anonymous, so there is no key that raises it; the same literature is "
-                "reachable more slowly through " + elsewhere.format("asta", "asta") + f". {local}"
+                "reachable more slowly through " + elsewhere("asta") + f". {local}"
             )
         return (
             "retry -- Semantic Scholar's anonymous pool is shared and its own keys are only "
             "issued to institutional addresses. Papers with Code is anonymous and answers in "
-            "about a second: " + elsewhere.format("pwc", "pwc") + f". {local}"
+            "about a second: " + elsewhere("pwc") + f". {local}"
         )
     if sources == ["pwc"]:
         return (
             "this catalogue is anonymous, so there is no key to add and nothing to "
             "configure -- it is down or unreachable. Retry, or reach the same literature "
-            "more slowly through " + elsewhere.format("asta", "asta") + f". {local}"
+            "more slowly through " + elsewhere("asta") + f". {local}"
         )
     if sources in (["s2"], ["asta"]):
         # Both doors onto the Semantic Scholar corpus point at the one that is
@@ -441,7 +588,7 @@ def _tier1_fix(sources: list[str], failures: list[str] | None = None) -> str:
         return (
             "Semantic Scholar's own API only issues keys to institutional addresses, and "
             "Asta answers in minutes rather than seconds. Papers with Code is anonymous and "
-            "answers in about a second: " + elsewhere.format("pwc", "pwc") + f". {local}"
+            "answers in about a second: " + elsewhere("pwc") + f". {local}"
         )
     return (
         "the message above is the service's own and names the endpoint that refused -- no "

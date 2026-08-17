@@ -19,10 +19,12 @@ from typing import Any
 from core import budget as budget_mod, jsonl, ledger_store as ls, paths
 from core.config import Config
 from core.errors import (
+    EXIT_CONCURRENCY,
     EXIT_EXPECTATION,
     EXIT_PREFLIGHT,
     EXIT_SPEND,
     EXIT_STALE_RUN,
+    ConfigError,
     GateRefusal,
 )
 from core.submission import Submission
@@ -197,24 +199,145 @@ def check_project_spend(project_id: str | None, estimate_usd: float) -> dict[str
 # gate 4: no stale uncollected run
 # ---------------------------------------------------------------------------
 def check_stale(cfg: Config, *, now: _dt.datetime | None = None) -> None:
+    """Refuse while an uncollected run is past its grace window.
+
+    The fix has to distinguish two populations, because one of them cannot take
+    the other's advice. A run that reached a backend has a handle and is
+    collectable. A run that never reached one has no handle, and `collect`
+    refuses it with `no_handle` -- so pointing every stale run at `collect` sent
+    exactly the runs that could not be collected to the one command that would
+    not work, and the only remaining exit was editing `runs.jsonl` by hand.
+    Those go to `ledger abandon` instead.
+    """
     stale = ls.stale_runs(cfg=cfg, now=now)
-    if stale:
-        ids = ", ".join(r.id for r in stale)
-        raise GateRefusal(
-            "stale_run",
-            (
-                f"{len(stale)} run(s) are past their collection window and still uncollected: {ids}. "
-                "Spend only becomes actual at collect time; if collection were optional, "
-                "the ceiling would be too."
-            ),
-            EXIT_STALE_RUN,
-            fix=f"python -m tools.jobs collect {stale[0].id} --json",
-            detail={"stale_run_ids": [r.id for r in stale]},
-        )
+    if not stale:
+        return
+    from core import submit as submit_lib  # noqa: PLC0415 - avoids an import cycle
+
+    unreached = [r for r in stale if not r.get("handle")]
+    ids = ", ".join(r.id for r in stale)
+    raise GateRefusal(
+        "stale_run",
+        (
+            f"{len(stale)} run(s) are past their collection window and still uncollected: {ids}. "
+            "Spend only becomes actual at collect time; if collection were optional, "
+            "the ceiling would be too."
+        ),
+        EXIT_STALE_RUN,
+        # The first run that can actually take the advice given, so a mixed batch
+        # names a command that works rather than the first id in the list.
+        fix=(
+            f'python -m tools.ledger abandon {unreached[0].id} --reason "..." --json  '
+            "# never reached a backend, so there is nothing to collect"
+            if unreached
+            else submit_lib.collect_command(stale[0])
+        ),
+        detail={
+            "stale_run_ids": [r.id for r in stale],
+            # Split out rather than left for the caller to re-derive: which of
+            # these is collectable and which is not is the whole of the decision.
+            "unreached_run_ids": [r.id for r in unreached],
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
-# all four, in order
+# gate 5: not too many in flight at once
+# ---------------------------------------------------------------------------
+def concurrency_ceiling(sub: Submission | None, cfg: Config) -> int:
+    """How many runs may be in flight: the spec's `[execution] max_concurrent`,
+    then `[execution] max_concurrent_runs`.
+
+    Per-spec because the right number is a property of the work: two ten-hour
+    training jobs is a different proposition from two two-minute evaluations, and
+    the spec is where the job describes itself. Bounded below at 1 -- a ceiling of
+    zero would refuse every submission, which is a configuration typo that reads
+    as the whole system being broken.
+    """
+    declared = (sub.execution.get("max_concurrent") if sub else None)
+    if declared is None:
+        declared = cfg.get("execution", "max_concurrent_runs", 2)
+    try:
+        # Via `float` first, so a fractional value is refused rather than
+        # truncated. `int(2.7)` is 2 and raises nothing, which made a ceiling
+        # typed as 2.7 mean 2 -- a number nobody wrote, arrived at silently, in
+        # the one place whose whole job is refusing to proceed on a number it
+        # does not trust.
+        exact = float(declared)
+    except (TypeError, ValueError):
+        exact = float("nan")
+    if not exact.is_integer():
+        raise ConfigError(
+            f"max_concurrent must be a whole number, not {declared!r}",
+            fix="fix [execution] max_concurrent in the spec, or max_concurrent_runs in config/grad.toml",
+        )
+    return max(1, int(exact))
+
+
+def check_concurrency(cfg: Config, *, sub: Submission | None = None) -> dict[str, Any]:
+    """Refuse when too many runs are already in flight.
+
+    **This is the gate that makes parallel submission safe rather than merely
+    possible**, and the argument is entirely about `check_stale`. That gate
+    refuses *every* later submission while *any* uncollected run is past its
+    window -- so each additional job in flight is another collection window open,
+    and one wedged backend takes every other job's successor down with it. Without
+    a ceiling, "submit things in parallel" and "exit 7 is the normal state" are
+    the same sentence.
+
+    It is deliberately not folded into `check_stale`. They refuse for opposite
+    reasons: 7 means something has gone wrong with a run and needs clearing, 14
+    means nothing has gone wrong at all and you should wait. Giving them one exit
+    code would make "abandon it" look like the fix for a healthy system.
+
+    Smoke runs are counted. They are short, but they are real jobs on a real
+    backend holding a real collection window, and §6's argument about the smoke
+    carve-out not becoming the hole in the ceiling applies unchanged.
+    """
+    ceiling = concurrency_ceiling(sub, cfg)
+    live = ls.in_flight()
+    if len(live) < ceiling:
+        return {"in_flight": len(live), "ceiling": ceiling}
+    from core import submit as submit_lib  # noqa: PLC0415 - avoids an import cycle
+
+    # The oldest run that can actually be collected, not simply the oldest. A
+    # submitter killed between writing its in-flight record and receiving the
+    # backend's job id leaves a run with no handle, and `collect` refuses that
+    # one ("no_handle") -- so naming it here sends the reader to a command that
+    # cannot work on the run it names. `ledger abandon` is that run's exit, and
+    # it is the same distinction `cmd_abandon` makes in the other direction.
+    collectable = [r for r in live if r.get("handle")]
+    if collectable:
+        fix = submit_lib.collect_command(collectable[0])
+    else:
+        fix = (
+            f'python -m tools.ledger abandon {live[0].id} --reason "..." --json'
+            "   # none of these reached a backend, so none can be collected"
+        )
+    raise GateRefusal(
+        "too_many_in_flight",
+        (
+            f"{len(live)} run(s) are already in flight and the ceiling is {ceiling}: "
+            + ", ".join(r.id for r in live[:4])
+            + ". Every run in flight holds a collection window open, and one that goes "
+            "stale refuses every later submission (exit 7)."
+        ),
+        EXIT_CONCURRENCY,
+        # The oldest, because it is the one most likely to be finished and is
+        # certainly the one closest to going stale.
+        fix=fix,
+        detail={
+            "in_flight": [r.id for r in live],
+            "ceiling": ceiling,
+            "source": "spec [execution] max_concurrent"
+            if sub is not None and sub.execution.get("max_concurrent") is not None
+            else "config [execution] max_concurrent_runs",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# all five, in order
 # ---------------------------------------------------------------------------
 def check_submit(
     sub: Submission,
@@ -239,6 +362,11 @@ def check_submit(
     spend = check_spend(estimate, cfg, now=now)
     project_state = check_project_spend(project, estimate)
     check_stale(cfg, now=now)
+    # Last, and after the stale check on purpose. A stale run is *also* in flight,
+    # so a caller with one wedged job would otherwise be told "too many in flight,
+    # wait" -- advice that never becomes true, for a situation whose actual fix is
+    # to collect or abandon the stale one. 7 first, then 14.
+    concurrency = check_concurrency(cfg, sub=sub)
     return {
         "submission_hash": sub.hash(),
         "preflight": {"checks": list(record.get("checks", {})), "verified_at": record.get("verified_at")},
@@ -261,6 +389,7 @@ def check_submit(
             }
         ),
         "estimate_usd": estimate,
+        "concurrency": concurrency,
     }
 
 

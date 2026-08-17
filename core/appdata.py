@@ -87,6 +87,23 @@ def cache_dir() -> Path:
     return app_dir() / "cache"
 
 
+def experiments_dir() -> Path:
+    """The cross-workspace experiment archive (see `core/experiments.py`).
+
+    Here rather than under a workspace, and that is the whole point of it: a
+    workspace's `ledger/runs.jsonl` answers "what did *this* project do", and
+    nothing answered "have I run this before" across the two or three workspaces
+    a person accumulates. This directory is the one place in Grad that is
+    deliberately global to the user.
+
+    It is emphatically *not* a second source of truth. Each workspace's ledger
+    stays authoritative for its own runs; this is a durable copy taken at the
+    moment a run becomes terminal, so that deleting a workspace loses the
+    working files and not the record that the experiment happened.
+    """
+    return app_dir() / "experiments"
+
+
 def _slug(value: str) -> str:
     """A readable, filesystem-safe stem. Never the whole name -- see `_key`."""
     keep = "".join(c if c.isalnum() or c in "._-" else "-" for c in value)
@@ -120,6 +137,22 @@ def _key(root: Path) -> str:
     text = str(resolved).casefold()
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
     return f"{_slug(resolved.name)}-{digest}"
+
+
+def workspace_key(root: Path | None = None) -> str:
+    """The stable identifier for a workspace, for callers outside this module.
+
+    `core/experiments.py` needs it to name an experiment, because a run id is
+    only unique within one ledger and the archive spans several. Public rather
+    than reaching for `_key`: a second caller is what turns a private helper
+    into an interface, and the resolution rules in `_key` are exactly the part
+    an outside caller must not reimplement.
+    """
+    if root is None:
+        from core import paths  # noqa: PLC0415 - see `workspace_state_dir`
+
+        root = paths.root()
+    return _key(Path(root))
 
 
 def workspace_state_dir(root: Path | None = None) -> Path:

@@ -435,6 +435,35 @@ def test_a_new_turn_clears_the_tail_rather_than_stacking_onto_it(rendered):
         assert "the first turn" not in html_of(client)
 
 
+def test_the_transcript_overflows_the_scroller_rather_than_its_own_children(rendered):
+    """Both halves of the transcript must refuse to shrink.
+
+    The scroller is a flex column, so the settled transcript and the streaming
+    tail are flex items, and `kit.column` gives them `min-height: 0` -- correct
+    for a nested scroll container, and the exact property that lets a flex item
+    shrink below its own content. A conversation taller than the pane was
+    therefore not scrolled but *compressed*: the two boxes shrank to fit, their
+    messages spilled out of them, and one turn painted over another with no
+    scrollbar to suggest anything had overflowed. Moving a tile around was how
+    it kept appearing and disappearing -- that is what changes the pane height.
+    """
+    client, _ = rendered(["chat"])
+    with client:
+        scroller = next(
+            e for e in client.elements.values() if e._props.get("id") == "grad-transcript"
+        )
+        children = scroller.default_slot.children
+        assert len(children) == 2, "the settled transcript and the streaming tail"
+        for child in children:
+            assert child._style.get("flex") == "0 0 auto", (
+                "a shrinkable transcript overlaps its own messages when the pane is short"
+            )
+        # The scroller itself still takes the leftover height and owns the
+        # scrollbar -- that is where the overflow was supposed to go all along.
+        assert scroller._style.get("flex") == "1 1 auto"
+        assert scroller._style.get("overflow-y") == "auto"
+
+
 def test_the_status_line_names_the_call_in_flight(rendered):
     """A spinner says something is happening; naming the command says a
     40-minute job is running and which one.

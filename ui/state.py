@@ -630,6 +630,26 @@ class Workspace:
         self.show_reasoning = not self.show_reasoning
         return self.show_reasoning
 
+    def cycle_effort(self) -> str:
+        """Step the agent's reasoning effort round the ring. Returns the new level.
+
+        Takes effect on the next turn rather than now, and the notice says so.
+        The SDK fixes effort when a client is built and offers no request to
+        change it, so applying this immediately would mean tearing down the
+        conversation and resuming it while the user is only browsing the levels
+        -- see `core/effort.py` and `Session.apply_effort`.
+        """
+        from core import effort  # noqa: PLC0415 - keeps app state off the import path
+
+        level = effort.set_current(effort.cycle())
+        session = self.session
+        running = session is not None and session.client_effort not in (None, level)
+        self.say(
+            f"reasoning effort: {level}"
+            + (" — takes effect on the next turn" if running else "")
+        )
+        return level
+
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""
         self.notice = message

@@ -6,6 +6,10 @@ This CLI writes predictions and verdicts. It deliberately cannot write results:
 those come from `jobs.py collect` / `gpu.py collect`, because a result the model
 types from memory at the end of a long session is the failure mode the whole
 document is built to avoid.
+
+`abandon` is the one other terminal record it writes, and it is not an exception
+to that rule: it closes a run that produced nothing, at zero, with a reason --
+the case no `collect` can reach because the run never got as far as a backend.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from core import jsonl, ledger_store as ls, paths
+from core import budget, jsonl, ledger_store as ls, paths, submit as submit_lib
 from core.cli import Cli, main
 from core.errors import EXIT_USAGE, GradError, NotFound, UsageError
 
@@ -51,6 +55,9 @@ def _expect_args(p: argparse.ArgumentParser) -> None:
         "--comparability",
         default="",
         help="how our setup differs from the basis. REQUIRED for absolute predictions",
+    )
+    p.add_argument(
+        "--project", help="project this prediction belongs to (defaults to the current one; §15)"
     )
     p.add_argument("--confidence", choices=list(ls.CONFIDENCES), default="medium")
 
@@ -103,6 +110,14 @@ def cmd_expect(args: argparse.Namespace) -> dict[str, Any]:
         "id": ls.new_id("exp"),
         "task": args.task,
         "created_at": ls.now_iso(),
+        # The §15 dimension, stamped the way a run record is stamped. Until this
+        # existed an expectation could only be attributed to a project through
+        # whatever run eventually bound it -- so an *open* prediction belonged to
+        # nobody, and the one place that most wants to list them (a project's
+        # EXPECTATIONS.md) could not see the ones not yet tested. Additive:
+        # records without it fall back to their binding run, in
+        # `core/projects.py:_expectation_project`.
+        "project": budget.resolve(getattr(args, "project", None)) or budget.UNASSIGNED,
         "quantity": args.quantity,
         "claim": args.claim or _synthesise_claim(args),
         "predicted": {"low": args.low, "high": args.high, "direction": args.direction},
@@ -232,7 +247,68 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
         "judged_at": ls.now_iso(),
     }
     ls.append_run_event(record)
+    # Re-snapshot the archive: `finish` filed this run before it had been judged,
+    # and a judgement is the half of a result that a program cannot supply. An
+    # archive holding every deviation and no verdict would be a record of what was
+    # measured with the part that says what it meant left out.
+    submit_lib.archive_quietly(args.run_id)
     return {"verdict": record, "remaining_unjudged": len(ls.run(args.run_id).unjudged_deviations())}
+
+
+# ---------------------------------------------------------------------------
+def _abandon_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("run_id")
+    p.add_argument(
+        "--reason",
+        required=True,
+        help="why this run is being written off. Recorded on the ledger, not just printed",
+    )
+
+
+@cli.command(
+    "abandon",
+    "write off an in-flight run that never reached hf/kaggle/gpu",
+    setup=_abandon_args,
+)
+def cmd_abandon(args: argparse.Namespace) -> dict[str, Any]:
+    """The one way out of the dead end the §6 stale gate would otherwise be.
+
+    A submitter killed between writing its in-flight record and receiving the
+    backend's job id leaves a run that cannot be collected -- there is no id to
+    poll -- and that goes stale and then refuses every later submission on every
+    backend. `collect` cannot clear it and neither can anything else here, so
+    the escape hatch is this command and `check_stale` names it.
+
+    Living here rather than in `jobs.py` / `kaggle.py` / `gpu.py` because the
+    run in question reached none of them; asking the agent to pick the right
+    backend CLI for a run that has no backend is asking it to guess.
+
+    It is not the general "stop this job" button. A run that *did* reach a
+    platform has a handle, and `submit.abandon` refuses it: that one is still
+    spending, and `collect` (or the platform's own cancel) is its exit. This
+    writes results-free, $0 terminal records only.
+    """
+    record = submit_lib.abandon(args.run_id, reason=args.reason)
+    bound = ls.run(args.run_id).get("expectation_id")
+    remaining = ls.stale_runs()
+    unreached = [r for r in remaining if not r.get("handle")]
+    return {
+        "run": record,
+        # Reported, not released. `consumed_expectation_ids` has one spelling of
+        # "spent" and §7 depends on it meaning the same thing at every binding
+        # site, so a retry takes a fresh prediction -- and saying so here saves
+        # the agent a round trip into exit 5 to find out.
+        "expectation_still_bound": bound,
+        "stale_runs_remaining": [r.id for r in remaining],
+        "next": (
+            f'python -m tools.ledger abandon {unreached[0].id} --reason "..." --json'
+            if unreached
+            else submit_lib.collect_command(remaining[0])
+            if remaining
+            else "python -m tools.ledger expect --task <task> --quantity <q> ... --json  "
+            "# this run's expectation stays bound; a retry needs a new one"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

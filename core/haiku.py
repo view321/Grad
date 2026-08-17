@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import Any, Callable
 
 from core import credentials, paths, quota_log
@@ -85,35 +84,16 @@ useless answer.
 """
 
 
-NOT_AUTHENTICATED = (
-    "the funnel's Haiku stages have no subscription credentials, so the model was "
-    "never reached. The agent runs this CLI over Bash, and that hop strips "
-    "CLAUDE_CODE_OAUTH_TOKEN from the environment -- so the token has to come from "
-    "the credential store, not from the environment."
-)
-AUTH_FIX = (
-    "claude setup-token   # mint a token, then store it where the hop cannot strip it:\n"
-    "python -m tools.jobs credential set claude_oauth_token"
-)
+# Shared with `core/mutate.py`, which has exactly the same problem: an SDK client
+# inside a tool CLI the agent reached over Bash. The wording lives in
+# `core/credentials.py` so the two cannot drift into saying different things
+# about the same failure.
+NOT_AUTHENTICATED = credentials.NOT_AUTHENTICATED
+AUTH_FIX = credentials.AUTH_FIX
 
 
 def _credentials_env() -> dict[str, str]:
-    """Subscription credentials for the CLI this stage spawns.
-
-    The ambient variable comes first, so running a funnel stage by hand in a
-    terminal keeps working with no setup at all. The credential store is the
-    fallback that makes the same command work when the *agent* is the one
-    running it -- see `credentials.CLAUDE_TOKEN` for why the two differ.
-
-    `ClaudeAgentOptions.env` merges over the inherited environment rather than
-    replacing it, so this adds one variable and takes nothing away.
-    """
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if not token:
-        token = credentials.get(credentials.CLAUDE_TOKEN, required=False)
-    if not token:
-        raise ConfigError(NOT_AUTHENTICATED, fix=AUTH_FIX)
-    return {"CLAUDE_CODE_OAUTH_TOKEN": token}
+    return credentials.sdk_env()
 
 
 def _validate_expansion(args: dict[str, Any]) -> str | None:

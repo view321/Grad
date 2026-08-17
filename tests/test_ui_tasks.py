@@ -413,17 +413,36 @@ def test_the_call_list_is_bounded_so_the_window_is_not_a_second_transcript():
     assert len(models.agent_calls_model(FakeSession(settled=settled))) == models.AGENT_CALLS
 
 
-def test_the_two_lists_are_counted_apart():
+@pytest.mark.asyncio
+async def test_the_two_lists_are_counted_apart(workspace):
     """A task is a process this app started and can stop; a call is one the
     agent made and only the agent can stop. Merging them would imply a STOP
-    button that does not exist."""
+    button that does not exist.
+
+    Async, like every other test that starts one, and that is now load-bearing:
+    `tasks.start` hands `_run` to the *running* loop, and it says so rather than
+    conjuring a loop nobody runs -- which used to leave a task registered, drawn
+    as running, and never executed.
+    """
     from ui import models, tasks
 
-    tasks.start("a wiki rebuild", "tools.wiki", "map")
-    model = models.tasks_model(agent=models.agent_calls_model(FakeSession(blocks=[call("tu_1")])))
-    assert model["running"] == 1
-    assert model["agent_running"] == 1
-    assert [r["id"] for r in model["rows"]] != [c["id"] for c in model["agent"]]
+    name = script(workspace, "grad_slow", """
+        import time
+        time.sleep(30)
+    """)
+    task = tasks.start("a wiki rebuild", name)
+    try:
+        model = models.tasks_model(
+            agent=models.agent_calls_model(FakeSession(blocks=[call("tu_1")]))
+        )
+        assert model["running"] == 1
+        assert model["agent_running"] == 1
+        assert [r["id"] for r in model["rows"]] != [c["id"] for c in model["agent"]]
+    finally:
+        # Stopped rather than left to the registry reset: `tasks.reset()` empties
+        # a dict, it does not kill a sleeping process.
+        await tasks.cancel(task.id)
+        await tasks.drained(task)
 
 
 def test_the_tasks_model_without_a_session_is_unchanged():

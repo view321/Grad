@@ -131,6 +131,22 @@ def test_a_healthy_stage_still_returns_its_payload(monkeypatch):
 # ---------------------------------------------------------------------------
 # what a rate-limited stage 1 says
 # ---------------------------------------------------------------------------
+def _all_sources_enabled(workspace):
+    """Undo `tier1_disabled` for the tests that are about the doors themselves.
+
+    Asta and s2 ship switched off for latency, and `tier1_clients` refuses one
+    that is -- which is right for a funnel run and wrong for a test asking what
+    each door says when it is rate limited. `tests/test_asta.py` covers the
+    switch; these cover the messages behind it.
+    """
+    from core import config as config_mod
+
+    path = workspace / "config" / "grad.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[retrieval]\ntier1_disabled = []\n", encoding="utf-8")
+    config_mod._cache.clear()
+
+
 @pytest.mark.parametrize(
     "source, client, expected_fix",
     [
@@ -148,6 +164,7 @@ def test_a_search_whose_every_call_failed_is_a_failure_not_an_empty_result(
     from core import http
     from tools import paper_search
 
+    _all_sources_enabled(workspace)
     monkeypatch.setattr(http, client, lambda cfg: _RateLimited())
 
     code = paper_search.cli.run(
@@ -172,6 +189,7 @@ def test_the_s2_dead_end_does_not_recommend_a_key_that_cannot_be_obtained(
     from core import http
     from tools import paper_search
 
+    _all_sources_enabled(workspace)
     monkeypatch.setattr(http, "SemanticScholar", lambda cfg: _RateLimited())
     paper_search.cli.run(
         ["search", "efficient optimizers", "--tier1", "s2",

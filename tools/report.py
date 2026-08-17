@@ -866,7 +866,7 @@ def _render_bib(entries: dict[str, dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 @cli.command("check", "the gate: refuses on an unresolved claim or an unjudged run", setup=_project_arg)
 def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
-    """Four rules, in order. It refuses; it does not warn."""
+    """Five rules, in order. It refuses; it does not warn."""
     project_id = _project(args)
     files = report_lib.paths_for(project_id)
     if not files["tex"].exists():
@@ -910,6 +910,9 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     # Rule 4. Which code produced the numbers -- see `check_code_versions`.
     findings += report_lib.check_code_versions(report_lib.cited_run_ids(tex, claims))
 
+    # Rule 5. How many samples each number rests on -- see `check_replication`.
+    findings += report_lib.check_replication(tex, claims)
+
     findings += report_lib.check_latex(tex)
 
     payload = {
@@ -921,7 +924,7 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
         "findings": findings,
         "by_rule": {
             rule: sum(1 for f in findings if f.get("rule") == rule)
-            for rule in ("claims", "citations", "unjudged", "latex", "version")
+            for rule in ("claims", "citations", "unjudged", "latex", "version", "replication")
         },
     }
     if findings:

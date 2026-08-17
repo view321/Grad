@@ -465,10 +465,22 @@ def test_both_tier_one_clients_answer_in_the_same_shape(workspace, transport, mo
     assert asta_row["source"] != s2_row["source"]
 
 
+def _config(workspace, text: str):
+    path = workspace / "config" / "grad.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    # `reload=True` is the contract: it skips the cache and overwrites this
+    # path's entry. Reaching into `_cache` as well was a test depending on a
+    # private attribute to do what the public argument already does.
+    return config_mod.load(path, reload=True)
+
+
 def test_the_tier_one_selector_builds_the_clients_the_config_names(workspace):
+    """The name -> clients mapping, with nothing switched off. `tier1_disabled`
+    filters this; it does not change what each name means."""
     from tools import paper_search
 
-    cfg = config_mod.load(reload=True)
+    cfg = _config(workspace, "[retrieval]\ntier1_disabled = []\n")
     assert [n for n, _ in paper_search.tier1_clients(cfg, "pwc")] == ["pwc"]
     assert [n for n, _ in paper_search.tier1_clients(cfg, "asta")] == ["asta"]
     assert [n for n, _ in paper_search.tier1_clients(cfg, "s2")] == ["s2"]
@@ -486,6 +498,74 @@ def test_an_unknown_tier_one_source_lists_the_real_ones(workspace):
     with pytest.raises(UsageError) as exc:
         paper_search.tier1_clients(config_mod.load(reload=True), "scholar")
     assert "pwc" in (exc.value.fix or "")
+
+
+# ---------------------------------------------------------------------------
+# both Semantic Scholar doors, switched off for latency
+# ---------------------------------------------------------------------------
+def test_the_semantic_scholar_doors_ship_switched_off(workspace):
+    """121s per search against 1-2s, times six expanded queries by two verbs.
+    The corpus is fine; the wait is not, and every caller gives up before it
+    ends."""
+    from tools import paper_search
+
+    cfg = config_mod.load(reload=True)
+    assert paper_search.disabled_tier1(cfg) == {"asta", "s2"}
+    # The default is unaffected -- it never named them.
+    assert [n for n, _ in paper_search.tier1_clients(cfg)] == ["pwc"]
+    # ... and `all` quietly narrows to what is left, which is what asking for
+    # "everything available" should mean.
+    assert [n for n, _ in paper_search.tier1_clients(cfg, "all")] == ["pwc"]
+
+
+def test_a_source_asked_for_by_name_is_refused_rather_than_substituted(workspace):
+    """Falling back to pwc here would answer a question nobody asked: `--tier1
+    asta` is how two retrievers get compared, and a comparison that silently ran
+    the same one twice is worse than one that declined."""
+    from core.errors import UsageError
+    from tools import paper_search
+
+    cfg = config_mod.load(reload=True)
+    for name in ("asta", "s2"):
+        with pytest.raises(UsageError) as exc:
+            paper_search.tier1_clients(cfg, name)
+        assert "tier1_disabled" in (exc.value.fix or ""), "the error says how to undo it"
+
+
+def test_both_selects_only_disabled_sources_and_says_so(workspace):
+    """`both` is asta+s2 and both are off, so it selects nothing. Returning an
+    empty list would run the funnel with no tier 1 at all -- discovery silently
+    downgraded to the local index."""
+    from core.errors import UsageError
+    from tools import paper_search
+
+    with pytest.raises(UsageError) as exc:
+        paper_search.tier1_clients(config_mod.load(reload=True), "both")
+    assert "switched off" in str(exc.value)
+    assert "--local-only" in (exc.value.fix or "")
+
+
+def test_emptying_the_list_gives_them_back(workspace):
+    """A switch, not a deletion: one line in config and nothing else changes."""
+    from tools import paper_search
+
+    cfg = _config(workspace, "[retrieval]\ntier1_disabled = []\n")
+    assert paper_search.disabled_tier1(cfg) == frozenset()
+    assert [n for n, _ in paper_search.tier1_clients(cfg, "asta")] == ["asta"]
+
+
+def test_advice_never_points_at_a_source_that_is_switched_off(workspace):
+    """`_tier1_fix`'s whole subject is advice that can actually be followed. It
+    used to send a failing pwc run to `--tier1 asta`, which `tier1_clients` now
+    refuses -- so the next step would have been a usage error."""
+    from tools import paper_search
+
+    off = paper_search.disabled_tier1(config_mod.load(reload=True))
+    fix = paper_search._tier1_fix(["pwc"], ["pwc.paper_search: boom"], off)
+    assert "--tier1 asta" not in fix
+    assert "tier1_disabled" in fix, "it names the switch instead"
+    # With them on, the original advice is unchanged.
+    assert "--tier1 asta" in paper_search._tier1_fix(["pwc"], ["boom"], frozenset())
 
 
 # ---------------------------------------------------------------------------

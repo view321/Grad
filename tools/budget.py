@@ -33,9 +33,9 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from core import budget, paths
+from core import budget, paths, projects
 from core.cli import Cli, main
-from core.errors import EXIT_PROJECT_BUDGET, UsageError
+from core.errors import EXIT_PROJECT_BUDGET, GradError, UsageError
 
 cli = Cli(
     "grad-budget",
@@ -109,9 +109,42 @@ def cmd_new(args: argparse.Namespace) -> dict[str, Any]:
     )
     if args.use:
         budget.set_current(args.id)
+    # The memory directory is created with the project rather than on first use.
+    # A project whose notes begin the day someone remembers the command begins
+    # them after the decisions worth recording have already been made -- and the
+    # empty scaffold is itself the prompt to write in it.
+    #
+    # Guarded, because the project record has already been written by the line
+    # above. A failure to scaffold must not fail the command that created the
+    # project: that would report an error for a project that now exists, and the
+    # obvious retry -- run `new` again -- hits "already exists". `project init`
+    # is idempotent and is the fix.
+    try:
+        memory = projects.scaffold(args.id)
+        projects.sync(args.id)
+        memory_error = None
+    except (GradError, OSError) as exc:
+        memory = {"dir": str(projects.resolve_dir(args.id)), "created": []}
+        memory_error = f"{type(exc).__name__}: {exc}"
     return {
         "project": record,
         "current": budget.current_project(),
+        "memory_dir": memory["dir"],
+        "memory_files": memory["created"],
+        "memory_error": memory_error,
+        # A project with no ceilings bounds nothing, and every gate that reads
+        # one passes silently. Said here because this is the only moment anyone
+        # is looking at the allocation, and a blank meter reads like a project
+        # with headroom rather than one with no ceiling at all.
+        "warning": (
+            None
+            if record.get("budget")
+            else (
+                f"project {args.id!r} has no ceilings, so nothing bounds its spend, its "
+                "tokens or its credits. Set them with `python -m tools.budget raise "
+                f"--project {args.id} --gpu-usd <n> --quota-tokens <n> --credits-usd <n> --json`"
+            )
+        ),
         "next": f"python -m tools.budget use {args.id} --json" if not args.use else None,
     }
 

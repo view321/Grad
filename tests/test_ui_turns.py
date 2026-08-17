@@ -250,3 +250,98 @@ class _FakeAssistant:
 class _FakeTextBlock:
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+# ---------------------------------------------------------------------------
+# close racing start
+# ---------------------------------------------------------------------------
+class _SlowConnectClient:
+    """A client whose `__aenter__` takes as long as it is told to.
+
+    The SDK's connect is not safe against a concurrent disconnect -- it comes
+    back holding a query built around a transport the disconnect already nulled.
+    The bug this models: NiceGUI's disconnect handler fired *during* the first,
+    slowest connect (a cold CLI spawn) and closed the client mid-`__aenter__`.
+    """
+
+    def __init__(self) -> None:
+        self.proceed = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.exited_after_enter: bool | None = None
+        self._enter_done = False
+
+    async def __aenter__(self):
+        self.entered.set()
+        await self.proceed.wait()
+        self._enter_done = True
+        return self
+
+    async def __aexit__(self, *_):
+        # The property under test: by the time close reaches this client, its
+        # connect has finished. Closing a half-connected client is exactly the
+        # interleaving that corrupted the SDK's internals.
+        self.exited_after_enter = self._enter_done
+        return False
+
+
+async def test_a_close_during_a_slow_connect_waits_for_the_connect(monkeypatch):
+    """A disconnect landing mid-spawn must not pull the client apart."""
+    import claude_agent_sdk
+    import agent as agent_mod
+
+    made: list[_SlowConnectClient] = []
+
+    def make_client(options=None):
+        client = _SlowConnectClient()
+        made.append(client)
+        return client
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", make_client)
+    monkeypatch.setattr(agent_mod, "preflight_environment", lambda: {})
+    monkeypatch.setattr(agent_mod, "build_options", lambda cfg, **_: object())
+
+    session = app.Session("race")
+    starting = asyncio.create_task(session.start())
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if made:
+            break
+    assert made, "the start task never built a client"
+    await asyncio.wait_for(made[0].entered.wait(), timeout=5)
+
+    closing = asyncio.create_task(session.close())
+    # Give the close every chance to run early; the lock is what stops it.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert made[0].exited_after_enter is None, "close ran inside the connect"
+
+    made[0].proceed.set()
+    await asyncio.wait_for(starting, timeout=5)
+    await asyncio.wait_for(closing, timeout=5)
+    assert made[0].exited_after_enter is True
+    assert session.client is None
+
+
+async def test_a_release_waits_out_a_socket_blip(monkeypatch):
+    """`_release_when_gone`: a socket that comes back keeps its session."""
+    monkeypatch.setattr(app, "RELEASE_GRACE_S", 0.05)
+
+    class Client:
+        has_socket_connection = False
+
+    released: list[bool] = []
+
+    class FakeSession:
+        async def release(self) -> None:
+            released.append(True)
+
+    client = Client()
+    app._release_when_gone(client, FakeSession())
+    client.has_socket_connection = True  # the page reconnected inside the grace
+    await asyncio.sleep(0.2)
+    assert released == [], "a reconnected client lost its session anyway"
+
+    client.has_socket_connection = False
+    app._release_when_gone(client, FakeSession())
+    await asyncio.sleep(0.2)
+    assert released == [True], "a client that stayed gone was never released"

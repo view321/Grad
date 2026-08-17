@@ -808,6 +808,11 @@ def test_the_stamp_cannot_be_overridden_by_a_backend(monkeypatch):
         def hash(self) -> str:
             return "h" * 12
 
+        def resolved(self) -> dict:
+            # The record stores the resolved document beside its digest, so the
+            # archive can re-derive the hash with no workspace present.
+            return {"schema": 1, "entrypoint": "train.py"}
+
         def estimated_cost_usd(self) -> float:
             return 1.0
 
@@ -843,6 +848,11 @@ def test_submitted_runs_carry_the_stamp(monkeypatch):
 
         def hash(self) -> str:
             return "h" * 12
+
+        def resolved(self) -> dict:
+            # The record stores the resolved document beside its digest, so the
+            # archive can re-derive the hash with no workspace present.
+            return {"schema": 1, "entrypoint": "train.py"}
 
         def estimated_cost_usd(self) -> float:
             return 1.0

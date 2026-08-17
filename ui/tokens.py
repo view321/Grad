@@ -569,7 +569,27 @@ def _data() -> str:
 
 def _chat() -> str:
     return """
-.grad-msg { padding: 9px 14px; }
+/* `content-visibility` is here for the composer, which is nowhere near it.
+ *
+ * The textarea autogrows, and Quasar spells that: set `height: 1px`, read
+ * `scrollHeight`, put the height back. The write dirties the layout tree to the
+ * root and the read forces it clean again -- a full-document synchronous layout,
+ * on every keystroke, whose cost is the size of the transcript above it. A
+ * settled research conversation is tens of thousands of nodes once KaTeX has
+ * expanded the maths, and measured in the browser that is 30-40ms per key. At
+ * that point the typing is behind the typist by a whole word, which is the
+ * symptom this file is fixing and the composer is not where it was fixable.
+ *
+ * Skipping the layout of messages scrolled out of view roughly halves it. The
+ * `auto` in `contain-intrinsic-size` is the load-bearing half: it makes the
+ * browser remember each message's real height once it has been rendered once,
+ * so `scrollHeight` stays honest and `gradStickBottom` keeps pinning to a
+ * bottom that does not move underneath it. A bare placeholder height would make
+ * every scroll past an unrendered message a small jump.
+ *
+ * `auto` and not `hidden`: these have to render when scrolled to, and be found
+ * by the browser's own find-in-page. */
+.grad-msg { padding: 9px 14px; content-visibility: auto; contain-intrinsic-size: auto 140px; }
 .grad-msg .role { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.5;
                   text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 4px; }
 .grad-msg.user { display: flex; flex-direction: column; align-items: flex-end; }
@@ -647,10 +667,19 @@ def _chat() -> str:
     opacity: 1; border: 1.5px solid var(--grad-ink); }
 .grad-statusline .context.attention {
     opacity: 1; background: var(--grad-attention); color: var(--grad-ink); }
-/* The one part of the bar that is a control rather than a report, so it is the
-   one part drawn as one. */
-.grad-statusline .reasoning { flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
-                              padding: 1px 7px; letter-spacing: 0.08em; }
+/* The two parts of the bar that are controls rather than reports, so they are
+   the parts drawn as such. Effort sits to the left of the reasoning switch:
+   both are about the agent's thinking, and this one changes what it does while
+   that one changes what you see. */
+.grad-statusline .reasoning, .grad-statusline .effort {
+    flex: 0 0 auto; border: 1.5px solid var(--grad-ink);
+    padding: 1px 7px; letter-spacing: 0.08em; }
+/* Dashed until it is set, because "auto" is the absence of a choice rather than
+   a level -- a solid chip reading `effort auto` looks like a setting someone
+   picked. */
+.grad-statusline .effort { cursor: pointer; border-style: dashed; opacity: 0.62; }
+.grad-statusline .effort.set { border-style: solid; opacity: 1; }
+.grad-statusline .effort:hover { background: var(--grad-paper-raised); }
 .grad-chat.reasoning-on .grad-statusline .reasoning {
     background: var(--grad-ink); color: var(--grad-paper); }
 
@@ -687,6 +716,45 @@ def _chat() -> str:
 .grad-composer { border-top: var(--grad-border); background: var(--grad-paper-sunk);
                  padding: 10px 14px; flex: 0 0 auto; }
 .grad-composer .field { border: var(--grad-border); background: var(--grad-paper-raised); }
+
+/* The other half of the typing-lag fix, and the half that removes the cause
+ * rather than reducing it.
+ *
+ * A textarea that grows with its content is the right control, and Quasar's
+ * way of getting one is `autogrow`: on every input event, set `height: 1px`,
+ * read `scrollHeight`, put the height back. The write invalidates layout to the
+ * root and the read forces it clean again -- a full-document synchronous layout
+ * *inside the keystroke handler*, so its cost is the size of the transcript and
+ * it is paid once per key. Measured against a 77,700-node conversation: typing
+ * twenty characters blocked the main thread for 289ms.
+ *
+ * `field-sizing: content` asks the browser for the same behaviour and lets it
+ * do the sizing during its own layout pass, where it belongs. Nothing is read
+ * back, so nothing is forced: the same twenty characters block for 0.2ms and
+ * the layout they imply is one 13ms pass for the whole burst rather than twenty
+ * separate ones. O(frames), not O(keystrokes) -- and a person typing quickly is
+ * precisely the case where those two diverge.
+ *
+ * The `autogrow` prop is gone from both composers, because leaving it on would
+ * keep the measurement above exactly as it was; this rule replaces it rather
+ * than assisting it. `min-height` is the one row `rows="1"` used to give, and
+ * `max-height` is what `autogrow` never had -- a pasted stack trace grew the
+ * box until it ate the transcript.
+ *
+ * WebView2 is evergreen and the app's floor is well past this property, but a
+ * browser without it would get a one-line box with an inner scrollbar, so the
+ * fallback asks for a few rows and lets it scroll. Usable, not lovely, and not
+ * reachable on the platform this ships to. */
+.grad-composer .field textarea,
+.grad-wiki-ask .field textarea {
+    field-sizing: content;
+    min-height: 1lh;
+    max-height: 40vh;
+}
+@supports not (field-sizing: content) {
+    .grad-composer .field textarea,
+    .grad-wiki-ask .field textarea { min-height: 4lh; max-height: 40vh; overflow-y: auto; }
+}
 .grad-mention { font-family: var(--grad-font-mono); font-size: 10px; opacity: 0.55; }
 
 /* Which conversation this is, and the opener for the rest of them. */

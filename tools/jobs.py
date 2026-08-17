@@ -655,11 +655,14 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
     (artifacts / "job.log").write_text(logs, encoding="utf-8")
 
     results: dict[str, Any] = {}
+    # Every value the run reported per quantity, not just the last. A run that
+    # reports one quantity several times is a replicated run -- see core/stats.py.
+    samples: dict[str, list[Any]] = {}
     metrics_error = None
     metrics_path = artifacts / Path(r.get("metrics_file") or "metrics.json").name
     try:
         _download_artifacts(r, artifacts)
-        results = submit_lib.parse_metrics(metrics_path)
+        results, samples = submit_lib.read_metrics(metrics_path)
     except GradError as exc:
         metrics_error = exc.message
 
@@ -683,6 +686,7 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
         cost_usd_actual=cost,
         artifacts_dir=artifacts,
         expectation=expectation,
+        samples=samples,
         extra={
             "job_state": state,
             "metrics_error": metrics_error,

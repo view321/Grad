@@ -25,16 +25,20 @@ is a sentence in `prompts/system.md`.
 | A prediction exists before the result does | `core/gates.py:check_expectation`, bound at submit time |
 | Results get recorded at all | `collect` writes the run record; a stale uncollected run blocks new submissions |
 | Cumulative spend stays bounded | `core/ledger_store.py:rolling_spend` — actuals for collected runs, estimates for in-flight ones |
+| A free backend's rationed hours stay bounded too | `core/kaggle_quota.py` — the same fold over accelerator hours, because on Kaggle the dollar ceilings measure nothing |
 | The smoke job cannot become a backdoor | `core/gates.py:check_smoke_caps` clamps steps and wall clock, and clamps the wall clock again against the target's hourly rate so the cost cap is arithmetic rather than a self-report |
 | Notebooks run clean top-to-bottom | `tools/nb.py verify` on a fresh kernel |
-| No general remote-execution capability | credentials in Windows Credential Manager, read only by `jobs.py` / `gpu.py` |
+| No general remote-execution capability | credentials in Windows Credential Manager, read only by `jobs.py` / `gpu.py` / `kaggle.py` |
 | Concurrent ledger writes don't corrupt | one locked `core/jsonl.py:append`; no CLI writes a ledger file directly |
 | Token and credit spend stays bounded, not merely measured | `core/budget.py`, checked at every gateable event, over all four kinds of token |
 | An evolutionary campaign cannot outspend its allocation | the campaign gate in `tools/evolve.py`, before generation 0 and before each generation after it |
+| Every mutation a campaign proposes is metered | `core/mutate.py` goes through the Agent SDK and `quota_log.from_sdk_usage` records it — see below for what the alternative would have cost |
+| Running jobs in parallel cannot make exit 7 the normal state | `core/gates.py:check_concurrency`, re-checked inside the append lock |
 | A job submitted to an org is collectable from that org | the namespace is persisted on the run handle, not just passed at submit |
 | Every number in a report traces to a run record | `tools/report.py check` refuses on an unresolved claim, on a `claims.tex` that has drifted from `claims.json`, and on a measured-looking number typed into the generated prose |
 | Every citation in a report is a real paper | `report cite` resolves only against the corpus and verified S2 ids, and `check` re-resolves each entry's id rather than trusting its `gradsource` label |
 | A result that has not been judged cannot be published | `report check` refuses while any cited run has an unjudged deviation |
+| A replicated run is compared as an interval, not a point | `core/stats.py` — and an overlap is `null`, which needs a verdict rather than passing |
 
 ### The one thing that is *not* fully mechanical, and why
 
@@ -93,11 +97,66 @@ that was not. On the measured ledger the correction is **12×**. Set
 total and the weights it used, side by side, because a total that is mostly cache
 traffic is unarguable with its components beside it and baffling without them.
 
+### A third backend, where the spend ceiling measures nothing
+
+`tools/kaggle.py` runs pipelines on Kaggle's free GPUs and TPUs. Every one of
+the four §6 gates still runs, and the spend gate passes every time — a Kaggle
+kernel costs $0.00, which is under every ceiling there is. That is not a gate
+being quiet. It is a gate measuring the wrong quantity, and the row above about
+rates that are "stale in the optimistic direction" applies in its strongest
+form: on this backend the optimistic rate is *correct*, and the ceiling is
+decoration anyway.
+
+What Kaggle rations is accelerator hours — roughly 30 GPU h and 20 TPU h a
+week, with any single session stopped at 12 h (9 h on TPU). Running out
+destroys work rather than costing money: the kernel is killed and whatever was
+not checkpointed is gone. So the allowance is enforced the same way spend is,
+by `core/kaggle_quota.py`, in the same shape — **actual hours for collected
+runs, estimated hours for in-flight ones.** Without the second half, ten
+kernels pushed before any was collected would all pass a 30-hour ceiling on
+zero hours counted, which is exactly the failure `cost_for_ceiling` exists to
+prevent on the dollar side.
+
+Two consequences worth stating, because both are refusals you will meet:
+
+* **A spec with no `[estimate] hours` cannot be submitted here.** On a dollar
+  backend an absent estimate is merely optimistic — `collect` replaces it with
+  the platform's own accounting and the ledger self-corrects. Here the estimate
+  is the only number the weekly pool has for a run until it is collected, so a
+  spec that declares none is a run the ceiling cannot see. This is the same
+  refusal `check_smoke_caps` makes about a target whose rate it cannot look up.
+* **An accelerator id that is not in `[kaggle.accelerators]` is a configuration
+  error, never a guess.** Both available guesses are wrong in a way that
+  matters: `gpu` charges a TPU run to the wrong pool, and `cpu` charges it to
+  none at all.
+
+The numbers in `[kaggle.quota]` are a proxy you control, not a mirror of
+Kaggle's limit — the same honesty note the token ceiling carries. Kaggle varies
+the real allowance with demand and exposes no remaining balance. Set yours at or
+under the published one and it binds first, which is the useful direction to be
+wrong in: refusing at 30 h when Kaggle would have allowed 34 costs four hours,
+and refusing at 34 when Kaggle stops at 30 loses a run mid-training.
+
+One structural difference from the other two backends, since it shows up in the
+artifacts: `kaggle kernels push` uploads a single code file, so there is no
+`scp -r` here. The pipeline directory is packed into a base64 blob **inside** the
+generated notebook, which is what keeps "the remote sees exactly what was
+preflighted" true on a backend that cannot copy a directory. It also caps how
+much can go up — bulk belongs in a Kaggle dataset, and the submitter refuses with
+that instruction rather than letting the upload fail on Kaggle's side.
+
 ## Install
 
 ```bash
 pip install -e ".[agent,notebook,retrieval,remote,ui,math,dev]"
 ```
+
+Add `kaggle` to that list for the free GPU/TPU backend. It is its own extra
+rather than part of `remote` because it is genuinely optional — the other two
+submitters work without it — and because it brings the `kaggle` CLI, which
+`tools/kaggle.py` shells out to rather than imports, for the reason `gpu.py`
+shells out to `ssh`: the credential goes into one child process's environment at
+the moment of use and never into this one's.
 
 `ui` brings the embedded JupyterLab with it (the `lab` extra, pinned exactly
 because the 3→4 break is what killed the Tabnine extension). That is not a
@@ -106,7 +165,8 @@ without it ships a window whose only content is a button that fails.
 
 Optional extras, each pinned and each independently skippable:
 `lab-extensions` (LSP, git — `python-lsp-server[all]` is heavier than everything
-else here put together), `wiki` (RepoWiki), `evolve` (ShinkaEvolve).
+else here put together), `wiki` (RepoWiki), `evolve` (ShinkaEvolve — needed only
+for `--mutator shinka`; the default operator ships with `agent`).
 
 The core — ledger, preflight, gates, submitters — needs only the standard
 library plus a file lock. Everything heavier is optional and imported at the
@@ -128,12 +188,36 @@ Store credentials once; they never enter the agent's environment:
 
 ```bash
 python -m tools.jobs credential set hf_token
-python -m tools.jobs credential set openrouter_key
-python -m tools.jobs credential set voyage_key
+python -m tools.jobs credential set voyage_key      # embeddings *and* the reranker
 python -m tools.jobs credential set claude_oauth_token
+python -m tools.jobs credential set openrouter_key  # optional; a second rail for stage 2
 python -m tools.jobs credential set asta_api_key    # optional; raises rate limits
 python -m tools.jobs credential set context7_key    # optional; raises rate limits
+python -m tools.jobs credential set kaggle_key      # optional; the free GPU/TPU backend
 ```
+
+Voyage serve `rerank-2.5` themselves, so one key covers both of retrieval's
+credit-spending stages. An OpenRouter key is used only when it is the only one
+stored, or when `[retrieval] rerank_provider = "openrouter"` pins that rail.
+
+`kaggle_key` is half a credential: Kaggle authenticates with a username and a
+key, and only the key is secret. So the account is set by its own command and
+stays readable, and only the key goes to Credential Manager:
+
+```bash
+python -m tools.kaggle account --set <your-kaggle-username> --json
+```
+
+```bash
+python -m tools.kaggle account --check --json
+```
+
+`--check` makes one authenticated call, because a username and a key are useless
+apart and both halves fail the same way. The account is stored under the app
+directory rather than in `config/grad.toml`: that file is hand-annotated and
+`tomllib` can read it but not write it, so a command that edited it would
+reformat it and drop every comment in it. `[kaggle] username` is still read as a
+fallback, and `account` says when a stored selection is shadowing one.
 
 Or store them from the app: the workspace menu (`project ▾`) has a credentials
 panel, which is the same command with `--stdin` instead of the `getpass` prompt.
@@ -266,6 +350,265 @@ CLI's otherwise — because a meter reading 40% means quite different things at
 unknown context and an empty one look identical at a glance and only one of them
 is worth acting on.
 
+### The mutation operator is ours, and the reason is the token ledger
+
+§21 said "driver, not fork" and deferred the decision until evidence appeared
+that a driver over ShinkaEvolve was insufficient. Three pieces appeared, and only
+the first was the one being waited for:
+
+1. **`ShinkaEvolveRunner.run()` owns the generation loop**, which is the boundary
+   the campaign budget gate needs. That was §23 item 1.
+2. **There is no generation boundary in it to take.** The 0.0.7 runner is async —
+   `max_proposal_jobs`, `max_evaluation_jobs` — so proposals are in flight
+   together and complete out of order. A fork exposing one generation at a time
+   would be a fork that removes the concurrency that makes it fast.
+3. **Its subscription rail is `headless/claude`**, which drives the Claude Code
+   CLI through `npx`. Every mutation would have been a model call `drive_turn`
+   never issued, spending Max quota `ledger/quota.jsonl` cannot see and
+   `budget.check` cannot bound — on the one loop in this system explicitly
+   designed to run with no human in it.
+
+The third is the disqualifying one, and it is the same failure as the ceiling
+that could see one per cent of the tokens, in the place it would matter most. So
+`core/mutate.py` proposes through the Agent SDK the way `core/haiku.py` does, and
+`evolve.mutate` is a stage `tools.quota summary` totals like any other. A smaller
+version of the same bug was already live and is fixed with it: the old
+`ShinkaMutator.propose` called `quota_log.record` with no token counts at all, so
+every mutation appended a row that incremented a call counter and reported zero
+tokens — which reads exactly like a campaign that spent nothing.
+
+**`--mutator shinka` still exists** and starts working the moment upstream grows
+a per-generation entry point. A path that already worked should not stop working
+because a better one arrived; `python -m tools.evolve capabilities --json` says
+which engines are installed and which will run.
+
+What replaced Shinka's ensemble-of-models bandit is a bandit over **patch types**
+— `diff`, `full`, `cross` — in `core/evolution.py`, which is pure and tested.
+One model proposing three kinds of change turned out to be more diversity per
+token than three models proposing the same kind. The rest of that module is the
+part of an evolutionary algorithm whose failures are silent: islands so a small
+population does not collapse onto the first decent basin by generation three,
+rank-weighted parents so selection has pressure without collapse, and novelty
+dedup because an operator shown the leaderboard every generation proposes one of
+the leaders back, and evaluation is the expensive half.
+
+**One structural improvement over the previous design.** §21's third collision —
+every mutation invalidating the preflight hash — was resolved by *checking*
+whether a mutation escaped the `EVOLVE-BLOCK` markers. It is now mostly resolved
+by construction: the operator is only ever given the contents of a region and
+never a file, and `campaign.replace_blocks` splices its answer between markers
+taken from the baseline. Code outside the region cannot change because nothing
+outside the region was ever in the model's output. `escaped_evolve_block` still
+runs, and still earns its place — a replacement containing marker text would move
+real code across the boundary, and at that point the markers are data rather than
+structure.
+
+### One number is not a measurement
+
+Until now an expectation bound one quantity to one interval and `collect`
+compared **one number** to it. `val_loss = 3.05` against a predicted
+`[2.9, 3.2]` was recorded as in range with identical confidence whether the
+run-to-run spread was 0.001 or 0.3 — so on a system whose stated purpose is that
+a surprise is an alarm, the alarm could not be calibrated. It mattered most in
+`tools/evolve.py`, where selecting on a noisy single-sample metric is how a
+search learns to prefer a lucky seed.
+
+**The mechanism needed no new contract, only for the existing one to stop
+discarding data.** §7 already requires a machine-readable metrics artifact, and
+a JSONL of `{"quantity": ..., "value": ...}` records that reports one quantity
+several times *is* a replicated run. `parse_metrics` kept the last of them and
+silently dropped the rest. So a pipeline that already writes one record per seed
+was already replicating correctly, and its evidence was being thrown away.
+
+Now `core/stats.py` summarises the samples — n, mean, sample sd, sem, and a 95%
+t interval — and the comparison is **interval against interval**, which has
+three outcomes rather than two:
+
+| relation | `in_range` | meaning |
+|---|---|---|
+| contained | `true` | the observed interval sits inside the prediction |
+| disjoint | `false` | they do not overlap at all |
+| overlapping | `null` | neither confirmed nor refuted — needs a verdict |
+
+The third is the one that did not exist before, and it needed no new machinery:
+`in_range` has been tri-state since the first release, and
+`Run.unjudged_deviations` already treats anything `not True` as needing
+judgement, so an overlapping result lands in the pending list by itself.
+
+Three smaller decisions worth stating:
+
+* **`sd` is `null` at n = 1, not `0.0`.** One sample has no spread, and zero
+  would claim a precision that was never measured.
+* **The critical values are a table, not an inverse CDF.** Replication here is
+  three to five seeds, where the normal approximation understates the interval
+  by about a third — but `core/` runs on the standard library plus a file lock,
+  and SciPy would be the heaviest dependency in the project for thirty numbers
+  out of a textbook.
+* **The samples are kept, not just the summary.** For the reason the four raw
+  token counts survive beside `billable_tokens`: a summary is how numbers are
+  compared, never a substitute for having them. A later change to what a 95%
+  interval means has to be able to run over what was actually measured.
+
+`report check` gains a fifth rule. A `\gradnum` whose run reported one sample is
+a **finding, not a refusal** — one seed is a legitimate result for a throughput
+measurement or a smoke check, and refusing them would make this the rule people
+route around. What it stops is a number being published without anyone having
+noticed how thin it is. Records written before this landed carry no sample count
+and are left alone, because a rule that flagged every historical claim would be
+noise.
+
+Declaring `seeds = [0, 1, 2]` in `[config]` is optional and buys a cross-check.
+It lands in the submission hash for free — `config` is hashed, and a different
+seed list is a different experiment. `[execution]` would have been the wrong
+home: it is deliberately *excluded* from the hash, because how many siblings a
+job was submitted beside cannot change its numbers, and seeds very much can.
+
+### What survives a session, and what survives a workspace
+
+Two additions with one motive: everything this system knew was either a number
+in the ledger or a sentence in a conversation, and conversations are compacted.
+
+**Per project, six files in `projects/<id>/`.** Three are yours — `MEMORY.md`,
+`PLAN.md`, `TODO.md` — and three are rendered from the ledger by
+`python -m tools.project sync`: `EXPECTATIONS.md`, `RESULTS.md`, `DONE.md`.
+
+The split is HANDOFF §7 applied to a new surface. A `RESULTS.md` the agent wrote
+from memory at the end of a long session would read well, be cited, and be free
+to disagree with `runs.jsonl` — which is the failure the ledger exists to
+prevent. Rendering it costs one function and makes the disagreement impossible.
+Each generated file carries a digest of its own body, so a hand edit is
+*detectable*: `sync` refuses to overwrite one that has been edited rather than
+silently discarding it.
+
+`MEMORY.md` is the one that is appended to the system prompt at the start of
+every session, bounded by `[agent] memory_max_chars` (16k characters, about 4k
+tokens). That bound is on a *recurring* cost and is the reason it exists — the
+system prompt is re-read from cache on every tool round-trip, so an unbounded
+memory file becomes the dominant line in `quota summary` without ever being a
+decision anyone made. The other five are named in the prompt and read on demand.
+
+Putting memory in the system prompt also means a compaction cannot lose it:
+`agent.build_options` is what a fresh client is built from, so the note carries
+the conversation and this carries what the project knows.
+
+**Across every workspace, one archive.** `%LOCALAPPDATA%\Grad\experiments\`
+holds a snapshot of every run that became terminal — `collect` and `abandon`
+both go through `core/submit.py:finish`, and `ledger verdict` re-files a run
+once it has been judged. It answers the one question a per-workspace ledger
+cannot: *have I run this before?*
+
+It is a copy, not a second source of truth. Three things make it honest:
+
+* **Artifacts by reference, hashed.** The files stay in their workspace; the
+  archive records path, size and SHA-256, and `experiments verify` re-hashes
+  them. An artifact that was edited, truncated or deleted is detectable rather
+  than silently missing.
+* **The resolved spec, not just its hash.** `spec_resolved` is the pre-image of
+  the submission hash, so `verify` can re-derive the hash and check the
+  archive's own copy of what ran — the one integrity property the store can
+  check with nothing else present.
+* **Tokens are not attributed per run, and it does not pretend otherwise.**
+  `quota.jsonl` is tagged by stage and project, never by run: a conversation
+  that submits three jobs spends its tokens on the conversation. The record
+  carries the project's *running* total at archive time, named for what it is.
+
+### The dial for how hard it thinks
+
+`ClaudeAgentOptions.effort` takes `low | medium | high | xhigh | max`, and the
+right setting is a property of the task — the tasks in one session range from
+"what is in the ledger" to designing a campaign. A config value is the wrong
+shape for something that should change three times an afternoon, so it is a
+control on the chat statusline, beside the reasoning switch.
+
+**It cannot be changed on a live client.** The SDK's control protocol has
+exactly two subtypes that change an option mid-session — `set_model` and
+`set_permission_mode` — and there is nothing for effort. So a change means
+building a new client, which is what `compact` already does and costs the same.
+
+Hence the selection is recorded and applied **lazily, at the start of the next
+turn**: flipping the dial four times while idle costs nothing, and the rebuild
+lands once, immediately before a turn that was going to need a connected client
+anyway. The conversation survives because the rebuild passes `resume` with the
+SDK's own session id — which is the entire difference between this and a
+compaction, that deliberately clears it. When there is no id to resume yet the
+change is *deferred* rather than taken, because changing a setting must never be
+the thing that discards a transcript.
+
+`auto` stays in the cycle and is the default: it passes nothing and leaves the
+matter to the CLI, which is what every session did before the dial existed. The
+chip is dashed until a level is chosen, because "auto" is the absence of a
+choice rather than a level.
+
+### Doing more than one thing at a time
+
+Every capability here is reached by a `Bash` into `tools/`, and a `Bash` blocks
+the turn until the process exits. So `preflight run` — tests at 900s, then a dry
+run at 900s, then a paid remote smoke with a 900s queue grace — was one tool call
+that owned the conversation for all of it. Meanwhile `ui/tasks.py` had given the
+*workspace* a proper background runner two releases ago: the human could run four
+things at once and the agent could not run two.
+
+`tools/task.py` closes that, and the registry behind it (`core/tasks.py`) is a
+file rather than a process's memory, which is what lets the desktop app's tasks
+window show the agent's work in the same list as your own.
+
+```bash
+python -m tools.task start --label preflight --json -- \
+    python -m tools.preflight run --spec pipeline/spec.toml --json
+python -m tools.task list --json
+python -m tools.task wait task-093042-1f0a --timeout 900 --json
+```
+
+**It is not the SDK's `Task` tool**, which stays denied in `agent.py` for the
+reason above: a subagent is a model call `drive_turn` never issued. This runs
+*CLIs*, which are the slow things, and every one of them lands in the same
+ledgers it would have from a terminal. Three refusals are worth knowing:
+
+* **The Bash deny list applies here.** `hooks.evaluate_bash` is a pure function
+  precisely so a second caller can use it. Without that, `task start -- ssh box
+  nvidia-smi` would be the cheapest bypass in the system and would look like a
+  feature.
+* **Tasks cannot start tasks.** A supervisor supervising a supervisor is a
+  process tree `stop` cannot reason about, for no gain.
+* **There is a ceiling** — `[execution] max_concurrent_tasks`, exit 14.
+
+Two tools now parallelise inside themselves, both with `--jobs`. The funnel's
+stage 1 is twelve independent read-only requests (six expanded queries × two
+verbs) and measures 2.8s → 0.6s; preflight's local checks are independent of each
+other and measure 3.8s → 1.6s. The determinism survives in both: results are
+merged in submission order rather than completion order, so which copy of a
+paper's metadata wins does not depend on which endpoint answered first.
+
+**Preflight's `smoke` is now gated behind the local checks.** It was always run
+in sequence with them regardless of whether they passed, which meant a spec whose
+tests failed still submitted a paid remote job to learn something the first check
+had already said. Parallelising forced the dependency structure to be stated, and
+once stated the right answer was obvious. `--smoke-anyway` is there for when the
+remote environment is what you are debugging.
+
+### The ceiling that makes parallelism safe
+
+`check_stale` refuses *every* later submission while *any* uncollected run is past
+its window. So each additional job in flight is another collection window open,
+and one wedged backend takes the successors of all the others down with it.
+Without a bound, "submit things in parallel" and "exit 7 is the normal state" are
+the same sentence.
+
+Hence exit 14, `[execution] max_concurrent_runs`, defaulting to 2 — enough to
+overlap a long job with a short one, not enough to lose track of what is out
+there. A spec raises it for itself with `[execution] max_concurrent`, which is
+deliberately **not** in the submission hash: how many siblings a job was submitted
+beside cannot change its numbers, and hashing it would invalidate a good preflight
+for a scheduling preference.
+
+14 is distinct from 7 and from 6 for the reason 12 and 13 are distinct from each
+other. 7 means something has gone wrong with a run and needs clearing; 14 means
+nothing has gone wrong at all and you should wait. Giving them one code would make
+"abandon it" look like the fix for a healthy system. And because racing submitters
+are now the *intended* use rather than a corner case, the check is re-run inside
+the append lock alongside the spend gates — a ceiling of 2 that two concurrent
+starts can both walk through is a ceiling of 4.
+
 ### Retrieval without an institutional email, and without waiting
 
 Tier 1 defaults to **Papers with Code** (`paperswithcode.co/api/v1`) — the
@@ -300,8 +643,13 @@ says how many did. `pwc`'s expansion is also a *dense neighbour* rather than a
 citation edge, and `neighbours` reports it as one rather than claiming the
 citation graph §5 asks for.
 
-Set `[retrieval] tier1` to `asta`, `s2`, `both` (the two Semantic Scholar doors)
-or `all`, or pass `--tier1` per search. Two wall clocks bound a run either way:
+**Both Semantic Scholar doors are currently switched off**, on those latency
+numbers alone: `[retrieval] tier1_disabled = ["asta", "s2"]`. While they are
+listed there, `--tier1 asta` refuses with that instruction rather than quietly
+falling back to `pwc` — a comparison that silently ran the same retriever twice
+is worse than one that declined. Empty the list to have them back, then set
+`[retrieval] tier1` or pass `--tier1` per search. Two wall clocks bound a run
+either way:
 `request_deadline_s` caps one request, and `stage1_budget_s` caps the whole of
 stage 1 — when it is spent the funnel keeps what it retrieved and records how
 many queries it actually searched.
@@ -336,12 +684,16 @@ that carry the literal next command.
 | `tools/preflight.py` | run the QA gate, write `ledger/preflight/<hash>.json` |
 | `tools/jobs.py` | Hugging Face Jobs: `submit` / `status` / `collect` / `ceilings` / `credential` |
 | `tools/gpu.py` | the same verbs against a known SSH host |
-| `tools/ledger.py` | `expect` / `query` / `verdict` / `falsify` / `verify` / `reindex` |
+| `tools/kaggle.py` | the same verbs on Kaggle's free GPU/TPU, plus `account` / `quota` / `accelerators` |
+| `tools/ledger.py` | `expect` / `query` / `verdict` / `falsify` / `abandon` / `verify` / `reindex` |
 | `tools/quota.py` | measured token and credit usage, summarised by stage, role, and project |
 | `tools/budget.py` | projects and their ceilings: `new` / `use` / `status` / `raise` / `close` |
 | `tools/docs.py` | is this library call current? introspection first, then Context7 |
-| `tools/evolve.py` | evolutionary search as a budgeted campaign, over ShinkaEvolve |
+| `tools/evolve.py` | evolutionary search as a budgeted campaign, over our own operator |
+| `tools/task.py` | run a CLI in the background: `start` / `list` / `status` / `output` / `wait` / `stop` |
 | `tools/report.py` | `draft` / `write` / `cite` / `check` / `build` — the report and its gate |
+| `tools/project.py` | the project's memory: `init` / `sync` / `show` / `memory` / `path` |
+| `tools/experiments.py` | every experiment ever run, across workspaces: `list` / `show` / `verify` |
 | `tools/lab.py` | the embedded JupyterLab server (human editing surface) |
 | `tools/traces.py` | tag stored sessions, and harvest eval candidates from real use — **human-facing only** |
 | `tools/wiki.py` | RepoWiki over `core/` and `tools/` — **human-facing only**, not an agent tool |
@@ -366,10 +718,18 @@ things, and the model should not have to read prose to tell them apart.
 | 10 | job still running (not an error) |
 | 11 | configuration or credential problem |
 | 12 | **gate**: project budget exceeded |
+| 13 | **gate**: accelerator quota exhausted |
+| 14 | **gate**: too many runs or tasks in flight at once |
+
+14 is the only refusal in this table that is not a fault: nothing has gone wrong
+and the fix is to wait or to collect one, never to abandon anything. See "the
+ceiling that makes parallelism safe" above for why it cannot share 7's code.
 
 12 is deliberately distinct from 6: "this research ran out of its allocation" is
 not "the machine is out of money", and conflating them makes the wrong fix look
-right.
+right. 13 is distinct from both for the same reason — it means a metered
+allowance that was never denominated in dollars has run out, and the fix is to
+wait for the window to roll or to run something smaller, not to raise a ceiling.
 
 ## A full cycle
 
@@ -395,6 +755,28 @@ command you skipped in its `fix` field. Skip the verdict and `report check`
 refuses. `skills/preflight/SKILL.md` documents the submission spec format and
 what each check catches.
 
+### When a submitter is interrupted
+
+Every submitter writes its in-flight record *before* the network call and the
+backend's job id *after* it, so the ceiling can count a job while it is still
+being submitted. A submitter that is killed in between — Ctrl-C, a lost machine,
+an exception past the handler — leaves a run that is holding its estimate
+against the ceiling, has no job id to poll, and goes stale, at which point gate
+4 refuses every later submission on every backend.
+
+`collect` cannot clear that run; there is nothing to collect. `abandon` can:
+
+```bash
+python -m tools.ledger abandon run-... --reason "submitter killed before the job id came back" --json
+```
+
+It writes a terminal, results-free record at $0, hands the accelerator hours
+back to Kaggle's weekly pool, and is refused outright for any run that *does*
+have a handle — that run reached a platform and may still be spending, so it
+goes to `collect` or to the platform's own cancel. The expectation stays bound:
+a retry mints a new prediction. Exit 7's `fix` field names whichever of the two
+commands applies.
+
 ## Layout
 
 ```
@@ -409,9 +791,17 @@ core/                 the machinery the CLIs share, so no tool can forget a rule
   submission.py       the resolved submission and its hash
   gates.py            the submit gates and the smoke carve-out
   budget.py           the project dimension and its three ceilings
+  kaggle_quota.py     the weekly accelerator allowance, folded like rolling spend
   ledger_store.py     event-folded runs, rolling spend, staleness, derived index
   submit.py           shared submitter machinery: record, collect, deviations
   campaign.py         campaigns, candidates, and the evolve-block escape check
+  stats.py            replication: samples in, interval-vs-interval out  -- pure, tested
+  projects.py         per-project memory: three files authored, three rendered
+  experiments.py      the cross-workspace archive of everything ever run
+  effort.py           how hard the agent thinks, and where that choice is kept
+  evolution.py        islands, parents, novelty, the patch bandit  -- pure, tested
+  mutate.py           the mutation operator, through the SDK and the token ledger
+  tasks.py            background tasks as records, so three processes see one list
   report.py           the claim and citation guarantees `report check` enforces
   corpus.py           FTS5 + vectors + reciprocal rank fusion
   haiku.py            funnel stages 0 and 3, via forced SDK tools
@@ -431,6 +821,8 @@ config/jupyter/       the Lab server config: framing headers, overrides, theme
 skills/               loaded on demand, not into the default context
 ledger/               expectations.jsonl, runs.jsonl, quota.jsonl, projects.jsonl,
                       campaigns.jsonl, candidates.jsonl, preflight records
+projects/<id>/        MEMORY.md, PLAN.md, TODO.md  -- yours
+                      EXPECTATIONS.md, RESULTS.md, DONE.md  -- rendered
 reports/<project>/    main.tex, claims.json, references.bib, the PDF
 evals/retrieval.jsonl the arbiter for any change to retrieval
 ```
@@ -448,8 +840,9 @@ autouse fixture in `tests/conftest.py` replaces `core.http._httpx`, because a
 suite that reaches the network does not fail, it *hangs*.
 
 Implemented but not exercised against a live service: the HF Jobs backend, the
-SSH backend, Semantic Scholar, the OpenRouter reranker, Voyage embeddings, the
-two Haiku funnel stages, Context7, ShinkaEvolve, and RepoWiki. They are written
+SSH backend, Semantic Scholar, the reranker on either rail, Voyage embeddings,
+the two Haiku funnel stages, Context7, the mutation operator in `core/mutate.py`,
+and RepoWiki. They are written
 against the documented interfaces and fail with actionable errors rather than
 tracebacks, but a real credential and a real run are what will find the
 mismatches.
@@ -491,15 +884,18 @@ unrecognised one still raises rather than returning an empty list.
 - **ShinkaEvolve exposes no per-candidate callback, and no per-generation entry
   point either** (§23 item 1). `ShinkaEvolveRunner` has `run` and `run_async`,
   both of which own the whole loop — which is the control the campaign budget
-  gate needs in order to re-check between generations. **This is the evidence
-  §21 said a fork should wait for.** `evolve run` refuses with that explanation
-  rather than handing control away with the budget unchecked;
-  `python -m tools.evolve capabilities --json` reports what it found.
+  gate needs in order to re-check between generations. **This was the evidence
+  §21 said a fork should wait for**, and the answer turned out to be neither
+  driver nor fork: the mutation operator is now `core/mutate.py` and the search
+  policy is `core/evolution.py`, both ours. `--mutator shinka` keeps the old path
+  alive for a release that grows the entry point, and
+  `python -m tools.evolve capabilities --json` reports which engines are usable.
+- **Whether `headless/claude` works against a Max subscription** (§23 item 3) is
+  now moot rather than open. It routes through the Claude Code CLI, so a campaign
+  on that rail spends subscription quota no ledger here can see — which is a
+  reason not to use it whether or not it works.
 
 **Still open:**
-
-- **Whether `headless/claude` works against a Max subscription specifically** is
-  reported in Shinka's release notes and untested here.
 - **Historical records are left as `"unassigned"`** rather than retrofitted with
   a project. Cheap to change while the ledger is small.
 - **Phase 2 of the campaign loop (remote evaluation) is not enabled.**

@@ -1,16 +1,23 @@
 """Window 12 — background work.
 
-Two lists, because there are two ways work ends up running with nobody watching
-it, and they are not the same thing:
+Three lists, because there are three ways work ends up running with nobody
+watching it, and they are not the same thing:
 
 * **The agent's calls.** Every capability in this project is reached by a Bash
   into `tools/`, so a turn that is "thinking" is usually a command running. The
   transcript shows them, but the transcript scrolls, and once it has, the answer
   to "is that still going" was nowhere. They are listed first and they carry no
   STOP: the only thing that stops one is interrupting the turn.
+* **The agent's background tasks** — anything it started with `tools.task`, which
+  is how it runs a preflight or a collect without blocking its own turn. These
+  live in a *file* rather than in this process, which is the whole reason they
+  can appear here at all: they were started by the agent, or by a second
+  terminal, and until the registry existed the workspace could not see them.
+  They stop through `tools.task stop`, which asks the tool's own halt verb first.
 * **The commands the workspace started and did not wait for**: a notebook verify
   on a fresh kernel, a preflight, a wiki rebuild, a PDF build. These are this
-  app's own subprocesses, so these are the ones it can stop.
+  app's own subprocesses, held in memory, so these are the ones it can signal
+  directly.
 
 Separate from the queue window on purpose -- see `models.tasks_model` for why a
 local subprocess and a GPU job do not belong in one table, which is the same
@@ -35,7 +42,7 @@ from typing import Any
 
 from ui import kit
 from ui.state import Workspace
-from ui.tasks import cancel, clear_finished
+from ui.tasks import cancel, clear_finished, envelope_message, run_tool
 
 #: How much of a task's tail is on screen at once. The rest is scrolled to.
 TAIL_STYLE = "max-height: 220px; overflow: auto"
@@ -43,10 +50,10 @@ TAIL_STYLE = "max-height: 220px; overflow: auto"
 
 def subtitle(workspace: Any) -> str:
     model = workspace.model("tasks") or {}
-    running = model.get("running", 0)
+    running = model.get("running", 0) + model.get("background_running", 0)
     finished = model.get("finished", 0)
     calls = model.get("agent_running", 0)
-    if not running and not finished and not model.get("agent"):
+    if not running and not finished and not model.get("agent") and not model.get("background"):
         return "nothing running"
     parts = [f"{running} running", f"{finished} finished"]
     if calls:
@@ -57,11 +64,15 @@ def subtitle(workspace: Any) -> str:
 def chips(workspace: Any) -> list[tuple[str, str]]:
     model = workspace.model("tasks") or {}
     out: list[tuple[str, str]] = []
-    if model.get("running"):
-        out.append((f"{model['running']} RUNNING", "ok"))
+    running = model.get("running", 0) + model.get("background_running", 0)
+    if running:
+        out.append((f"{running} RUNNING", "ok"))
     if model.get("agent_running"):
         out.append((f"{model['agent_running']} AGENT", "ok"))
-    failed = len([r for r in model.get("rows") or [] if r["state"] == "failed"])
+    failed = len(
+        [r for r in (model.get("rows") or []) + (model.get("background") or [])
+         if r["state"] == "failed"]
+    )
     if failed:
         out.append((f"{failed} FAILED", "broken"))
     return out
@@ -72,13 +83,21 @@ def render(workspace: Workspace) -> None:
     kit.error_strip(model.get("error"))
     rows = model.get("rows") or []
     calls = model.get("agent") or []
-    if not rows and not calls:
+    background = model.get("background") or []
+    if not rows and not calls and not background:
         kit.empty("Nothing has been started here.", model.get("empty_fix"))
         return
 
-    def clear() -> None:
+    async def clear() -> None:
         gone = clear_finished()
-        workspace.say(f"cleared {gone} finished task{'' if gone == 1 else 's'}")
+        # Both registries, because the section header says "clear finished" and a
+        # button that cleared one of two lists would be a button that looks
+        # broken. The agent's tasks are cleared through its own CLI, which is the
+        # same command it would run -- §10, and it is also the only thing that
+        # knows to delete the logs.
+        payload = await run_tool("tools.task", "clear", "--json")
+        forgotten = ((payload.get("data") or {}).get("forgotten")) or 0
+        workspace.say(f"cleared {gone + forgotten} finished task(s)")
         workspace.invalidate("tasks")
         workspace.tick()
 
@@ -86,20 +105,33 @@ def render(workspace: Workspace) -> None:
         kit.button(
             "CLEAR FINISHED",
             tone="neutral",
-            disabled=not model.get("finished"),
+            disabled=not model.get("finished")
+            and not any(not r["running"] for r in background),
             title="running tasks are left alone",
             on_click=clear,
         )
         kit.spacer()
-        kit.text(f"{len(rows)} started here · {len(calls)} agent", "grad-caption", tag="span")
+        kit.text(
+            f"{len(rows)} started here · {len(background)} backgrounded · {len(calls)} agent",
+            "grad-caption",
+            tag="span",
+        )
 
     if calls:
-        # First, and above the workspace's own: this is the section that answers
-        # "is it still going", and the agent's calls are the ones with nowhere
-        # else to be read once the transcript has scrolled on.
+        # First, and above the rest: this is the section that answers "is it
+        # still going", and the agent's calls are the ones with nowhere else to
+        # be read once the transcript has scrolled on.
         _section("THE AGENT'S CALLS", "what the agent is running, newest first")
         for call in calls:
             _call(call)
+
+    if background:
+        _section(
+            "BACKGROUNDED BY THE AGENT",
+            "started with tools.task; still running after the turn that started them",
+        )
+        for row in background:
+            _background(workspace, row)
 
     if rows:
         _section("STARTED HERE", "commands this workspace ran and did not wait for")
@@ -150,6 +182,59 @@ def _call(row: dict[str, Any]) -> None:
                             "grad-caption",
                         )
                     kit.pre(row["tail"], "broken" if row["state"] == "failed" else "neutral")
+
+
+def _background(workspace: Workspace, row: dict[str, Any]) -> None:
+    """One of the agent's background tasks.
+
+    Stopped through `tools.task stop` rather than by signalling anything from
+    here, and that is not merely tidiness: this app did not spawn the process and
+    holds no handle to it. The CLI does the halt-verb-then-signal dance, and
+    running the same command the agent would is the rule the whole workspace is
+    built on.
+    """
+
+    async def stop() -> None:
+        payload = await run_tool("tools.task", "stop", row["id"], "--json")
+        workspace.say(envelope_message(payload))
+        workspace.invalidate("tasks")
+        workspace.tick()
+
+    with kit.el("div", "grad-card tool"):
+        with kit.row("head ink", gap=9):
+            kit.text("BACKGROUND", "", tag="span")
+            kit.text(row["label"], "subject", tag="span")
+            kit.spacer()
+            if row["exit_code"] is not None:
+                kit.text(f"exit {row['exit_code']}", "", tag="span")
+            kit.chip(row["state"].upper(), row["tone"], dot=row["running"])
+
+        with kit.el("div", "body"):
+            kit.pre(row["command"])
+            if row["stoppable"]:
+                with kit.row("", gap=6).style("margin-top: 8px"):
+                    kit.button(
+                        "■ STOP",
+                        tone="neutral",
+                        title=(
+                            f"asks the tool to stop first: {row['halt']}"
+                            if row["halt"]
+                            else "python -m tools.task stop " + row["id"]
+                        ),
+                        on_click=stop,
+                    )
+                    kit.text(row["id"], "grad-caption")
+            elif row["state"] == "lost":
+                kit.note(
+                    "started, never recorded an exit, and its supervisor is gone — "
+                    "usually a reboot. There is no exit code to report."
+                ).style("margin-top: 8px")
+            if row["error"]:
+                kit.text(row["error"], "grad-caption").style("margin-top: 8px")
+            for note in row["notes"]:
+                kit.text(note, "grad-caption")
+            if row["log"]:
+                kit.text(f"log: {row['log']}", "grad-caption")
 
 
 def _task(workspace: Workspace, row: dict[str, Any]) -> None:

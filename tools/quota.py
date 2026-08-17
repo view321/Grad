@@ -24,8 +24,8 @@ cli = Cli(
     "Summarise measured token usage by stage, credits spent, and rolling GPU spend.",
     epilog=(
         "Two currencies, never conflated: `quota` is the Max 5x window (anything via the\n"
-        "Agent SDK), `credits` are dollars (OpenRouter rerank, Voyage embeddings).\n"
-        "Stage 2 stays quota-free on purpose."
+        "Agent SDK), `credits` are dollars (Voyage rerank and embeddings, or OpenRouter\n"
+        "where that rail is configured). Stage 2 stays quota-free on purpose."
     ),
 )
 

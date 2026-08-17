@@ -31,6 +31,14 @@ agent = ["claude-agent-sdk>=0.1.0"]
 notebook = ["jupyter-client>=8.6", "ipykernel>=6.29", "nbformat>=5.10", "nbconvert>=7.16"]
 retrieval = ["httpx>=0.27", "sqlite-vec>=0.1.6"]
 remote = ["keyring>=25.0", "huggingface-hub>=0.24"]
+# `tools/kaggle.py` shells out to the `kaggle` CLI rather than importing the
+# package, for the reason `gpu.py` shells out to ssh: the credential goes into
+# one child process's environment at the moment of use and never into this one's.
+# The floor is where `kernels push --accelerator <id>` replaced the older
+# enable_gpu/enable_tpu booleans -- on an earlier CLI the flag is silently
+# unrecognised and every kernel runs on CPU, which is a job that burns no quota
+# and produces nothing.
+kaggle = ["keyring>=25.0", "kaggle>=1.6.14"]
 # NiceGUI 3 is a floor, not a preference: the window system needs `Element.move`
 # to reparent a window between panes without rebuilding it, and `shared=True` on
 # `add_head_html`/`add_body_html`, which 3.0 requires when global-scope markup

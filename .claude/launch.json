@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "grad-ui-browser",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-c", "from ui.app import run; run(native=False, port=8123)"],
+      "port": 8123
+    }
+  ]
+}
