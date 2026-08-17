@@ -949,3 +949,24 @@ def test_an_ordinary_pipeline_file_is_not_mistaken_for_a_credential(workspace):
     sub = make_submission(workspace, extra_files={"data/x.csv": "a,b\n1,2\n"})
     blob, packed = kaggle._payload_b64(sub)
     assert "data/x.csv" in packed and blob
+
+
+@pytest.mark.parametrize("name", [".ssh/config", ".SSH/config", ".Aws/config", ".GNUPG/trustdb.gpg"])
+def test_a_credential_directory_is_caught_whatever_its_casing(workspace, name):
+    """Windows keeps the casing the author typed in `Path.parts` while treating
+    the directory itself as case-insensitive, so `.SSH` and `.ssh` are one
+    directory with two spellings -- and only one of them used to be checked."""
+    write_config(workspace)
+    sub = make_submission(workspace, extra_files={name: "secret\n"})
+    with pytest.raises(UsageError) as exc:
+        kaggle._payload_b64(sub)
+    assert "credential" in exc.value.message
+
+
+def test_a_file_merely_named_like_a_secret_directory_is_still_packed(workspace):
+    """`Config.py` is source, not `.ssh/config`. The directory rule is about
+    directories, and case-folding it must not widen it into the filenames."""
+    write_config(workspace)
+    sub = make_submission(workspace, extra_files={"src/Config.py": "X = 1\n"})
+    _, packed = kaggle._payload_b64(sub)
+    assert "src/Config.py" in packed

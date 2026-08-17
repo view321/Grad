@@ -123,8 +123,15 @@ def is_secret(rel: Path) -> bool:
 
     Deliberately generous about what counts. A false positive is a file someone
     moves one directory up; a false negative is a key on Kaggle.
+
+    Case-folded on both halves, and the directory half is the one that needed
+    saying. This ships to Windows, where `.SSH` and `.ssh` are the same directory
+    on disk but `Path.parts` hands back whatever casing was typed -- so comparing
+    those raw let `.SSH/config` through while catching `.ssh/config`, which is
+    the difference between two spellings of one directory and not a difference
+    anyone would think to check.
     """
-    if any(part in _SECRET_DIRS for part in rel.parts[:-1]):
+    if any(part.lower() in _SECRET_DIRS for part in rel.parts[:-1]):
         return True
     name = rel.name.lower()
     return (
