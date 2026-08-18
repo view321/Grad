@@ -197,6 +197,15 @@ async def test_the_client_is_rebuilt_after_an_interrupt_and_resumes_the_conversa
 
     session.interrupt()
     await asyncio.wait_for(task, timeout=5)
+    # The turn ending and the interrupt finishing are two different events.
+    # `interrupt` runs `_stop_turn` as its own task, and that task only reaches
+    # `close()` *after* the turn settles -- so the turn's completion is the thing
+    # that unblocks the teardown, not evidence it has happened. Waiting for it
+    # here is what `ask` does before the next turn (`ui/app.py:450`); without it
+    # this read is a race that happened to fall the right way on 3.13 and the
+    # wrong way on 3.11.
+    if session._stopping is not None:  # noqa: SLF001
+        await asyncio.wait_for(session._stopping, timeout=5)  # noqa: SLF001
     assert session.client is None
 
     second = await run_turn(session, "again")

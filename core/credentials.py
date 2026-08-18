@@ -15,6 +15,7 @@ it also means the spend ceilings guard the only path that can authenticate.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 from core.errors import ConfigError
@@ -76,13 +77,49 @@ ALL: tuple[str, ...] = (
 )
 
 
+def store_name() -> str:
+    """What the credential store is called on this machine.
+
+    Named rather than hardcoded because the error that mentions it is the error
+    a user acts on, and "check that Windows Credential Manager is reachable"
+    told every Linux user to go and look at something that does not exist.
+    """
+    if os.name == "nt":
+        return "Windows Credential Manager"
+    if sys.platform == "darwin":
+        return "the macOS Keychain"
+    return "the Secret Service keyring"
+
+
+def store_fix() -> str:
+    """How to make credentials work here, for the platform actually in use.
+
+    The POSIX branch has to answer for the headless case, because that is the
+    normal case: a GPU box reached over SSH has no D-Bus session and therefore no
+    Secret Service, and a research tool that cannot authenticate without a
+    desktop session is a research tool that cannot run where the GPUs are. The
+    environment route is the honest answer there, and it already exists --
+    `GRAD_ALLOW_ENV_CREDENTIALS` was built for CI and the first-run bootstrap and
+    is exactly as good a fit for a headless host.
+    """
+    if os.name == "nt":
+        return "check that Windows Credential Manager is reachable for this user"
+    return (
+        "install a keyring backend (`pip install keyrings.alt`, or run a Secret Service "
+        "provider such as gnome-keyring), or -- on a headless host, where there is no "
+        "D-Bus session to hold one -- export the credential instead:\n"
+        "    export GRAD_ALLOW_ENV_CREDENTIALS=1\n"
+        "    export GRAD_<NAME>=...   # e.g. GRAD_VOYAGE_KEY, GRAD_CLAUDE_OAUTH_TOKEN"
+    )
+
+
 def _keyring() -> Any:
     try:
         import keyring  # noqa: PLC0415 - imported at point of use, on purpose
     except ImportError as exc:
         raise ConfigError(
             "the `keyring` package is not installed, so credentials cannot be read "
-            "from Windows Credential Manager",
+            f"from {store_name()}",
             fix="pip install keyring",
         ) from exc
     return keyring
@@ -94,35 +131,75 @@ def get(name: str, *, required: bool = True) -> str | None:
     GRAD_ALLOW_ENV_CREDENTIALS=1 permits an environment fallback; it exists for
     CI and for the first-run bootstrap, and it is off by default precisely
     because §9's argument is that the token must not be in the environment.
+
+    **An unreachable store is an absent credential, not an error, when the
+    caller said the credential was optional.** `required=False` is a caller
+    stating it can proceed without this; a store that will not open is one more
+    way for the value not to be there, and it is not a distinction that caller
+    can act on. This mattered on exactly one platform and it was the one nobody
+    ran: a headless Linux host has no Secret Service, so `keyring` raises
+    `NoKeyringError` for every read, and three optional lookups
+    (`s2_api_key`, `asta_api_key`, `context7_key`) turned that into a hard
+    failure of anonymous retrieval -- discovery refusing to run for want of a key
+    it does not need. `core/http.py` had already caught it at one of the three
+    call sites; the other two are why this belongs here instead.
+
+    A *required* credential still raises, and now says what the store is called
+    on this platform and how to get one working.
     """
     kr = None
+    #: The store failing to open, remembered rather than raised, because whether
+    #: it is an error depends on `required` -- which is not known until the end.
+    store_error: Exception | None = None
     try:
         kr = _keyring()
-    except ConfigError:
-        if not _env_fallback_allowed():
-            raise
+    except ConfigError as exc:
+        store_error = exc
     value = None
     if kr is not None:
         try:
             value = kr.get_password(SERVICE, name)
         except Exception as exc:  # noqa: BLE001 - backend errors vary wildly by platform
-            if not _env_fallback_allowed():
-                raise ConfigError(
-                    f"credential store unavailable while reading {name!r}: {exc}",
-                    fix="check that Windows Credential Manager is reachable for this user",
-                ) from exc
+            store_error = exc
     if not value and _env_fallback_allowed():
         value = os.environ.get(f"GRAD_{name.upper()}")
-    if not value and required:
+    if value:
+        return value
+    if not required:
+        return None
+    if store_error is not None:
+        # The import failure already carries its own message and `pip install
+        # keyring` fix; wrapping it would bury both under a vaguer sentence.
+        if isinstance(store_error, ConfigError):
+            raise store_error
         raise ConfigError(
-            f"credential {name!r} is not in the credential store",
-            fix=f"python -m tools.jobs credential set {name}   # prompts, does not echo",
-        )
-    return value
+            f"credential store unavailable while reading {name!r}: {store_error}",
+            fix=store_fix(),
+        ) from store_error
+    raise ConfigError(
+        f"credential {name!r} is not in the credential store",
+        fix=f"python -m tools.jobs credential set {name}   # prompts, does not echo",
+    )
 
 
 def set_(name: str, value: str) -> None:
-    _keyring().set_password(SERVICE, name, value)
+    """Store one credential.
+
+    Unlike `get`, this cannot degrade: there is nowhere else to put the value, so
+    an unreachable store is a real failure. It is reported as one rather than as
+    a `NoKeyringError` traceback, because storing a credential is the step
+    immediately after installing and a bare backend exception at that moment
+    reads as "this software is broken" rather than "this host needs a backend".
+    """
+    try:
+        _keyring().set_password(SERVICE, name, value)
+    except ConfigError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - backend errors vary wildly by platform
+        raise ConfigError(
+            f"credential store unavailable while storing {name!r}: {exc}",
+            fix=store_fix(),
+        ) from exc
 
 
 def delete(name: str) -> None:

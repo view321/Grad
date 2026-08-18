@@ -143,6 +143,23 @@ Credentials go to the OS credential store, never into a config file and never
 into the agent's environment. The tools that need them shell out, so the secret
 enters one child process at the moment of use.
 
+**On a headless host there is no credential store**, which is a normal situation
+rather than an exotic one — a GPU box reached over SSH has no D-Bus session, so
+`keyring` has no Secret Service to talk to and every read fails. The way through
+is to say so explicitly and pass the secrets in the environment instead:
+
+```bash
+export GRAD_ALLOW_ENV_CREDENTIALS=1
+export GRAD_CLAUDE_OAUTH_TOKEN=...        # GRAD_ + the credential's name, upper-cased
+export GRAD_VOYAGE_KEY=...
+```
+
+It is off by default because §9's whole argument is that a token in the
+environment is a token the agent can read. Turning it on is a deliberate trade
+for a machine where the alternative is not authenticating at all. Optional
+credentials need none of this: an unreachable store reads as an absent key, so
+anonymous retrieval still runs.
+
 ---
 
 ## Install
@@ -289,10 +306,27 @@ Three things to know before trusting it with a budget:
   semantics have changed between releases, so run `python agent.py --probe` after
   every SDK upgrade: it attempts a call that should be denied and reports whether
   it was actually denied.
-- **Windows is the first-class target.** The native window, the notification-area
-  icon and the credential store are Windows features. Linux and macOS get the CLI
-  and the browser UI, and everything that matters — the ledger, the gates, the
-  notebooks, the submitters — works there.
+- **Windows is the first-class target.** The native window and the
+  notification-area icon are Windows features. Linux and macOS get the CLI and
+  the browser UI, and everything that matters — the ledger, the gates, the
+  notebooks, the submitters — works there. The credential store is `keyring` and
+  is not Windows-only, but a headless host has no backend for it; see
+  [What you need](#optional-one-per-backend) for the environment route.
+  Linux is covered by CI now, which is how the first three Linux-only defects
+  were found — before that it had never been run there at all.
+
+### If you run it
+
+The most useful thing anyone can send right now is **where they stopped** —
+[`I ran it — here is how far I got`](https://github.com/view321/Grad/issues/new?template=ran_it.yml).
+Nothing has to have broken. "I read this far and did not install it" is a finding
+about this page. A project with one author and one machine cannot find the things
+that only a second machine has.
+
+Something actually broken goes to the
+[bug report form](https://github.com/view321/Grad/issues/new?template=bug_report.yml),
+which asks for `grad --check` — a report of booleans and variable names that
+carries no credentials. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.
 
 ---
 
@@ -304,6 +338,7 @@ Three things to know before trusting it with a budget:
 | [`HANDOFF.md`](HANDOFF.md) · [`HANDOFF-2.md`](HANDOFF-2.md) | the design documents of record |
 | [`prompts/system.md`](prompts/system.md) | the entire system prompt — read it, edit it |
 | [`skills/`](skills) | workflows loaded on demand, not into the default context |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to report what broke, and what the CI checks before a change lands |
 
 ---
 

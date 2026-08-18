@@ -166,16 +166,30 @@ def test_a_stored_key_is_sent_and_its_absence_is_not_an_error(workspace, transpo
     assert posts[-1]["headers"]["x-api-key"] == "k-1"
 
 
-def test_an_unreachable_credential_store_still_allows_an_anonymous_call(workspace, transport):
+def test_an_unreachable_credential_store_still_allows_an_anonymous_call(workspace, monkeypatch):
     """Same reasoning as Context7: an optional credential whose *store* is
-    missing must not make an anonymous call impossible."""
-    from core.errors import ConfigError
+    missing must not make an anonymous call impossible.
 
-    def explode(name, required=True):
-        raise ConfigError("keyring is not installed")
+    Broken at the *backend*, not at `credentials.get`. The degradation lives
+    inside `get` now, so a stub in its place would test the stub -- which is what
+    the earlier version of this test did, and why it passed on a machine where
+    the real thing was failing. This is the shape a headless Linux host fails in:
+    `keyring` imports cleanly and every read raises, because there is no Secret
+    Service session for it to talk to. It took anonymous retrieval down for want
+    of a key it does not need.
 
-    _, queue = transport
-    http.credentials.get = explode  # restored by the fixture's monkeypatch teardown
+    The `transport` fixture is deliberately not used: it stubs `credentials.get`
+    to return None, which would bypass the code under test entirely. Nothing here
+    reaches the network -- constructing the client reads config and one
+    credential, and `authenticated` is a property over what it found.
+    """
+    keyring = pytest.importorskip("keyring")
+    errors = pytest.importorskip("keyring.errors")
+
+    def no_backend(*_a, **_k):
+        raise errors.NoKeyringError("No recommended backend was available.")
+
+    monkeypatch.setattr(keyring, "get_password", no_backend)
     assert client().authenticated is False
 
 

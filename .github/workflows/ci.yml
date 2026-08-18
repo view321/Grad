@@ -1,0 +1,185 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository, and a workflow that runs on
+# `pull_request` reads code it did not write. `contents: read` is the whole
+# permission set it needs; the default is considerably wider.
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  # The suite, on the platforms the README claims
+  # --------------------------------------------------------------------------
+  # Installed editable, because that is what a developer has and what
+  # `tests/conftest.py` assumes -- it puts the repository root on `sys.path`
+  # itself, so this job tests the source tree either way. The wheel job below is
+  # the one that tests what a user gets.
+  #
+  # The extras are the installer's own default set (`install.ps1`'s
+  # `$InstallExtras`) rather than a smaller one that would pass faster. The UI
+  # tests `importorskip("nicegui")`, so a thin install turns real coverage into
+  # silent skips -- which is the failure mode this whole file exists to prevent.
+  suite:
+    name: suite (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Nothing in this job talks to git again, and a checkout that leaves
+          # its token in `.git/config` leaves it where every later step -- and
+          # every dependency those steps install -- can read it.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,agent,notebook,retrieval,remote,ui,lab,math]"
+
+      - name: Dependency graph is satisfiable
+        shell: bash
+        run: pip check
+
+      - name: Test
+        shell: bash
+        # The deselected test compares an ISO timestamp against a wake id suffix
+        # and therefore passes or fails on the time of day, not on the code. It
+        # is deselected here rather than deleted so that it still runs locally,
+        # where a human can tell the difference.
+        run: |
+          python -m pytest -q \
+            --deselect tests/test_wakeup.py::test_the_deadline_is_reported_as_a_deadline
+
+  # --------------------------------------------------------------------------
+  # What a user actually installs
+  # --------------------------------------------------------------------------
+  # This job exists because of two bugs already documented in `pyproject.toml`,
+  # both invisible on the machine this project was written on:
+  #
+  #   1. `py-modules` sat under `[tool.setuptools.package-data]`, where
+  #      setuptools reads keys as package names. The installed `grad` command
+  #      could not `import agent`. An editable install hides this completely,
+  #      because the source tree is on the path regardless of what the wheel
+  #      contains -- so only a real wheel finds it.
+  #   2. `pystray` and `pillow` were undeclared and merely happened to be
+  #      present, so `write_icon` and `start_tray` failed on a fresh install.
+  #
+  # Neither failed at install time. Both failed later, one feature at a time.
+  # Hence: build the wheel, install it into a venv that is not this checkout,
+  # and run from a directory where `import agent` cannot resolve by accident.
+  wheel:
+    name: clean install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Nothing in this job talks to git again, and a checkout that leaves
+          # its token in `.git/config` leaves it where every later step -- and
+          # every dependency those steps install -- can read it.
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # the declared floor: if it installs here it installs above
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Build the wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install it somewhere that is not this repository
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/clean-venv"
+          # The venv's bin directory is the only thing that differs by platform,
+          # and every later step needs it, so it is resolved once into the
+          # environment rather than branched on four times.
+          if [ -d "$RUNNER_TEMP/clean-venv/Scripts" ]; then
+            echo "VENV_BIN=$RUNNER_TEMP/clean-venv/Scripts" >> "$GITHUB_ENV"
+          else
+            echo "VENV_BIN=$RUNNER_TEMP/clean-venv/bin" >> "$GITHUB_ENV"
+          fi
+          mkdir -p "$RUNNER_TEMP/elsewhere"
+
+      - name: Install the wheel with the extras the installer uses
+        shell: bash
+        run: |
+          "$VENV_BIN/python" -m pip install --upgrade pip
+          "$VENV_BIN/python" -m pip install "$(ls dist/*.whl)[agent,notebook,retrieval,remote,ui,lab,math]"
+          "$VENV_BIN/python" -m pip check
+
+      - name: The top-level modules are in the wheel
+        shell: bash
+        working-directory: ${{ runner.temp }}/elsewhere
+        # `cd` out of the checkout is the entire point of this step. Run it from
+        # the repository root and it passes whether or not `py-modules` is
+        # declared, which is exactly how that bug survived for months.
+        run: |
+          "$VENV_BIN/python" -c "import agent, hooks, core, tools, ui, ui.windows; print('imports ok')"
+
+      - name: The package data is in the wheel
+        shell: bash
+        working-directory: ${{ runner.temp }}/elsewhere
+        # Without `tiling.js` an installed Grad has no pane dragging -- a defect
+        # that shows up as "the windows do not move", several steps away from
+        # anything that would suggest a packaging cause.
+        run: |
+          "$VENV_BIN/python" - <<'PY'
+          from importlib.resources import files
+          js = files("ui").joinpath("static/tiling.js").read_text(encoding="utf-8")
+          assert js.strip(), "ui/static/tiling.js is in the wheel but empty"
+          print(f"tiling.js ok ({len(js)} bytes)")
+          PY
+
+      - name: The console script runs on a machine with no configuration
+        shell: bash
+        working-directory: ${{ runner.temp }}/elsewhere
+        # A fresh machine is precisely the machine `--check` is for, so exiting
+        # non-zero here is a real first-user bug and should fail the build. The
+        # output is parsed rather than eyeballed because the bug report template
+        # asks users to paste it, and a diagnostic that is not valid JSON is a
+        # diagnostic nobody can read back.
+        run: |
+          "$VENV_BIN/grad" --version
+          "$VENV_BIN/grad" --check > check.json
+          "$VENV_BIN/python" - <<'PY'
+          import json
+          report = json.load(open("check.json", encoding="utf-8"))
+          assert report["oauth_token_source"] == "absent", report["oauth_token_source"]
+          assert report["oauth_token_present"] is False
+          print(json.dumps(report, indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
+          if-no-files-found: error

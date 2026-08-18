@@ -189,6 +189,13 @@ class Workspace:
         #: routing it through here keeps the gate card from having to reach into
         #: another window's closure.
         self.chat_send: Callable[[str], Any] | None = None
+        #: What is in the composer's box, when something put it there. Here
+        #: rather than in the chat window's closure for the same reason
+        #: `show_reasoning` is: a rewind sets it and then rebuilds the window,
+        #: which is exactly the moment a value living in that closure would be
+        #: destroyed. The window seeds the box from this on build and clears it
+        #: on send.
+        self.chat_draft: str = ""
         #: Wakes that have arrived and not yet been turned into a prompt.
         #:
         #: A queue rather than a direct call, because the two ends are in

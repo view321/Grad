@@ -327,14 +327,22 @@ def test_currency_degrades_when_the_credential_store_is_unreachable(workspace, m
 
 def test_context7_constructs_without_a_credential_backend(workspace, monkeypatch):
     """The key is optional, so an unreachable credential store must degrade to
-    anonymous rather than making the client unbuildable."""
-    from core import config as config_mod, credentials
-    from core.errors import ConfigError
+    anonymous rather than making the client unbuildable.
 
-    def boom(name, required=True):
-        raise ConfigError("the `keyring` package is not installed", fix="pip install keyring")
+    The backend is what fails here, not `credentials.get` -- `get` is where the
+    degradation lives, so replacing it would test the replacement. See
+    `tests/test_credentials.py`, which covers the same guarantee at its source.
+    """
+    from core import config as config_mod
 
-    monkeypatch.setattr(credentials, "get", boom)
+    keyring = pytest.importorskip("keyring")
+    errors = pytest.importorskip("keyring.errors")
+
+    def no_backend(*_a, **_k):
+        raise errors.NoKeyringError("No recommended backend was available.")
+
+    monkeypatch.setattr(keyring, "get_password", no_backend)
+    monkeypatch.delenv("GRAD_ALLOW_ENV_CREDENTIALS", raising=False)
     client = http.Context7(config_mod.load(reload=True))
     assert client.key is None
     assert client.authenticated is False

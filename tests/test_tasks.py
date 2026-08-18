@@ -254,3 +254,42 @@ def test_stopping_a_finished_task_says_so_rather_than_signalling(workspace):
     payload = task_cli.cmd_stop(argparse.Namespace(task_id=started["task"], json=True))
     assert payload["stopped"] is False
     assert "already" in payload["message"]
+
+
+# ---------------------------------------------------------------------------
+# liveness, and the POSIX state Windows has no word for
+# ---------------------------------------------------------------------------
+# `kill(pid, 0)` succeeds for a process that has exited and not been reaped, so
+# a stop used to wait out its whole grace period watching a corpse, report
+# `"stopped": false`, and never write the exit event that keeps the task from
+# reading as `lost`. Only ever reproducible off Windows, which is why it stood.
+#
+# The parser is tested rather than the file read, because there is no `/proc` on
+# the machine most of this is written on and a test that skips there is a test
+# that never runs.
+@pytest.mark.parametrize(
+    ("line", "zombie", "why"),
+    [
+        (b"4242 (python3) Z 1 4242 4242 0 -1 4194560 0 0", True, "a plain zombie"),
+        (b"4242 (python3) S 1 4242 4242 0 -1 4194560 0 0", False, "sleeping"),
+        (b"4242 (python3) R 1 4242 4242 0 -1 4194560 0 0", False, "running"),
+        # `comm` is parenthesised and may contain spaces and brackets of its own,
+        # so the state is the field after the *last* ')'. Splitting on whitespace
+        # and taking the third token reads the wrong field for any process whose
+        # name has a space in it.
+        (b"77 (a b) c) Z 1 77 77 0 -1 0 0", True, "a name with a space and a bracket"),
+        (b"88 (weird)name) S 1 88 88 0 -1 0 0", False, "a name with an embedded bracket"),
+        (b"", False, "an empty read, which is not evidence of anything"),
+    ],
+)
+def test_the_process_state_is_read_from_after_the_last_bracket(line, zombie, why):
+    assert tasklib._stat_is_zombie(line) is zombie, why  # noqa: SLF001
+
+
+def test_a_pid_with_no_proc_entry_is_not_called_a_zombie():
+    """The read failing is not evidence of anything -- on Windows it always
+    fails, and reporting every live process as a corpse there would fold every
+    running task to `exited`."""
+    import os
+
+    assert tasklib._zombie(os.getpid()) is False  # noqa: SLF001

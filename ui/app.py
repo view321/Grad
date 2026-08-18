@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from core import appdata, config as config_mod, effort, instance, migrate, paths
+from core import appdata, config as config_mod, effort, instance, migrate, paths, rewind
 from ui import desktop, katex, kit, render, sessions, shell, state as state_mod
 #: Roles the chat window knows how to draw, and therefore the ones `restore`
 #: keeps. `system` is the compaction marker: not something anyone said, but the
@@ -67,6 +67,13 @@ PORT = 8080
 #: forever is worse than no control, because the composer then silently refuses
 #: every prompt after it.
 INTERRUPT_GRACE_S = 8.0
+
+#: What the CLI says when a truncating resume would discard more than the one
+#: turn it was told about. Matched on the text because that is what the SDK
+#: documents as the contract -- there is no distinct exception class for it --
+#: and `Session._connect` treats it as "resume without the check" rather than as
+#: a failure, because by then the transcript has already been rewound.
+_REWIND_REFUSED = "Resume rejected by --resume-drops-turn:"
 #: How often `_stop_turn` checks whether the turn it asked to stop has settled.
 SETTLE_POLL_S = 0.1
 
@@ -134,6 +141,22 @@ class Session:
         #: transport a turn is streaming on, and a slow one must not be able to
         #: queue a second behind it every time the poll timer fires.
         self._reading_context = False
+        #: Where the next client should stop loading the conversation, set by a
+        #: rewind and consumed by the `start()` that follows it. It is state
+        #: rather than an argument because the two are separated by whatever
+        #: rebuilds the client next -- `rewind_to` drops it and `ask` builds the
+        #: replacement a turn later, and a rewind that had to be followed
+        #: immediately by a turn would be a rewind you could not think about.
+        self._rewind_at: str | None = None
+        #: The prompt that rewind means to discard, for the CLI to check the
+        #: truncation against. Only set when exactly one turn is going -- the
+        #: check is "everything after the anchor belongs to this turn", which a
+        #: multi-turn rewind contradicts by design.
+        self._rewind_drops: str | None = None
+        #: The last transcript entry the SDK named in the turn in flight. Stamped
+        #: onto the settled record so a later rewind knows where that turn ended;
+        #: see `core/rewind.py`.
+        self._turn_uuid: str | None = None
         #: The handover note a compaction left, waiting for somewhere to go. It
         #: rides in front of the next prompt rather than being sent as a turn of
         #: its own, which would spend a round-trip to produce an answer nobody
@@ -175,14 +198,72 @@ class Session:
                 return
             cfg = config_mod.load()
             agent.preflight_environment()
-            options = agent.build_options(cfg, resume=self.sdk_session_id)
-            self.client = ClaudeSDKClient(options=options)
-            await self.client.__aenter__()
+            await self._connect(agent, ClaudeSDKClient, cfg)
+            # Consumed, not kept. A rewind aims at one rebuild; leaving these set
+            # would have the *next* one -- an effort change, an interrupt, a
+            # model switch -- silently truncate the conversation again, at a
+            # point that by then is several turns in the past.
+            self._rewind_at = None
+            self._rewind_drops = None
             # Recorded after the client exists, so a construction that raised
             # does not leave this claiming a level nothing is running at -- which
             # would have `apply_effort` decide there was nothing to rebuild.
             self.client_effort = effort.current(cfg)
             self.client_model = cfg.model_for("research")
+
+    async def _connect(self, agent: Any, client_cls: Any, cfg: Any) -> None:
+        """Build the client and enter it, retrying once past a refused rewind.
+
+        `resume_drops_turn` is a claim about what a truncating resume will
+        discard, and the CLI refuses the resume outright when the claim does not
+        hold -- a message queued while the turn ran, a wake the session absorbed.
+        The SDK documents that refusal as deterministic and says to clear the
+        check and resume plainly rather than retry it, so that is what this does:
+        the rewind still happens, unvalidated, and the reason is logged.
+
+        Retrying without it rather than failing is the right trade because the
+        alternative is a session that cannot be reconnected at all. The
+        transcript has already been rewound by this point, so a refusal that
+        propagated would leave the window showing turns the agent is not being
+        rebuilt to match.
+        """
+        try:
+            await self._enter(agent, client_cls, cfg)
+            return
+        except Exception as exc:  # noqa: BLE001 - narrowed by the message below
+            if not (self._rewind_drops and _REWIND_REFUSED in str(exc)):
+                raise
+            log.warning("the rewind check was refused; resuming without it", exc_info=exc)
+            self.say(
+                "more than that one turn had been queued into this conversation — "
+                "rewinding anyway, without the check"
+            )
+        self._rewind_drops = None
+        await self._enter(agent, client_cls, cfg)
+
+    async def _enter(self, agent: Any, client_cls: Any, cfg: Any) -> None:
+        """One attempt at a live client, leaving nothing behind if it fails.
+
+        `self.client` is cleared on the way out of a failure because `start()`
+        returns early when it is set: a half-built client left in place is a
+        session that can never connect again and never says why. That was
+        reachable before a rewind existed -- any raise from `__aenter__` did it
+        -- and the retry above would have made it reachable twice.
+        """
+        client = client_cls(
+            options=agent.build_options(
+                cfg,
+                resume=self.sdk_session_id,
+                resume_at=self._rewind_at,
+                drops_turn=self._rewind_drops,
+            )
+        )
+        self.client = client
+        try:
+            await client.__aenter__()
+        except BaseException:
+            self.client = None
+            raise
 
     # -- named sessions -----------------------------------------------------
     def adopt(self) -> None:
@@ -279,6 +360,10 @@ class Session:
         self.title = title.strip()
         self.created_at = None
         self.sdk_session_id = None
+        # For the reason `restore` clears them: this is a different conversation,
+        # and a rewind armed against the last one names nothing in it.
+        self._rewind_at = None
+        self._rewind_drops = None
         self.blocks = []
         self.settled.clear()
         # Written immediately: an empty session that exists is listable, and a
@@ -392,6 +477,10 @@ class Session:
         # gain a tool card, and the block being written is the block being drawn.
         stream = agent.TurnStream()
         self.blocks = stream.blocks
+        # Cleared per turn, so a turn the SDK never named cannot inherit the
+        # previous turn's anchor -- which would put a rewind's cut a whole
+        # exchange earlier than the one it was aimed at.
+        self._turn_uuid = None
         try:
             # The same driver the CLI runs: it checks the token allocation before
             # issuing the turn and records what the turn spent. Doing it here
@@ -406,6 +495,7 @@ class Session:
                 # the rebuilt client `resume` this conversation, so losing it on
                 # exactly the turns that end in a rebuild cost the whole thread.
                 on_session_id=self._remember_sdk_session,
+                on_uuid=self._remember_turn_entry,
                 session=self.session_id,
             )
             if result.get("sdk_session_id"):
@@ -456,6 +546,15 @@ class Session:
                 "text": stream.text,
                 "blocks": list(stream.blocks),
             }
+            # Where this turn ended, and in which conversation. Both, because a
+            # uuid only means anything inside the session that issued it and the
+            # SDK may name a resumed conversation something new -- see
+            # `core/rewind.py:anchor_in`. Written even for a turn that failed:
+            # that is the turn most likely to be rewound past, and the entry the
+            # rewind resumes at is the last one *before* it.
+            if self._turn_uuid:
+                record["uuid"] = self._turn_uuid
+                record["sdk_session_id"] = self.sdk_session_id
             self.blocks = []
             # `blocks`, not `text`: a turn that only ran commands and said
             # nothing still happened, and dropping it would leave the transcript
@@ -565,6 +664,143 @@ class Session:
         # Bounded: `_stop_turn` bounds itself, and a hang here would be the very
         # thing this method exists to prevent, one layer up.
         await asyncio.wait([pending], timeout=INTERRUPT_GRACE_S * 2)
+
+    def _remember_turn_entry(self, uuid: str) -> None:
+        """The latest transcript entry the SDK has named in this turn.
+
+        Overwritten rather than accumulated: a rewind resumes at the *end* of
+        the turn it keeps, so the only one worth holding is the last.
+        """
+        self._turn_uuid = uuid
+
+    async def rewind_to(self, index: int) -> dict[str, Any]:
+        """Drop a prompt and everything after it, from the screen and the model.
+
+        The two halves are separable and only one of them is ours, which is the
+        whole shape of this: the transcript is a list in memory and a file, and
+        rewinding it always works; the conversation belongs to the SDK and comes
+        back only if the kept turns recorded an anchor it will accept. Both
+        outcomes are real ones and the caller is told which happened -- see
+        `core/rewind.py` for why a rewind that silently only cleaned the screen
+        would be the worse half of the feature.
+
+        **The client is dropped, and the rewind lands on the next turn.** There
+        is no control request for this: `resume_session_at` is fixed when a
+        client is built, so putting the model back means building a new one, and
+        the same laziness `apply_effort` uses applies for the same reason -- a
+        rebuild is seconds, and paying it at the click would make rewinding twice
+        to find the right point cost more than living with the bad turns.
+
+        The prompt comes back rather than being re-sent. A rewind is most often
+        reached for because the prompt itself wanted changing, and a rewind that
+        immediately re-asked would spend a turn reproducing the answer it just
+        discarded -- which for this agent can be a job it also just submitted.
+        """
+        if self.busy:
+            return {"ok": False, "message": "a turn is still running — interrupt it first"}
+
+        plan = rewind.plan(self.settled, index, sdk_session_id=self.sdk_session_id)
+        if not plan["ok"]:
+            return {"ok": False, "message": plan["reason"]}
+
+        import agent  # noqa: PLC0415 - imported here so the UI can load without the SDK
+
+        anchor = plan["anchor"]
+        # Whether the *installed* SDK will honour that anchor, asked before
+        # anything is promised. An anchor is only half the condition: an SDK
+        # without `resume_session_at` ignores it, the conversation comes back
+        # whole, and a message claiming the memory went back would be describing
+        # the one outcome `core/rewind.py` exists to make impossible to miss.
+        resumed = bool(anchor) and agent.rewind_supported()
+        drops = self._drops_turn(anchor) if resumed and plan["turns"] == 1 else None
+        # The client goes before anything is written, so a rewind cannot leave a
+        # live conversation running against a transcript that has moved out from
+        # under it. `start()` builds the replacement on the next turn.
+        await self.close()
+        # Checked again, because `close` is the one long await in here -- it
+        # tears down a CLI subprocess -- and the composer is live throughout it.
+        # A prompt submitted in that window runs `ask`, which sets `busy`,
+        # appends to `settled` and starts a turn; carrying on from here would
+        # overwrite that transcript with the rewound one, so the prompt would
+        # vanish from the screen with its turn still running against a client
+        # this just closed. The guard at the top was true when it was read.
+        if self.busy:
+            return {
+                "ok": False,
+                "message": "a turn started while the rewind was in flight — interrupt it first",
+            }
+        # Armed only when it will actually be honoured. Left set against an SDK
+        # that ignores it, the marker would survive a restart claiming a rewind
+        # was still pending that nothing was ever going to apply.
+        self._rewind_at = anchor if resumed else None
+        self._rewind_drops = drops
+
+        self.settled = [
+            *plan["keep"],
+            rewind.record(
+                dropped=plan["dropped"], resumed=resumed, anchor=anchor if resumed else None
+            ),
+        ]
+        self._persist()
+
+        turns = plan["turns"]
+        what = "one exchange" if turns == 1 else f"{turns} exchanges"
+        if resumed:
+            message = f"rewound {what} — the agent's memory goes back too, on the next turn"
+        elif anchor:
+            # There is a live conversation and a point to cut it at; what is
+            # missing is an SDK that accepts one. Named separately because the
+            # fix is an upgrade, which is worth saying rather than leaving the
+            # user to conclude the feature is broken.
+            message = (
+                f"rewound {what} on screen — this claude-agent-sdk cannot resume at a point, "
+                "so the agent still remembers them (upgrade claude-agent-sdk for the other half)"
+            )
+        elif self.sdk_session_id:
+            # An anchor from a conversation this session is no longer in. Named
+            # rather than folded into the case below, because "there was no live
+            # conversation" and "there is one and it cannot be cut here" are
+            # different situations with the same symptom.
+            message = (
+                f"rewound {what} on screen — this conversation was resumed under a new id, "
+                "so the agent still remembers them"
+            )
+        else:
+            message = f"rewound {what} on screen — there is no conversation to put back"
+        return {"ok": True, "message": message, "prompt": plan["prompt"], "resumed": resumed}
+
+    def _drops_turn(self, anchor: str) -> str | None:
+        """The uuid of the prompt this rewind means to discard, for the CLI's check.
+
+        Read out of the SDK's own transcript rather than captured live, and that
+        is the cheaper half of a real trade. Capturing it would mean asking every
+        session for `replay-user-messages` and carrying `UserMessage` objects
+        through `TurnStream` on every turn of every conversation, to serve an
+        optional check on an occasional, deliberate action. Reading the file
+        costs one parse at the click.
+
+        Best effort by construction. The check is a refinement of a truncation
+        that happens either way, so anything unreadable here -- an SDK without
+        the helper, a transcript in a directory this cannot guess, a session that
+        never reached disk -- returns None and the rewind runs unvalidated.
+        """
+        try:
+            from claude_agent_sdk import get_session_messages  # noqa: PLC0415
+
+            messages = get_session_messages(self.sdk_session_id, directory=str(paths.root()))
+        except Exception:  # noqa: BLE001 - see the docstring
+            log.debug("no drops-turn uuid for the rewind", exc_info=True)
+            return None
+        # The first prompt *after* the anchor: the SDK's rule of thumb is that
+        # `resume_session_at` names the last entry kept and `resume_drops_turn`
+        # the prompt of the turn immediately following it.
+        found = False
+        for message in messages:
+            if found and getattr(message, "type", None) == "user":
+                return getattr(message, "uuid", None)
+            if getattr(message, "uuid", None) == anchor:
+                found = True
+        return None
 
     def _remember_sdk_session(self, sdk_session_id: str) -> None:
         self.sdk_session_id = sdk_session_id
@@ -806,6 +1042,13 @@ class Session:
         The `meta` line is skipped by that same filter rather than by a special
         case: its `role` is absent, so it is not a record that renders.
         """
+        # Cleared first, and on every path out of here. A pending rewind belongs
+        # to one conversation -- it names an entry inside it -- so carrying one
+        # across a session switch would resume a *different* SDK session at a
+        # uuid that is not in it. Restoring is where the session identity
+        # changes, so it is where this has to be true.
+        self._rewind_at = None
+        self._rewind_drops = None
         path = self.path()
         meta = sessions.read_meta(path)
         self.title = str(meta.get("title") or "")
@@ -837,7 +1080,30 @@ class Session:
                     kept["kind"] = record["kind"]
                 if isinstance(record.get("note"), str):
                     kept["note"] = record["note"]
+                # Where this turn ended in the SDK's transcript, so a rewind
+                # still has somewhere to cut after the app has been restarted.
+                # Dropping these was the difference between a rewind that works
+                # on a session you have been in all along and one that quietly
+                # stops working the moment you reopen it.
+                if isinstance(record.get("uuid"), str):
+                    kept["uuid"] = record["uuid"]
+                if isinstance(record.get("sdk_session_id"), str):
+                    kept["sdk_session_id"] = record["sdk_session_id"]
+                # The turns a rewind took out, carried through so the marker
+                # still has them to show. Filtered by the same rule as `blocks`:
+                # this file outlives the version that wrote it.
+                if record.get("dropped") is not None:
+                    kept["dropped"] = rewind.dropped_of(record)
+                if isinstance(record.get("anchor"), str):
+                    kept["anchor"] = record["anchor"]
                 self.settled.append(kept)
+        # A rewind that had not been applied to a conversation yet when the app
+        # was closed. The marker is what says so and the anchor is on it, so this
+        # costs no extra state -- see `core/rewind.py:pending_anchor`. The
+        # drops-turn check is not restored with it: it is a refinement of a
+        # truncation that happens either way, and reconstructing it here would
+        # mean reading the SDK's transcript on every session that is opened.
+        self._rewind_at = rewind.pending_anchor(self.settled)
 
 
 def _drawable_blocks(value: Any) -> list[dict[str, Any]]:

@@ -128,7 +128,14 @@ def project_memory_block() -> str:
         return ""
 
 
-def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str | None = None) -> Any:
+def build_options(
+    cfg: Any,
+    *,
+    permission_mode: str | None = None,
+    resume: str | None = None,
+    resume_at: str | None = None,
+    drops_turn: str | None = None,
+) -> Any:
     """The options one session runs under.
 
     `resume` is an SDK session id, and passing it is the difference between
@@ -137,6 +144,26 @@ def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str |
     which is a worse failure than not resuming at all because nothing on screen
     says so. `ui/sessions.py` records the id and reports when it does not have
     one.
+
+    `resume_at` is how a rewind reaches the model. It names the last transcript
+    entry to load, so the conversation comes back without the turns after it --
+    which is the only mechanism there is for this: the control protocol has no
+    "forget the last turn", and `core/rewind.py` explains why a rewind that only
+    cleaned the screen would be the worse half of the feature.
+
+    **Deliberately not `fork_session`.** Forking is the SDK's suggested
+    companion to `resume_at` and it remaps every uuid into a new session, which
+    would invalidate the anchor recorded on every turn above the rewind point --
+    so the *second* rewind in a session would find nothing to resume at and
+    silently degrade to a transcript-only one. Resuming in place keeps the ids
+    that `core/rewind.py:anchor_in` matches on, and the abandoned branch stays in
+    the SDK's own transcript either way.
+
+    `drops_turn` is validation, not behaviour: it names the user prompt the
+    truncation intends to discard and the CLI refuses the resume if anything
+    else would go with it -- a queued message, a wake the session absorbed
+    mid-turn. Optional, and a rewind that cannot identify one runs unvalidated
+    rather than not running.
     """
     sdk = _sdk()
     mode = permission_mode or str(cfg.get("agent", "permission_mode", "dontAsk"))
@@ -160,6 +187,7 @@ def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str |
         # the two into one transcript -- see the warning in its docstring.
         "include_partial_messages": True,
     }
+    options.update(rewind_option(sdk, resume_at, drops_turn))
     options.update(thinking_option(cfg, sdk))
     # How hard it thinks, from `core/effort.py`. Applied here rather than
     # anywhere later because there is nowhere later: the SDK exposes no control
@@ -168,6 +196,68 @@ def build_options(cfg: Any, *, permission_mode: str | None = None, resume: str |
     # rebuild.
     options.update(effort.option(cfg, sdk))
     return sdk.ClaudeAgentOptions(**options)
+
+
+def rewind_option(sdk: Any, resume_at: str | None, drops_turn: str | None) -> dict[str, Any]:
+    """Where a resumed conversation should stop loading, when a rewind says so.
+
+    Feature-detected like `thinking_option`, and for the same reason: these two
+    options are newer than the rest of what this file passes, and an SDK without
+    them must give a session that ignores the rewind rather than one that cannot
+    be built at all. `Session.rewind_to` reads the transcript's half of the
+    rewind back off the return value, so the degradation is reported instead of
+    being left to be discovered when the model remembers a turn that is no longer
+    on screen.
+
+    `drops_turn` is dropped rather than sent alone when there is nothing to
+    anchor it to: it is a claim *about* a truncation, and on its own it would
+    describe one that is not happening.
+    """
+    if not resume_at:
+        return {}
+    fields = _option_fields(sdk)
+    if "resume_session_at" not in fields:
+        return {}
+    options: dict[str, Any] = {"resume_session_at": resume_at}
+    if drops_turn and "resume_drops_turn" in fields:
+        options["resume_drops_turn"] = drops_turn
+    return options
+
+
+def _option_fields(sdk: Any) -> set[str]:
+    """The option names this SDK accepts, or nothing if it cannot be asked."""
+    try:
+        return {field.name for field in dataclasses.fields(sdk.ClaudeAgentOptions)}
+    except TypeError:
+        return set()
+
+
+def rewind_supported(sdk: Any = None) -> bool:
+    """Can the installed SDK put a conversation back to an earlier point?
+
+    Asked separately from `rewind_option` because the answer is needed before
+    the option is built: an anchor the SDK will not accept is a rewind that
+    cleans the screen and leaves the model remembering everything, and telling
+    someone their memory went back when it did not is the exact failure
+    `core/rewind.py` is written to avoid. The caller words its result on this.
+
+    Feature-detected rather than pinned to an SDK floor, which is deliberate and
+    is the same call `thinking_option` makes. A hard minimum would refuse to
+    start for want of a capability the rest of the app does not need, on the
+    surface -- permission-mode names and option sets -- that has moved most
+    between releases. Degrading and saying so costs one sentence; a floor costs
+    everyone on an older SDK the whole application.
+
+    Answers False rather than raising when there is no SDK at all: the UI is
+    allowed to load without one, and a window asking whether a button should
+    promise something is not the place to discover it is missing.
+    """
+    if sdk is None:
+        try:
+            sdk = _sdk()
+        except BaseException:  # noqa: BLE001 - `_sdk` exits rather than raising ImportError
+            return False
+    return "resume_session_at" in _option_fields(sdk)
 
 
 def thinking_option(cfg: Any, sdk: Any) -> dict[str, Any]:
@@ -431,6 +521,7 @@ async def drive_turn(
     *,
     on_chunk: Any = None,
     on_session_id: Any = None,
+    on_uuid: Any = None,
     session: str | None = None,
     stage: str = quota_log.STAGE_MAIN,
     role: str = "research",
@@ -454,6 +545,14 @@ async def drive_turn(
     off the return value learned it only for turns that finished -- and an
     interrupted turn is precisely the one after which the client is rebuilt, so
     that was the case where losing the id cost the whole conversation.
+
+    `on_uuid` is called with each transcript entry the SDK names, and it is a
+    callback for the same reason and with a sharper version of the same
+    consequence. The *last* one of a turn is what `resume_session_at` takes to
+    rewind to the end of that turn (`core/rewind.py`), and a turn that failed
+    half-way is the single most likely thing anyone will want to rewind past --
+    so reading it off a return value that a failed turn never reaches would lose
+    the anchor on precisely the turns the feature exists for.
 
     `stage` and `role` decide where the turn's tokens land in `ledger/quota.jsonl`.
     They default to the conversation, and the one caller that overrides them is
@@ -485,6 +584,14 @@ async def drive_turn(
                 if candidate != sdk_session_id and on_session_id is not None:
                     on_session_id(candidate)
                 sdk_session_id = candidate
+            # The id of this entry in the SDK's own transcript, which is what a
+            # rewind resumes at. Reported as it arrives and never compared
+            # against what came before: the last one wins because the anchor
+            # wanted is the *end* of the turn, whatever kind of message that
+            # turned out to be. `ResultMessage` is usually it and carries one.
+            entry = getattr(message, "uuid", None)
+            if isinstance(entry, str) and entry and on_uuid is not None:
+                on_uuid(entry)
             # The *last* usage seen, recorded once after the loop -- not one
             # record per message. `ResultMessage` arrives last and carries the
             # turn's cumulative usage, so summing every message that has a
