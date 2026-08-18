@@ -846,9 +846,16 @@ def _validate(cfg: Config, path: Path) -> None:
         # Checked here rather than at submit, where the failure would be a run
         # that got as far as the ceiling before anything noticed the ceiling
         # could not be computed.
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        #
+        # `_check_number` rather than a bespoke test, for the reason its own
+        # docstring gives about `[kaggle.quota]`: a second copy is a second
+        # place to drift, and this one had already drifted -- it caught bools
+        # and non-numbers and let `nan` through, which TOML has a literal for
+        # and which makes every comparison against a ceiling false.
+        _check_number(value, f"modal.gpu_rates.{name}", path)
+        if value < 0:
             raise ConfigError(
-                f"[modal.gpu_rates] {name} must be a non-negative number of dollars per hour",
+                f"[modal.gpu_rates] {name} must not be negative",
                 fix=f'write it as "{name}" = 3.9492 in {path}',
             )
     cfg.hosts  # noqa: B018 - raises ConfigError on a malformed inventory

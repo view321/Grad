@@ -134,6 +134,11 @@ def _first_run_row(workspace: Any, step: dict[str, Any]) -> None:
         step.get("why", ""),
         open=done,
         title=step.get("why", ""),
+        # A finished step has nothing to click, and a `<button>` with no handler
+        # is still a tab stop -- so keyboard navigation through this panel used
+        # to land on rows that do nothing. `disabled` takes them out of the
+        # order and dims them, which is also the honest appearance.
+        disabled=done,
     )
     if done:
         return

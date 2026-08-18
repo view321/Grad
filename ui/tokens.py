@@ -315,6 +315,26 @@ def palette(theme: str | None = None) -> dict[str, str]:
     return PALETTES.get(str(theme or DEFAULT_THEME).lower(), COLOUR)
 
 
+def resolved_theme() -> str:
+    """The palette this workspace is set to, or the default. Never raises.
+
+    One copy, because there were three: `ui/render.py`, `ui/splash.py` and
+    `ui/state.py` each had the same try-settings-except-default, and one of them
+    fell back to a literal `"light"` rather than to `DEFAULT_THEME` -- which is
+    the drift `_check_number`'s docstring warns about, arriving on schedule.
+
+    Here rather than in `core/settings.py` because the fallback is a *design*
+    fact: an unreadable setting resolves to the palette the design ships, and
+    `palette()` already makes the same choice for an unknown name.
+    """
+    try:
+        from core import settings  # noqa: PLC0415 - keeps `core` off the import path
+
+        return settings.theme()
+    except Exception:  # noqa: BLE001 - a theme is never worth failing to draw
+        return DEFAULT_THEME
+
+
 def colour_variables(theme: str | None = None) -> str:
     """Just the colours, for one palette. The part that differs between themes."""
     active = palette(theme)

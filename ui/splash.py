@@ -73,12 +73,9 @@ def _theme() -> str:
     there in a stripped install -- has to answer "light" rather than stop a
     launch this module exists to make feel faster.
     """
-    try:
-        from core import settings  # noqa: PLC0415
+    from ui import tokens  # noqa: PLC0415
 
-        return settings.theme()
-    except Exception:  # noqa: BLE001 - see the docstring
-        return "light"
+    return tokens.resolved_theme()
 
 
 def start(*, timeout_s: float = MAX_SECONDS) -> None:

@@ -85,7 +85,7 @@ carries a `fix` field that is usually the literal next command.
   kernel was deleted in the Kaggle UI — it asks Kaggle first and refuses unless
   the answer is a 404, so it is not a way out of a job that still exists.
 - `python -m tools.modal submit --spec <spec> --expect <id> --json` — the same
-  verbs on Modal, which rents H100s and up by the second. The `[spend]` ceilings
+  verbs on Modal, which rents GPUs from a T4 to a B200 by the second. The `[spend]` ceilings
   are the only gate here, so exit 13 never comes from this backend — but every
   hour is real money, unlike Kaggle. `gpus` shows what is priced and refuses
   anything that is not; `ceilings` shows the headroom; `account --check` says
@@ -110,7 +110,7 @@ carries a `fix` field that is usually the literal next command.
   `--pressure` tune the search; `--jobs` proposes several at once. `TASK.md` in
   the task dir is put in front of the operator every time — write it. `promote`
   turns a winner into an ordinary run, which still needs its own preflight and
-  prediction. `--remote {ssh|hf_jobs|kaggle} --remote-spec <spec>` evaluates
+  prediction. `--remote {ssh|hf_jobs|kaggle|modal} --remote-spec <spec>` evaluates
   every candidate on real hardware instead of on this machine — the loop stays
   here, the training goes there. It refuses unless that spec's preflight is
   complete and passing including the smoke run, so run the preflight first. A

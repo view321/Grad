@@ -717,7 +717,7 @@ class Session:
         # twice, because the two uses want different conditions -- the SDK only
         # accepts `resume_drops_turn` for a single-turn rewind, while restoring
         # files to the *earliest* dropped prompt is right for any number of them.
-        dropped_prompt = self._drops_turn(anchor) if anchor else None
+        dropped_prompt = self._drops_turn(anchor)
         drops = dropped_prompt if resumed and plan["turns"] == 1 else None
         # Files first, because this one is a control request and the two after it
         # are not: `rewind_files` needs a live client, and the next statement
@@ -824,8 +824,15 @@ class Session:
             return False
         return True
 
-    def _drops_turn(self, anchor: str) -> str | None:
+    def _drops_turn(self, anchor: str | None) -> str | None:
         """The uuid of the prompt this rewind means to discard, for the CLI's check.
+
+        `anchor` is optional because rewinding to the *first* prompt of a session
+        keeps nothing, so there is no last-entry-of-the-last-kept-turn to anchor
+        on. That is the "start over" rewind, and it is the one where restoring
+        files matters most -- so a missing anchor means "the first prompt in the
+        conversation" rather than "no prompt at all", which is what it used to
+        mean and why `rewind_to(0)` moved the transcript and left the work.
 
         Read out of the SDK's own transcript rather than captured live, and that
         is the cheaper half of a real trade. Capturing it would mean asking every
@@ -848,8 +855,10 @@ class Session:
             return None
         # The first prompt *after* the anchor: the SDK's rule of thumb is that
         # `resume_session_at` names the last entry kept and `resume_drops_turn`
-        # the prompt of the turn immediately following it.
-        found = False
+        # the prompt of the turn immediately following it. With no anchor there
+        # is nothing before the first prompt, so `found` starts true and the
+        # answer is the first user message in the conversation.
+        found = anchor is None
         for message in messages:
             if found and getattr(message, "type", None) == "user":
                 return getattr(message, "uuid", None)

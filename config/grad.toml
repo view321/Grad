@@ -282,10 +282,14 @@ timeout_margin = 1.25
 "H100" = 3.9492
 "H200" = 4.5396
 "B200" = 6.2496
-# The CPU and memory a GPU sandbox also bills for, added to the GPU rate above.
-# Small next to an H100 and not zero: $0.0000131/core/s and $0.00000222/GiB/s.
-cpu_usd_per_core_hour = 0.04716
-memory_usd_per_gib_hour = 0.007992
+#
+# GPU time only. Modal also bills for the CPU and memory a sandbox holds
+# ($0.0000131/core/s and $0.00000222/GiB/s), and those are deliberately not in
+# this table: `tools/modal.py` passes no `cpu=` or `memory=`, so the allocation
+# is Modal's default and this side does not know what it is. A rate that cannot
+# be multiplied by a quantity is not a price, and two entries sitting here
+# unused would read as if they were being charged. They are small next to an
+# H100 and they are not zero, so the run record says the cost excludes them.
 
 # SSH hosts are a fixed inventory; an unknown name is a configuration error,
 # never an ad-hoc connection. Uncomment and fill in for a real host.

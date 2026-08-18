@@ -911,12 +911,9 @@ class Workspace:
         Read on the build path of every page, so an unreadable overlay has to be
         a cream window rather than a window that does not open.
         """
-        from core import settings as settings_mod  # noqa: PLC0415
+        from ui import tokens  # noqa: PLC0415
 
-        try:
-            return settings_mod.theme()
-        except Exception:  # noqa: BLE001 - see the docstring
-            return "light"
+        return tokens.resolved_theme()
 
     def set_theme(self, name: str) -> str:
         """Record the choice. Returns what is now in effect.

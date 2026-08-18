@@ -1021,10 +1021,17 @@ def test_creating_a_project_on_a_configured_machine_opens_nothing(rendered, monk
 
     monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
     monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
-    # `first_run_needed`, not `setup_needed`: the opening arrangement asks the
-    # wider question now (a token *and* a project), and `run_tool` is faked here
-    # so no project is actually created -- without this the machine under test
-    # is not the configured one the name promises.
+    # Both, because two different questions are asked on this path and stubbing
+    # either alone leaves the other reading the real machine.
+    #
+    # `create_project` consults `setup_needed` -- narrowly and correctly: after
+    # creating a project, the project half of `first_run_needed` is satisfied by
+    # definition, so only the token is left to ask about. But it also calls
+    # `reload()`, which re-derives the layout through `opening_windows` and
+    # therefore `first_run_needed`. `run_tool` is faked here so no project
+    # actually appears, and the setup window arrived from the *layout* rather
+    # than from the branch this test is named after.
+    monkeypatch.setattr(models_mod, "setup_needed", lambda: False)
     monkeypatch.setattr(models_mod, "first_run_needed", lambda: False)
 
     _, space = rendered(["projects"])

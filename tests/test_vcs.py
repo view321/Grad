@@ -181,6 +181,66 @@ def test_the_things_that_must_never_be_committed_are_not(workspace, relative):
     assert relative not in tracked
 
 
+def test_a_workspace_that_already_has_a_gitignore_still_excludes_secrets(workspace):
+    """The gap the first version left. A workspace can already have a
+    `.gitignore` -- somebody's own, or one left by a checkout it used to be --
+    and skipping the write there meant `.env` and `kaggle.json` were not
+    excluded and the first checkpoint committed them. A credential in a commit
+    survives the file being deleted."""
+    (workspace / ".gitignore").write_text("# mine\n*.tmp\n", encoding="utf-8")
+    initialised(workspace)
+
+    (workspace / ".env").write_text("VOYAGE_KEY=sk-real", encoding="utf-8")
+    (workspace / "scratch.tmp").write_text("x", encoding="utf-8")
+    (workspace / "notes").mkdir(exist_ok=True)
+    (workspace / "notes" / "a.md").write_text("kept", encoding="utf-8")
+    vcs.checkpoint("after")
+
+    tracked = (version.git("ls-files", cwd=workspace) or "").splitlines()
+    assert ".env" not in tracked
+    assert "notes/a.md" in tracked
+    # And the rules that were already there still apply.
+    assert "scratch.tmp" not in tracked
+    assert "# mine" in (workspace / ".gitignore").read_text(encoding="utf-8")
+
+
+def test_initialising_twice_does_not_write_the_block_twice(workspace):
+    initialised(workspace)
+    vcs._write_ignore(workspace / ".gitignore")
+
+    body = (workspace / ".gitignore").read_text(encoding="utf-8")
+    assert body.count(vcs.IGNORE_BEGIN) == 1
+
+
+def test_a_git_that_runs_and_refuses_is_not_a_success(workspace, monkeypatch):
+    """`is None` means "never ran". A non-zero return code means it ran and said
+    no, and conflating the two configured and committed into a directory that
+    was not a repository."""
+    class Refused:
+        returncode = 1
+        stdout = ""
+        stderr = "fatal: cannot mkdir"
+
+    monkeypatch.setattr(vcs, "_result", lambda *a, **k: Refused())
+    out = vcs.initialise()
+    assert out["created"] is False
+    assert out["error"]
+
+
+def test_a_failed_add_does_not_commit_whatever_was_staged(workspace, monkeypatch):
+    initialised(workspace)
+
+    class Refused:
+        returncode = 1
+        stdout = ""
+        stderr = "fatal: unable to index file"
+
+    monkeypatch.setattr(vcs, "_result", lambda *a, **k: Refused())
+    out = vcs.checkpoint("should not land")
+    assert out["committed"] is False
+    assert "unable to index file" in out["error"]
+
+
 def test_the_current_project_pointer_is_machine_local(workspace):
     """Which project is selected is one machine's choice, not a fact about the
     research. Two checkouts should not fight over it."""

@@ -319,7 +319,9 @@ def install(theme: str | None = None) -> dict[str, Any]:
     chosen = str(theme or tokens.DEFAULT_THEME).lower()
     if chosen not in LAB_BASE:
         chosen = tokens.DEFAULT_THEME
-    result: dict[str, Any] = {"theme": chosen, "written": [], "seeded": [], "error": None}
+    result: dict[str, Any] = {
+        "theme": chosen, "written": [], "seeded": [], "skipped": None, "error": None,
+    }
     try:
         config_dir = target().parent.parent
         shipped_dir = repo_path().parent.parent
@@ -335,6 +337,27 @@ def install(theme: str | None = None) -> dict[str, Any]:
                 if source.is_file() and not destination.exists():
                     shutil.copyfile(source, destination)
                     result["seeded"].append(str(destination))
+
+        # The workspace *is* the checkout in a default install, and then
+        # `target()` is the tracked, generated `custom.css` that
+        # `test_ui_theme.py` asserts equals `stylesheet()`. Writing the dark
+        # sheet there would dirty the repository and fail that test for anyone
+        # who had switched theme -- so the pair is left exactly as committed.
+        #
+        # Left *as a pair*, which is the part worth stating: skipping only the
+        # sheet while still switching the base theme would put dark JupyterLab
+        # defaults under a cream override, which is the mismatch `LAB_BASE`
+        # exists to prevent. Both are skipped, and the caller is told, because a
+        # notebook that stays cream in a dark workspace is otherwise a silent
+        # disagreement. Keeping the research in its own folder -- which the
+        # installer already recommends and the README already argues for -- is
+        # what makes a dark Lab available.
+        if config_dir == shipped_dir:
+            result["skipped"] = (
+                "the workspace is the installation, where config/jupyter/custom/custom.css is "
+                "a tracked generated file; JupyterLab keeps the light theme here"
+            )
+            return result
 
         sheet = target()
         write(sheet, chosen)

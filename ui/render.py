@@ -33,7 +33,6 @@ from __future__ import annotations
 import html
 import logging
 from pathlib import Path
-from typing import Any
 
 from core import paths
 from ui import tokens
@@ -117,15 +116,8 @@ def notebook_html(name: str) -> str:
 
 
 def _theme() -> str:
-    """The workspace's palette, or the default. Never raises: a notebook that
-    will not render because a setting could not be read is a worse outcome than
-    one rendered in the wrong colours."""
-    try:
-        from core import settings  # noqa: PLC0415
-
-        return settings.theme()
-    except Exception:  # noqa: BLE001 - see the docstring
-        return tokens.DEFAULT_THEME
+    """The workspace's palette, or the default. See `tokens.resolved_theme`."""
+    return tokens.resolved_theme()
 
 
 def _body(path: Path) -> str:

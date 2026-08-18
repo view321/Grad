@@ -424,7 +424,11 @@ def checkpointing_session(monkeypatch, *, fails: bool = False, supported: bool =
 
     monkeypatch.setattr(agent, "checkpointing_supported", lambda *_: supported)
     session = session_with(conversation())
-    monkeypatch.setattr(session, "_drops_turn", lambda _anchor: "prompt-3")
+    # Mapped rather than constant. A stub that answers "prompt-3" whatever it is
+    # asked cannot tell "the earliest dropped prompt" from "some prompt", which
+    # is the claim the multi-turn test below is making.
+    prompts = {None: "prompt-1", "entry-1": "prompt-2", "entry-2": "prompt-3"}
+    monkeypatch.setattr(session, "_drops_turn", lambda anchor: prompts.get(anchor))
     client = FakeCheckpointClient(fails=fails)
     session.client = client
     return session, client
@@ -461,8 +465,27 @@ def test_a_multi_turn_rewind_still_restores_the_files(workspace, monkeypatch):
     outcome = asyncio.run(session.rewind_to(2))
 
     assert outcome["files"] is True
-    assert client.rewound_to == "prompt-3"
+    # The prompt at index 2, not the one at index 4: two exchanges go, and the
+    # files belong at the point before the *first* of them ran.
+    assert client.rewound_to == "prompt-2"
     assert session._rewind_drops is None, "two turns go, so the SDK is not told one does"
+
+
+def test_rewinding_to_the_very_first_prompt_still_restores_the_files(workspace, monkeypatch):
+    """The "start over" rewind, and the one where the work matters most.
+
+    Rewinding to index 0 keeps nothing, so there is no last-entry-of-the-last-
+    kept-turn to anchor on -- and `dropped_prompt` was computed only `if anchor`,
+    so this case moved the transcript and left every file the session had
+    written. A missing anchor means "the first prompt in the conversation", not
+    "no prompt at all".
+    """
+    session, client = checkpointing_session(monkeypatch)
+    outcome = session and asyncio.run(session.rewind_to(0))
+
+    assert outcome["ok"] is True
+    assert outcome["files"] is True
+    assert client.rewound_to == "prompt-1"
 
 
 def test_an_sdk_that_cannot_checkpoint_rewinds_everything_else(workspace, monkeypatch):

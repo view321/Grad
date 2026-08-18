@@ -129,7 +129,7 @@ cli = Cli(
         "metered in ledger/quota.jsonl under the `evolve.mutate` stage and bounded by the\n"
         "project's token allocation. --mutator shinka switches to ShinkaEvolve, which\n"
         "refuses unless the installed release exposes a per-generation entry point.\n\n"
-        "--remote {ssh|hf_jobs|kaggle} --remote-spec <spec> evaluates every candidate on\n"
+        "--remote {ssh|hf_jobs|kaggle|modal} --remote-spec <spec> evaluates every candidate\n"
         "real hardware. It refuses unless that spec's preflight is complete and passing --\n"
         "tests, dry run, and a real smoke run on that hardware -- because a search is a\n"
         "loop with no human in it and the environment it lands in has to be proven once,\n"
@@ -829,7 +829,7 @@ def _remote_note(target: dict[str, Any] | None) -> dict[str, Any]:
     # Only what this backend actually resolved. A record carrying `host: null`
     # on a Kaggle campaign reads as a host that could not be found rather than
     # as a dimension that does not apply.
-    for key in ("host", "rate_usd_per_hour", "accelerator", "accelerator_kind", "flavor"):
+    for key in ("host", "rate_usd_per_hour", "accelerator", "accelerator_kind", "flavor", "gpu"):
         if target.get(key) is not None:
             note[key] = target[key]
     return note

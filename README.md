@@ -58,7 +58,7 @@ search result.
   under the project's ceiling, and no stale uncollected run. These are programs
   that refuse, not sentences in a prompt.
 - **Compute where you have it.** The same verbs — `submit`, `status`, `collect`
-  — against Modal (H100s and up, billed by the second), Hugging Face Jobs, any
+  — against Modal (T4 through B200, billed by the second), Hugging Face Jobs, any
   SSH host you can reach, and Kaggle's free GPU/TPU, where an hours-based quota
   is enforced because a dollar ceiling measures nothing.
 - **Evidence that outlives the session.** An append-only ledger of expectations
@@ -135,7 +135,7 @@ have no second rail.
 |---|---|
 | `hf_token` | Hugging Face Jobs |
 | `kaggle_key` + account | free GPU/TPU, rationed by the hour |
-| `modal_token_id` + `modal_token_secret` | Modal sandboxes: H100/H200/B200 by the second |
+| `modal_token_id` + `modal_token_secret` | Modal sandboxes: T4 through B200, by the second |
 | SSH host or key | your own box |
 | `openrouter_key` | a second rail for reranking |
 | `context7_key`, `asta_api_key` | higher rate limits on docs and discovery |

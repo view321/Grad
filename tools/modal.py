@@ -99,10 +99,32 @@ def _modal() -> Any:
             "the modal SDK is not installed, so Modal cannot be reached",
             fix="pip install -e '.[modal]'   # or: python -m pip install modal",
         ) from exc
-    for attr in ("Sandbox", "Image", "Volume", "App", "Client"):
-        if not hasattr(modal, attr):
+    # The exact surface this module uses, not just the top-level names. Checked
+    # the way `tools/jobs.py:_hub` checks for `run_job`/`inspect_job`, and for
+    # the same reason: a version floor in `pyproject.toml` is a hint to the
+    # resolver, and this is the thing that actually decides whether a submission
+    # can work. Without it an older SDK fails at `Client.from_credentials` with
+    # an AttributeError several frames into a submit that has already written a
+    # ledger record.
+    needed = {
+        "Client": ("from_credentials",),
+        "Sandbox": ("create", "from_id"),
+        "Image": ("from_registry",),
+        "Volume": ("from_name",),
+        "App": ("lookup",),
+    }
+    for attr, methods in needed.items():
+        target = getattr(modal, attr, None)
+        if target is None:
             raise ConfigError(
                 f"the installed modal has no {attr}; this is not a version this understands",
+                fix="python -m pip install -U modal",
+            )
+        missing = [m for m in methods if not hasattr(target, m)]
+        if missing:
+            raise ConfigError(
+                f"the installed modal's {attr} has no {', '.join(missing)}, "
+                "so this backend cannot reach it",
                 fix="python -m pip install -U modal",
             )
     return modal
@@ -176,10 +198,15 @@ def gpu_rate(gpu: str, cfg: Config) -> float | None:
     rate = (rates or {}).get(name.strip())
     if rate is None:
         return None
+    if not count.strip():
+        return float(rate)
     try:
-        multiplier = max(1, int(count)) if count.strip() else 1
+        multiplier = max(1, int(count))
     except ValueError:
-        multiplier = 1
+        # Not one card. `H100:eight` is a spec nobody can price, and pricing it
+        # as a single card would book an eight-GPU run at an eighth of its cost
+        # -- silently, and in the direction the ceiling cannot catch.
+        return None
     return float(rate) * multiplier
 
 
@@ -324,7 +351,18 @@ def _create_sandbox(
         volumes={mount: volume},
         client=client,
     )
-    sandbox_id = getattr(sandbox, "object_id", None) or str(sandbox)
+    sandbox_id = getattr(sandbox, "object_id", None)
+    if not sandbox_id or not isinstance(sandbox_id, str):
+        # Never `str(sandbox)`. The fallback looks harmless and writes
+        # `<modal.Sandbox object at 0x...>` into the ledger handle, which
+        # `collect` then hands to `Sandbox.from_id` -- so the run cannot be
+        # collected, goes stale, and blocks every later submission through the
+        # §6 gate. Failing here instead lets the caller mark the submission
+        # failed while the sandbox is still the only thing that exists.
+        raise UpstreamError(
+            "Modal returned a sandbox with no id, so this run could never be collected",
+            fix="retry; if it persists, check the Modal dashboard and `python -m pip install -U modal`",
+        )
     # Detached, so the sandbox outlives this CLI. `submit` returns in seconds and
     # the run takes hours; without this the client-side connection is the thing
     # holding it, and `collect` in a later process could not reach it.
@@ -426,6 +464,12 @@ def _download_outputs(cfg: Config, run_id: str, dest: Path, client: Any) -> list
             continue
         relative = str(remote).split(inside, 1)[-1].strip("/")
         if not relative:
+            continue
+        # The same guard `evaluate_candidate` puts on candidate filenames, for
+        # the same reason: these names come back from the Volume, which is
+        # written by the job, and `dest / "../../x"` resolves outside the run's
+        # artifacts directory. A traversal here writes to the researcher's disk.
+        if Path(relative).is_absolute() or ".." in Path(relative).parts:
             continue
         target = dest / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -911,14 +955,19 @@ def _actual_cost(r: ls.Run, handle: dict[str, Any], cfg: Config) -> tuple[float,
     gpu = str(handle.get("gpu") or (r.get("target") or {}).get("gpu") or "")
     rate = gpu_rate(gpu, cfg)
     if rate is None:
-        return 0.0, f"no rate configured for {gpu!r}; this run is booked at $0 and is not"
+        return 0.0, (
+            f"no rate configured for {gpu!r}, so this run is booked at $0 and its cost is "
+            "not bounded by the ceiling -- price it under [modal.gpu_rates] before the next one"
+        )
     elapsed = submit_lib.elapsed_hours(r)
     timeout_h = float(handle.get("timeout_s") or 0) / 3600 or None
     if timeout_h:
         elapsed = min(elapsed, timeout_h)
     return round(elapsed * rate, 4), (
-        "cost is wall clock from submission, priced against [modal.gpu_rates] -- an upper "
-        "bound including image pull and any delay before collection, not Modal's own billing"
+        "cost is wall clock from submission priced against [modal.gpu_rates], not Modal's own "
+        "billing. It is long in one direction (it includes the image pull and any delay before "
+        "collection) and short in another (GPU time only; the CPU and memory the sandbox held "
+        "are not counted). Collect promptly if the number matters."
     )
 
 
@@ -972,7 +1021,7 @@ def cmd_gpus(_: argparse.Namespace) -> dict[str, Any]:
     cfg = config_mod.load()
     rates = cfg.get("modal", "gpu_rates", {}) or {}
     return {
-        "gpus": {k: v for k, v in sorted(rates.items()) if not k.startswith(("cpu_", "memory_"))},
+        "gpus": dict(sorted(rates.items())),
         "default": cfg.get("modal", "default_gpu", "H100"),
         "max_hours": min(float(cfg.get("modal", "max_hours", MODAL_MAX_HOURS)), MODAL_MAX_HOURS),
         "note": "dollars per hour; a count suffix like H100:8 multiplies the rate",

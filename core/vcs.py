@@ -234,22 +234,65 @@ def initialise(*, identity: bool = True) -> dict[str, Any]:
         out["fix"] = f"git -C {root()} config --local {MARKER} true   # to opt in deliberately"
         return out
 
-    if _result("init") is None:
+    if not _ok(_result("init")):
         out["error"] = "git init failed"
         return out
     _git("config", "--local", MARKER, "true")
     if identity:
         _ensure_identity()
 
-    ignore = root() / ".gitignore"
-    if not ignore.exists():
-        ignore.write_text(IGNORE, encoding="utf-8")
+    _write_ignore(root() / ".gitignore")
 
     out["created"] = True
     first = checkpoint("workspace initialised", force=True)
     out["commit"] = first.get("commit")
     out["error"] = first.get("error")
     return out
+
+
+#: Fences the block this module manages, so it can be added to a file somebody
+#: else wrote without being written twice on the next `init`.
+IGNORE_BEGIN = "# --- grad: managed, do not edit between these markers ---"
+IGNORE_END = "# --- end grad ---"
+
+
+def _ok(result: Any) -> bool:
+    """Did a git command actually succeed?
+
+    `None` means it never ran; a non-zero return code means it ran and refused,
+    and the two were being conflated. `if _result("init") is None` treated a
+    *failed* `git init` as a success and went on to configure and commit into a
+    directory that is not a repository -- which fails again, later, somewhere
+    less obvious.
+    """
+    return result is not None and getattr(result, "returncode", 1) == 0
+
+
+def _write_ignore(path: Path) -> None:
+    """Put the managed rules in, without touching anybody else's.
+
+    A workspace can already have a `.gitignore` -- somebody's own, or one left
+    by a checkout it used to be. The first version skipped the file entirely in
+    that case, which meant `.env`, `kaggle.json` and `data/papers/` were not
+    excluded and the very first checkpoint committed them. A credential in a
+    commit survives the file being deleted, so this is the one rule in here
+    worth being careful about.
+
+    Appended between markers rather than merged line by line, so a second `init`
+    replaces the block instead of duplicating it, and so anything the user wrote
+    is visibly not ours.
+    """
+    block = f"{IGNORE_BEGIN}\n{IGNORE}{IGNORE_END}\n"
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        existing = ""
+    if IGNORE_BEGIN in existing:
+        head, _, rest = existing.partition(IGNORE_BEGIN)
+        _, _, tail = rest.partition(IGNORE_END)
+        existing = head + tail.lstrip("\n")
+    prefix = existing.rstrip("\n") + "\n\n" if existing.strip() else ""
+    path.write_text(prefix + block, encoding="utf-8")
 
 
 def _ensure_identity() -> None:
@@ -276,8 +319,13 @@ def checkpoint(reason: str, *, force: bool = False) -> dict[str, Any]:
     try:
         if not force and not enabled():
             return out
-        if _result("add", "-A") is None:
-            out["error"] = "git add failed"
+        staged_ok = _result("add", "-A")
+        if not _ok(staged_ok):
+            # Stop here rather than committing what happened to be staged
+            # already: an `add` that refused (a lock file, a permission, an
+            # index mid-rebase) means the commit below would record a state
+            # nobody chose.
+            out["error"] = (getattr(staged_ok, "stderr", "") or "").strip() or "git add failed"
             return out
         # `--porcelain` on the *index*: `diff --cached --quiet` exits 1 when
         # there is something staged, which is the cheap way to ask "is this

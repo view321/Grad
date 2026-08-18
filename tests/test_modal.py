@@ -250,7 +250,6 @@ def test_an_unpriced_gpu_at_collect_books_zero_and_admits_it(workspace):
 def test_a_machine_without_the_extra_is_told_which_extra(workspace):
     """Not mocked away: this is the behaviour on a machine that has not
     installed it, which is every machine until someone does."""
-    pytest.importorskip
     try:
         import modal  # noqa: F401, PLC0415
     except ImportError:

@@ -553,12 +553,20 @@ def checkpoint_workspace(reason: str) -> None:
     path of every module that already imports this one, and so the three call
     sites read as one decision rather than three.
     """
+    log = logging.getLogger("grad.vcs")
     try:
         from core import vcs  # noqa: PLC0415
 
-        vcs.checkpoint(reason)
+        result = vcs.checkpoint(reason)
     except Exception:  # noqa: BLE001 - a history is never worth a failed command
-        logging.getLogger("grad.vcs").debug("checkpoint skipped", exc_info=True)
+        log.debug("checkpoint skipped", exc_info=True)
+        return
+    # `checkpoint` reports rather than raises, so its `error` reaches nothing
+    # unless it is read here. Logged without `exc_info`, because there is no
+    # exception -- git ran and said no, and a traceback would describe a stack
+    # that has nothing to do with why.
+    if result.get("error"):
+        log.debug("workspace checkpoint failed: %s", result["error"])
 
 
 def archive_quietly(run_id: str) -> dict[str, Any] | None:
