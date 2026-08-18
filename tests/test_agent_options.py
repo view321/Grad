@@ -27,11 +27,25 @@ import agent
 # ---------------------------------------------------------------------------
 # PATH
 # ---------------------------------------------------------------------------
+def elsewhere(*names: str) -> list[str]:
+    """Fake PATH entries valid on the platform running the test.
+
+    `C:\\Windows` looked like harmless local colour and is not: entries here are
+    joined and split on `os.pathsep`, which is `;` on Windows and `:` on POSIX,
+    so a Windows-shaped literal splits down its *drive letter* on Linux and
+    `["C:\\Windows"]` comes back as `["C", "\\Windows"]`. Two tests below passed
+    on the machine they were written on and failed in CI, which is the whole
+    reason CI runs both.
+    """
+    root = "C:\\" if os.name == "nt" else "/"
+    return [root + name for name in names]
+
+
 def test_this_interpreters_scripts_directory_is_first(monkeypatch):
     """Not merely present -- first. `pip` had three entries ahead of the venv's
     on the machine this was written on, so anything but the front is a coin
     toss."""
-    monkeypatch.setenv("PATH", r"C:\Python314\Scripts" + os.pathsep + r"C:\Windows")
+    monkeypatch.setenv("PATH", os.pathsep.join(elsewhere("python314", "windows")))
     import sysconfig
 
     first = agent.interpreter_env()["PATH"].split(os.pathsep)[0]
@@ -42,16 +56,17 @@ def test_the_machines_path_is_kept_behind_it(monkeypatch):
     """Prepended, never replaced: the agent legitimately needs `git`, `docker`
     and `latexmk`, and this is not the place to decide what a research machine
     has installed."""
-    monkeypatch.setenv("PATH", os.pathsep.join([r"C:\Windows", r"C:\tools"]))
+    ambient = elsewhere("windows", "tools")
+    monkeypatch.setenv("PATH", os.pathsep.join(ambient))
     parts = agent.interpreter_env()["PATH"].split(os.pathsep)
-    assert parts[1:] == [r"C:\Windows", r"C:\tools"]
+    assert parts[1:] == ambient
 
 
 def test_it_does_not_grow_a_copy_per_compaction(monkeypatch):
     """A compaction builds a fresh client through `build_options`, so this runs
     again in a process whose PATH it has already fixed. Applying it twice has to
     be the same as applying it once."""
-    monkeypatch.setenv("PATH", r"C:\Windows")
+    monkeypatch.setenv("PATH", elsewhere("windows")[0])
     once = agent.interpreter_env()["PATH"]
     monkeypatch.setenv("PATH", once)
     assert agent.interpreter_env()["PATH"] == once
@@ -75,7 +90,7 @@ def test_an_empty_ambient_path_is_not_a_leading_separator(monkeypatch):
 def test_virtual_env_names_the_environment_actually_in_use(monkeypatch):
     """`pip` and `uv` both read it, and an ambient one pointing somewhere else is
     the exact confusion this function exists to end."""
-    monkeypatch.setenv("VIRTUAL_ENV", r"C:\somewhere\else")
+    monkeypatch.setenv("VIRTUAL_ENV", elsewhere("somewhere-else")[0])
     assert agent.interpreter_env()["VIRTUAL_ENV"] == sys.prefix
 
 
@@ -99,8 +114,9 @@ def test_a_bare_checkout_gets_one(monkeypatch):
 
 def test_an_existing_pythonpath_is_kept_behind_ours(monkeypatch):
     monkeypatch.setattr(agent, "_installed_as_distribution", lambda: False)
-    monkeypatch.setenv("PYTHONPATH", r"C:\theirs")
-    assert agent.interpreter_env()["PYTHONPATH"].split(os.pathsep)[-1] == r"C:\theirs"
+    theirs = elsewhere("theirs")[0]
+    monkeypatch.setenv("PYTHONPATH", theirs)
+    assert agent.interpreter_env()["PYTHONPATH"].split(os.pathsep)[-1] == theirs
 
 
 def test_the_distribution_check_never_raises(monkeypatch):
