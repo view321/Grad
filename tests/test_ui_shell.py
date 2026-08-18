@@ -1110,6 +1110,102 @@ def test_an_empty_credential_is_refused_before_a_command_runs(rendered, monkeypa
     assert "nothing to store" in (space.notice or "")
 
 
+def _placeholders(client: Client) -> set[str]:
+    """Every paste field on screen, by what it asks for.
+
+    The placeholder rather than the content, because that is where the field's
+    identity is: `html_of` joins tags, classes and content, and an `<input>` has
+    no content -- so a card with no fields at all and a card with two of them
+    produce the same markup under it.
+    """
+    return {
+        element._props["placeholder"]
+        for element in client.elements.values()
+        if "placeholder" in getattr(element, "_props", {})
+    }
+
+
+def test_every_backend_credential_can_be_pasted_in_the_setup_window(workspace, monkeypatch):
+    """A card that says NOT CONFIGURED, names the credential it is missing, and
+    gives you nowhere to type it.
+
+    That was `modal`. It was registered everywhere a backend is registered --
+    `settings.BACKENDS`, `setup.REQUIREMENTS`, `credentials.ALL`,
+    `models.CREDENTIAL_NOTES` -- and the setup window drew its paste fields from
+    a dispatch on the backend's *name*, where only `kaggle`, `hf_jobs` and `ssh`
+    had a branch. The optional-keys step does not catch the leftovers either: it
+    filters to the retrieval and extras groups, and a backend credential is in
+    neither. So both halves of the Modal token pair could only be stored from a
+    terminal, which is the one thing this window exists to make unnecessary.
+
+    Asserted for every backend rather than for Modal, because the fifth backend
+    will be added by someone reading `REQUIREMENTS` and not this file.
+    """
+    from core import credentials as credentials_mod, settings
+    from tools import setup as setup_tool
+    from ui.windows import setup as setup_window
+
+    monkeypatch.setattr(credentials_mod, "status", lambda: {n: False for n in credentials_mod.ALL})
+
+    client = Client(page("/"))
+    try:
+        with client:
+            space = state_mod.Workspace(FakeSession(), "proj")
+            space.layout = layout_mod.Layout()
+            space.layout.open("setup")
+            # Seeded, not selected: `select` redraws, and there is nothing built
+            # to redraw yet. The window reads this on its first render.
+            space.selection["setup.step"] = "backends"
+            shell.build(space)
+        fields = _placeholders(client)
+    finally:
+        client.delete()
+
+    # The field and the caption are asserted in separate passes on purpose. Run
+    # together, whichever assertion comes first short-circuits the backend and
+    # hides the other -- and it was the *field* that made this unusable, so it is
+    # the one that must not be reported only when the caption happens to exist.
+    for backend, needs in setup_tool.REQUIREMENTS.items():
+        assert backend in settings.BACKENDS
+        for name in needs["credentials"]:
+            assert f"paste {name}" in fields, (
+                f"{backend} needs {name} and the setup window offers no field for it"
+            )
+
+    for backend in setup_tool.REQUIREMENTS:
+        assert backend in setup_window.BACKEND_NOTES, (
+            f"{backend} has no one-line description, so its card draws a blank body"
+        )
+
+
+def test_a_backend_credential_is_offered_once(workspace, monkeypatch):
+    """Kaggle's key is a credential *and* was drawn by hand in `_kaggle`. Now
+    that the fields are derived, the hand-drawn one is a second identical box on
+    the same card -- and two password fields with the same placeholder is a
+    worse bug than the one being fixed, because it looks like it works."""
+    from core import credentials as credentials_mod
+
+    monkeypatch.setattr(credentials_mod, "status", lambda: {n: False for n in credentials_mod.ALL})
+
+    client = Client(page("/"))
+    try:
+        with client:
+            space = state_mod.Workspace(FakeSession(), "proj")
+            space.layout = layout_mod.Layout()
+            space.layout.open("setup")
+            space.selection["setup.step"] = "backends"
+            shell.build(space)
+        pasted = [
+            element._props["placeholder"]
+            for element in client.elements.values()
+            if str(getattr(element, "_props", {}).get("placeholder", "")).startswith("paste ")
+        ]
+    finally:
+        client.delete()
+
+    assert len(pasted) == len(set(pasted)), f"a credential is offered twice: {sorted(pasted)}"
+
+
 def test_the_folder_picker_argument_survives_a_process_boundary():
     """Native mode marshals `create_file_dialog` to the pywebview process over a
     multiprocessing queue, so its arguments have to pickle.

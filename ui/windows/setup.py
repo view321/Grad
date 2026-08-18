@@ -411,6 +411,7 @@ BACKEND_NOTES = {
     "kaggle": "free GPU/TPU hours, rationed in hours rather than dollars",
     "hf_jobs": "Hugging Face Jobs, priced per hour against the GPU ceiling",
     "ssh": "your own machines, priced by the rate you record for each",
+    "modal": "Modal sandboxes, H100s and up, billed per second against the spend ceiling",
 }
 
 
@@ -447,23 +448,35 @@ def _backends(workspace: Any, model: dict[str, Any]) -> None:
                         kit.text(
                             "missing: " + ", ".join(backend["missing"]), "grad-caption"
                         ).style("margin-top: 6px")
-                    # Named explicitly rather than falling through to `_hosts`.
-                    # A fourth backend would otherwise be handed an SSH host
-                    # editor, which is not merely useless -- it invites someone
-                    # to add an inventory entry that backend will never read.
+                    # The half that is *not* a credential, named explicitly
+                    # rather than falling through to `_hosts`. A fourth backend
+                    # would otherwise be handed an SSH host editor, which is not
+                    # merely useless -- it invites someone to add an inventory
+                    # entry that backend will never read.
                     if name == "kaggle":
                         _kaggle(workspace, model)
-                    elif name == "hf_jobs":
-                        _credential_field(workspace, "hf_token")
                     elif name == "ssh":
                         _hosts(workspace, model)
+                    # The credentials themselves are not dispatched on at all.
+                    # They used to be, and `modal` was the branch nobody wrote:
+                    # the backend was registered in `settings.BACKENDS`, in
+                    # `REQUIREMENTS`, and in `CREDENTIAL_NOTES`, so its card drew
+                    # with NOT CONFIGURED and named both missing tokens -- above
+                    # a body with nothing to type them into. `_extras` does not
+                    # catch them either; it filters to the retrieval and extras
+                    # groups, and a backend credential is in neither. There was
+                    # no field anywhere in the app.
+                    for credential in backend.get("credentials") or ():
+                        _credential_field(workspace, credential)
 
 
 def _kaggle(workspace: Any, model: dict[str, Any]) -> None:
     """Two halves, and only one of them is a secret.
 
     The username is stored where it can be read back, because "whose kernels are
-    these?" deserves a file you can open. The key goes to the credential store.
+    these?" deserves a file you can open. Only that half is here: the key is a
+    credential, and `_backends` draws a field for every credential a backend
+    declares. Drawing it here too would put two `kaggle_key` boxes on the card.
     """
     from nicegui import ui
 
@@ -483,7 +496,6 @@ def _kaggle(workspace: Any, model: dict[str, Any]) -> None:
                 workspace.set_kaggle_account((f.value or "").strip()), "kaggle account"
             ),
         )
-    _credential_field(workspace, "kaggle_key")
 
 
 def _hosts(workspace: Any, model: dict[str, Any]) -> None:

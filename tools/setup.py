@@ -387,6 +387,17 @@ def readiness(cfg: config_mod.Config) -> list[dict[str, Any]]:
                 "backend": backend,
                 "ready": not missing,
                 "missing": missing,
+                # Every credential this backend needs, stored or not -- which is
+                # not `missing` and must not be confused with it. `missing` is
+                # what is still absent and includes things that are not
+                # credentials at all ("an ssh host"), so a panel that offered a
+                # paste field per `missing` entry would offer one for those too,
+                # and would take the field away the moment the value was stored.
+                # The setup window draws its paste fields from this, so a fifth
+                # backend gets them by being added to `REQUIREMENTS` rather than
+                # by someone remembering a second place -- which is exactly what
+                # did not happen for `modal`.
+                "credentials": list(needs["credentials"]),
                 "fix": None if not missing else needs["fix"],
             }
         )
