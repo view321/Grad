@@ -57,6 +57,8 @@ def render(workspace: Any) -> None:
         kit.empty("Setup could not read this machine's configuration.")
         return
 
+    _first_run(workspace, model)
+
     active = workspace.selection.get("setup.step") or steps[0]["id"]
     if active not in {s["id"] for s in steps}:
         active = steps[0]["id"]
@@ -79,6 +81,79 @@ def render(workspace: Any) -> None:
         body(workspace, model)
 
     _installation(workspace)
+
+
+# ---------------------------------------------------------------------------
+# 0. the first run
+# ---------------------------------------------------------------------------
+def _first_run(workspace: Any, model: dict[str, Any]) -> None:
+    """Three things to do, in order, on a machine that has never been set up.
+
+    **Not a tour, and deliberately not one.** A guided overlay would have to
+    dim the workspace and float a callout with a drop shadow over it -- three
+    separate contradictions of a design whose motion rule is "instant state
+    swaps" and whose shadow rule is "no blur anywhere", enforced by
+    `tests/test_ui_tokens.py`. It would also have to know where a window *is*,
+    in a workspace whose whole premise is that you drag windows wherever you
+    want them, and it would have to be dismissable -- at which point it teaches
+    nobody who dismissed it.
+
+    A list of what is not done yet has none of those problems. It is drawn in
+    the ordinary components, it survives being read twice, and it goes away by
+    being satisfied rather than by being closed. See `ui/models.py:first_run`
+    for why the state behind it is derived rather than stored.
+
+    Rows are buttons: the point of putting this here is that the next action is
+    one click away rather than one paragraph away.
+    """
+    run = model.get("first_run") or {}
+    if not run.get("active"):
+        return
+
+    with kit.el("div", "grad-note").style("margin: 0 0 12px"):
+        with kit.row("", gap=9):
+            kit.text("FIRST RUN", "grad-label", tag="span")
+            kit.spacer()
+            kit.text(f"{run.get('done', 0)} of {run.get('total', 0)} done", "grad-caption", tag="span")
+        kit.text(
+            "Grad is not configured yet. These are the things it needs, in order.",
+            "grad-caption",
+        ).style("margin: 6px 0 9px")
+
+        for step in run.get("steps") or []:
+            _first_run_row(workspace, step)
+
+
+def _first_run_row(workspace: Any, step: dict[str, Any]) -> None:
+    done = bool(step.get("done"))
+    # A filled square for done and an empty one for not, the same mark the
+    # windows menu uses -- one vocabulary for "this is in effect".
+    row = kit.menu_row(
+        "■" if done else "□",
+        step.get("title", ""),
+        step.get("why", ""),
+        open=done,
+        title=step.get("why", ""),
+        # A finished step has nothing to click, and a `<button>` with no handler
+        # is still a tab stop -- so keyboard navigation through this panel used
+        # to land on rows that do nothing. `disabled` takes them out of the
+        # order and dims them, which is also the honest appearance.
+        disabled=done,
+    )
+    if done:
+        return
+
+    def go() -> None:
+        target = step.get("opens") or "setup"
+        if target != "setup":
+            workspace.open(target)
+            workspace.focus(target)
+            return
+        # Same window: move the step tabs rather than opening anything.
+        if step.get("step"):
+            workspace.select("setup.step", step["step"])
+
+    row.on("click", lambda _=None: go())
 
 
 # ---------------------------------------------------------------------------

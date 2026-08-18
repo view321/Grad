@@ -36,6 +36,7 @@ rebuild, but the sentence someone typed into it is not.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -379,6 +380,16 @@ def sync(project_id: str, *, force: bool = False) -> dict[str, Any]:
     for name, body in bodies.items():
         _write(directory / name, _with_marker(GENERATED[name], body))
         written.append(name)
+    # The third workspace checkpoint. `sync` is run after a collect or a verdict
+    # and rewrites the three files a human actually reads, so this is the commit
+    # whose diff shows what changed about the *project* rather than about the
+    # ledger. Never raises -- see `core/vcs.py`.
+    try:
+        from core import vcs  # noqa: PLC0415
+
+        vcs.checkpoint(f"sync {project_id}")
+    except Exception:  # noqa: BLE001 - a history is never worth a failed command
+        logging.getLogger("grad.vcs").debug("checkpoint skipped", exc_info=True)
     return {
         "project": project_id,
         "dir": str(directory),

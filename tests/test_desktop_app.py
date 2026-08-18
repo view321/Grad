@@ -926,6 +926,66 @@ def test_the_geometry_is_actually_handed_to_the_window(workspace, fresh_geometry
     nicegui_app.native.window_args.clear()
 
 
+def test_text_in_the_desktop_app_can_be_selected(workspace, fresh_geometry):
+    """pywebview defaults `text_select` to False, and that default is not a
+    preference -- it injects `body { user-select: none }` into the page.
+
+    Everything in this workspace is text somebody needs to copy: a run id to
+    paste into a command, a traceback to search for, a number out of the ledger.
+    None of it could be selected in the desktop app and all of it could in the
+    browser, which is exactly why it survived -- the rule is injected at runtime
+    and is in no stylesheet to grep.
+    """
+    assert desktop.window_args()["text_select"] is True
+
+
+def test_the_stylesheet_only_suppresses_selection_where_a_drag_needs_it(workspace):
+    """The other half of the same claim, and the evidence the design always
+    assumed selection was on: `user-select: none` appears on the title bar, the
+    split handle and the in-flight drag, and nowhere else. A rule that turned it
+    off for a *pane* or the app root would put the setting above back."""
+    import re
+
+    from ui import tokens
+
+    suppressed = [
+        match.group(1).strip()
+        for match in re.finditer(r"([^{}]+)\{[^}]*user-select:\s*none", tokens.stylesheet())
+    ]
+    for selector in suppressed:
+        assert any(
+            token in selector
+            for token in (".grad-handle", ".grad-titlebar", "body.grad-dragging")
+        ), f"{selector} makes text unselectable"
+
+
+def test_it_reaches_the_window_and_not_the_browser(workspace, fresh_geometry, monkeypatch):
+    """`window_args` only applies in native mode, which is the mode with the
+    problem: in a browser the text was always selectable."""
+    from nicegui import app as nicegui_app
+
+    from ui import app as grad_app
+
+    _screens(monkeypatch, (0, 0, 2560, 1440))
+    nicegui_app.native.window_args.clear()
+    grad_app._install_desktop(True)
+    assert nicegui_app.native.window_args.get("text_select") is True
+    nicegui_app.native.window_args.clear()
+
+    grad_app._install_desktop(False)
+    assert nicegui_app.native.window_args == {}
+
+
+def test_pywebview_still_takes_the_argument(workspace):
+    """Pinned against the installed pywebview rather than assumed. A release that
+    renamed or dropped this would leave `create_window` raising a TypeError at
+    launch -- or worse, silently ignoring it and putting the rule back."""
+    import inspect
+
+    webview = pytest.importorskip("webview", reason="pywebview is not installed")
+    assert "text_select" in inspect.signature(webview.create_window).parameters
+
+
 def test_browser_mode_is_handed_no_window_at_all(workspace, fresh_geometry):
     """`native=False` is the documented fallback and there is no window to place.
     Setting these there would turn native mode back on -- the same trap the

@@ -33,7 +33,6 @@ from __future__ import annotations
 import html
 import logging
 from pathlib import Path
-from typing import Any
 
 from core import paths
 from ui import tokens
@@ -43,7 +42,8 @@ log = logging.getLogger("grad.ui")
 #: `(resolved path) -> (mtime, size, html)`. One entry per notebook; a workspace
 #: with a hundred of them and every one opened is still a few megabytes, and the
 #: alternative is re-rendering the same unchanged file on every redraw.
-_CACHE: dict[str, tuple[float, int, str]] = {}
+#: path -> (mtime, size, theme, document). See `notebook_html`.
+_CACHE: dict[str, tuple[float, int, str, str]] = {}
 
 
 class NotAllowed(Exception):
@@ -102,13 +102,22 @@ def notebook_html(name: str) -> str:
     """A complete, script-free HTML document for one notebook."""
     path = resolve(name)
     stat = path.stat()
+    theme = _theme()
     cached = _CACHE.get(str(path))
-    if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
+    # The palette is in the cache key, not just in the render. A cache keyed on
+    # mtime alone would go on serving the cream document after a theme switch,
+    # for exactly as long as nobody edited the notebook.
+    if cached and cached[:3] == (stat.st_mtime, stat.st_size, theme):
+        return cached[3]
     body = _body(path)
-    document = _document(name, body)
-    _CACHE[str(path)] = (stat.st_mtime, stat.st_size, document)
+    document = _document(name, body, theme)
+    _CACHE[str(path)] = (stat.st_mtime, stat.st_size, theme, document)
     return document
+
+
+def _theme() -> str:
+    """The workspace's palette, or the default. See `tokens.resolved_theme`."""
+    return tokens.resolved_theme()
 
 
 def _body(path: Path) -> str:
@@ -140,7 +149,7 @@ def _body(path: Path) -> str:
     return body
 
 
-def _document(name: str, body: str) -> str:
+def _document(name: str, body: str, theme: str | None = None) -> str:
     """Wrap the fragment in the workspace's own typography.
 
     nbconvert's own stylesheet is Lab's, and dropping it into a pane that is
@@ -148,7 +157,7 @@ def _document(name: str, body: str) -> str:
     palette below is `ui/tokens.py`'s, read from it rather than copied, so the
     render cannot drift away from the rest of the app.
     """
-    c = tokens.COLOUR
+    c = tokens.palette(theme)
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <style>
@@ -171,8 +180,8 @@ def _document(name: str, body: str) -> str:
   h1, h2, h3, h4 {{ font-family: {tokens.FONT_SANS}; margin: 18px 0 7px; }}
   a {{ color: {c['link']}; }}
   .grad-render-note {{ color: {c['muted']}; font-style: italic; }}
-  .grad-render-head {{ position: sticky; top: 0; background: {c['ink']};
-                       color: {c['paper']}; font-family: {tokens.FONT_MONO};
+  .grad-render-head {{ position: sticky; top: 0; background: {c['fill']};
+                       color: {c['fill-ink']}; font-family: {tokens.FONT_MONO};
                        font-size: 11px; letter-spacing: .12em; padding: 5px 16px;
                        margin: -14px -16px 14px; }}
 </style></head>

@@ -252,6 +252,12 @@ def cmd_verdict(args: argparse.Namespace) -> dict[str, Any]:
     # archive holding every deviation and no verdict would be a record of what was
     # measured with the part that says what it meant left out.
     submit_lib.archive_quietly(args.run_id)
+    # The second of the three workspace checkpoints. A verdict is the moment a
+    # measurement becomes a finding, which makes it the one commit anybody
+    # reading the log later is looking for.
+    submit_lib.checkpoint_workspace(
+        f"verdict {args.verdict} on {args.run_id} ({args.quantity})"
+    )
     return {"verdict": record, "remaining_unjudged": len(ls.run(args.run_id).unjudged_deviations())}
 
 

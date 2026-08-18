@@ -65,6 +65,19 @@ _process: subprocess.Popen | None = None
 # ---------------------------------------------------------------------------
 # the parent's side
 # ---------------------------------------------------------------------------
+def _theme() -> str:
+    """The workspace's palette, or the default. Never raises.
+
+    Called on the launch path before anything else has loaded, so every failure
+    -- no app directory yet, a settings file half-written, an import that is not
+    there in a stripped install -- has to answer "light" rather than stop a
+    launch this module exists to make feel faster.
+    """
+    from ui import tokens  # noqa: PLC0415
+
+    return tokens.resolved_theme()
+
+
 def start(*, timeout_s: float = MAX_SECONDS) -> None:
     """Put the mark on screen. Returns immediately; never raises.
 
@@ -95,6 +108,14 @@ def start(*, timeout_s: float = MAX_SECONDS) -> None:
         # that vanishes the instant it is started, which is a confusing thing to
         # meet while debugging one.
         "--watch-stdin",
+        # Passed down rather than read in the child, and the reason is the whole
+        # design of this module: the child exists to be on screen in about a
+        # tenth of a second, and reading the setting there would put
+        # `core.settings` and `core.appdata` on that path. The parent is already
+        # importing them. A splash that flashed cream in front of a dark
+        # workspace would be the one frame the whole theme is judged on.
+        "--theme",
+        _theme(),
     ]
     try:
         from core import paths, spawn  # noqa: PLC0415
@@ -179,11 +200,13 @@ def _centre(window: Any, width: int, height: int) -> None:
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
-def show(*, timeout_s: float = MAX_SECONDS, watch_stdin: bool = False) -> int:
+def show(
+    *, timeout_s: float = MAX_SECONDS, watch_stdin: bool = False, theme: str = "light"
+) -> int:
     """The window itself. Runs the Tk loop until something says to stop."""
     import tkinter as tk  # noqa: PLC0415 - the child's whole reason to exist
 
-    from ui.tokens import COLOUR  # noqa: PLC0415
+    from ui import tokens  # noqa: PLC0415
 
     # Read from the palette, not spelled here. `tests/test_ui_tokens.py` enforces
     # that rule across the package and it applies to a window drawn in Tk exactly
@@ -191,8 +214,25 @@ def show(*, timeout_s: float = MAX_SECONDS, watch_stdin: bool = False) -> int:
     # brand yellow is the first thing to drift when the palette changes. The
     # module is pure Python with no dependencies of its own, so the cost of
     # importing it in this process is a parse.
-    ink, paper, brand = COLOUR["ink"], COLOUR["paper"], COLOUR["attention"]
-    muted = COLOUR["muted"]
+    #
+    # `palette()` rather than `COLOUR` since there are two: an unknown name
+    # resolves to the default there, so a `--theme` from a newer version is a
+    # cream splash rather than a KeyError in front of a launch.
+    colour = tokens.palette(theme)
+    # `fill`, not `ink`. The border and the ground behind the card are the
+    # emphasis ground -- in the dark palette `ink` is near-white, and a 2px
+    # near-white frame around a dark card is the same inversion bug the CSS
+    # `fill` token exists to prevent.
+    #
+    # Three names where there used to be one, for the same reason the stylesheet
+    # grew `fill` and `on-attention`: `ink` was doing three jobs here -- the
+    # frame around the card, the text on the card, and the nabla on the yellow
+    # mark -- and the three move in different directions when the ground
+    # inverts. The frame stays dark, the text goes light, and the nabla does not
+    # move at all because the yellow under it did not.
+    frame, paper, brand = colour["fill"], colour["paper"], colour["attention"]
+    ink, on_brand = colour["ink"], colour["on-attention"]
+    muted = colour["muted"]
     width, height = 340, 232
 
     gone = threading.Event()
@@ -205,7 +245,7 @@ def show(*, timeout_s: float = MAX_SECONDS, watch_stdin: bool = False) -> int:
     # It also keeps it out of the taskbar, where a second Grad entry that
     # disappears on its own would be its own small confusion.
     root.overrideredirect(True)
-    root.configure(bg=ink)
+    root.configure(bg=frame)
     root.attributes("-topmost", True)
     _centre(root, width, height)
 
@@ -228,7 +268,7 @@ def show(*, timeout_s: float = MAX_SECONDS, watch_stdin: bool = False) -> int:
     if image is None:
         # No Pillow, no PNG, or a Tk without the image reader. Deliberately not
         # a second hand-drawn nabla -- see `desktop.splash_png`.
-        mark.configure(text="∇", fg=ink, font=("Segoe UI", 44, "bold"), width=3, height=1)
+        mark.configure(text="∇", fg=on_brand, font=("Segoe UI", 44, "bold"), width=3, height=1)
     mark.pack(pady=(26, 14))
 
     tk.Label(
@@ -325,8 +365,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="close when the pipe from the launching process does",
     )
+    # Not validated against a list here: `tokens.palette` resolves an unknown
+    # name to the default, which is the behaviour that matters -- a splash is
+    # not the place to refuse to start over a theme name.
+    parser.add_argument("--theme", default="light", help="which palette to draw in")
     args = parser.parse_args(argv)
-    return show(timeout_s=args.timeout, watch_stdin=args.watch_stdin)
+    return show(timeout_s=args.timeout, watch_stdin=args.watch_stdin, theme=args.theme)
 
 
 if __name__ == "__main__":

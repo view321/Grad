@@ -350,6 +350,15 @@ REQUIREMENTS: dict[str, dict[str, Any]] = {
         "needs_kaggle_account": True,
         "fix": "python -m tools.kaggle account --set <username> --json",
     },
+    # Two credentials, and both are required: a token id without its secret
+    # authenticates nothing, so a workspace holding one half is not "partly
+    # ready", it is unready with a misleading panel. `missing` naming both is
+    # what stops someone going round the loop twice.
+    "modal": {
+        "credentials": (credentials.MODAL_TOKEN_ID, credentials.MODAL_TOKEN_SECRET),
+        "needs_host": False,
+        "fix": "python -m tools.jobs credential set modal_token_id   # and modal_token_secret",
+    },
 }
 
 

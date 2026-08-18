@@ -145,6 +145,12 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # Explicit for the reason `tools/nb.py` gives at its kernel spawn: this
+        # supervisor runs *the agent's own command*, and it has two possible
+        # parents -- the agent's Bash, which carries UTF-8 Mode, and the tasks
+        # window, which does not. A command that reads a paper must not depend
+        # on which button started it. See `core/spawn.py:utf8_env`.
+        env={**os.environ, **spawn.utf8_env()},
         # Detached, so it outlives this CLI -- which exits in a moment and is the
         # whole point. See `core/spawn.py` for why this is not DETACHED_PROCESS.
         **spawn.detached(),

@@ -82,13 +82,15 @@ def test_the_defaults_reproduce_the_mocks_opening_arrangement():
 def test_an_unauthenticated_machine_opens_on_setup(monkeypatch):
     """Those four windows are four windows that cannot do anything without a
     token, so the first thing on screen should be the one that fixes it."""
-    monkeypatch.setattr(state_mod.models, "setup_needed", lambda: True)
+    monkeypatch.setattr(state_mod.models, "first_run_needed", lambda: True)
     assert state_mod.opening_windows()[0] == "setup"
     assert set(registry.defaults()) <= set(state_mod.opening_windows())
 
 
 def test_a_configured_machine_opens_on_the_mocks_four(monkeypatch):
-    monkeypatch.setattr(state_mod.models, "setup_needed", lambda: False)
+    """Configured now means a token *and* a project: the arrangement asks
+    `first_run_needed`, which is the cheap half of `models.first_run`."""
+    monkeypatch.setattr(state_mod.models, "first_run_needed", lambda: False)
     assert state_mod.opening_windows() == registry.defaults()
 
 
@@ -96,7 +98,7 @@ def test_a_credential_store_that_raises_does_not_stop_a_workspace_opening(monkey
     def boom():
         raise RuntimeError("no keyring, no registry, nothing")
 
-    monkeypatch.setattr(state_mod.models, "setup_needed", boom)
+    monkeypatch.setattr(state_mod.models, "first_run_needed", boom)
     assert state_mod.opening_windows() == registry.defaults()
 
 

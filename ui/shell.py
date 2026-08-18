@@ -22,13 +22,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from ui import desktop, kit, registry
+from ui import desktop, kit, registry, tokens
 from ui.state import POLL_SECONDS, Workspace
 
 
 def build(workspace: Workspace) -> None:
     """Assemble the whole shell for one connected client."""
-    from nicegui import ui
+    from nicegui import context, ui
+
+    # Held for everything that has to reach this browser from outside a render.
+    # `context.client` resolves through the slot stack, which is empty in a
+    # spawned task -- see `Workspace.paint_theme`, whose first version was
+    # written without this and silently never repainted anything.
+    workspace.client = context.client
+    apply_theme(workspace.theme())
 
     roots: dict[str, Any] = {}
     bars: dict[str, Any] = {}
@@ -273,6 +280,57 @@ def _appbar(workspace: Workspace, windows: Any, projects: Any, workspaces: Any) 
             title="windows and arrangement (⌘K)",
             on_click=windows.open,
         )
+
+
+def apply_theme(theme: str) -> None:
+    """Put the palette on `<html>`, where the dark block's selector looks.
+
+    Both palettes are in the stylesheet already -- `ui/app.py` adds it once, at
+    import, with `shared=True`, so there is nothing to re-inject and the switch
+    is this attribute and the cascade. That is also what keeps it inside the
+    design's motion rule: an attribute flip is an instant state swap.
+
+    Written with `ui.add_body_html` on the way in and `run_javascript` on a
+    change, because those are two different moments: at build time there is no
+    socket yet and a `run_javascript` would be sent to nobody, and after build
+    there is no head left to add to. Both write the same attribute.
+
+    Never raises. A theme is decoration, and a workspace that will not open
+    because it could not read one is a worse outcome than a cream window.
+    """
+    import logging  # noqa: PLC0415
+
+    from nicegui import ui  # noqa: PLC0415
+
+    name = str(theme or tokens.DEFAULT_THEME)
+    try:
+        ui.add_body_html(
+            f'<script>document.documentElement.setAttribute('
+            f'"{tokens.THEME_ATTRIBUTE}", "{kit.attr(name)}")</script>'
+        )
+    except Exception:  # noqa: BLE001 - see the docstring
+        logging.getLogger("grad.ui").debug("theme not applied at build", exc_info=True)
+
+
+def switch_theme(workspace: Workspace, theme: str) -> None:
+    """Persist the choice and move the live page to it, in that order.
+
+    The order matters on the one path that can fail: if the write refuses -- an
+    unwritable app directory, a name a newer version wrote -- the page stays on
+    the palette that is still recorded, rather than showing one that will be
+    gone on the next launch.
+
+    **Synchronous, and that is the fix rather than a tidy-up.** This was a
+    coroutine handed to `Workspace.spawn`, which meant the repaint ran in a
+    spawned task -- where NiceGUI's slot stack is empty, `context.client` cannot
+    be resolved, and `ui.run_javascript` raises before it reaches a socket. The
+    write and the notice both succeeded, so the status bar said "theme: dark"
+    over a workspace that was still cream. There is nothing here to await:
+    `set_theme` writes a file and `paint_theme` fires a message, so making it a
+    coroutine bought only the task that broke it.
+    """
+    workspace.set_theme(theme)
+    workspace.paint_theme(theme)
 
 
 def _used_share(session: dict[str, Any]) -> float:
@@ -569,6 +627,13 @@ PRESET_ROWS = (
     ("full", "FULL", "⌥3", "the focused window, the rest at the edge"),
 )
 
+#: The palettes, and what each is for. Ordered light-first because that is the
+#: default and the list should not read as though the app has an opinion.
+THEME_ROWS = (
+    ("light", "LIGHT", "cream paper, ink rules — the design as drawn"),
+    ("dark", "DARK", "the same design at night; figures stay on white"),
+)
+
 
 def _windows_menu(ui: Any, workspace: Workspace) -> kit.Menu:
     """`⋯` and `⌘K`: which windows are open, and how they are arranged.
@@ -615,6 +680,23 @@ def _draw_windows_menu(workspace: Workspace, body: Any, menu: kit.Menu) -> None:
             for name, caption, chord, hint in PRESET_ROWS:
                 row = kit.menu_row(chord, caption, hint, title=hint)
                 row.on("click", lambda _=None, p=name: (workspace.preset(p), menu.close()))
+
+            # One row rather than a settings page. The theme is the only thing in
+            # the app with exactly two values and no consequences, and putting it
+            # behind the setup window would make a two-second decision a
+            # four-click one. `setup` still shows it, because `setup show` is
+            # where "what is this workspace wired to" is answered.
+            kit.text("APPEARANCE", "grad-caption").style("margin-top: 14px")
+            current = workspace.theme()
+            for name, caption, hint in THEME_ROWS:
+                row = kit.menu_row(
+                    "■" if name == current else "□", caption, hint,
+                    open=name == current, title=hint,
+                )
+                row.on(
+                    "click",
+                    lambda _=None, t=name: (switch_theme(workspace, t), menu.redraw()),
+                )
 
             kit.text(
                 "drag a title bar to move a window · drop it on another to swap them",

@@ -385,6 +385,166 @@ def test_an_sdk_that_cannot_resume_is_not_told_the_memory_went_back(workspace, m
     assert session.settled[-1].get("anchor") is None
 
 
+# ---------------------------------------------------------------------------
+# the third half: the files
+# ---------------------------------------------------------------------------
+class FakeCheckpointClient:
+    """A client that records the control requests it was sent, and in what order.
+
+    `closed` is what makes the ordering assertion possible: `rewind_files` is a
+    control request and `close` tears down the subprocess that answers it, so
+    the only bug worth testing for here is the two in the wrong order.
+    """
+
+    def __init__(self, *, fails: bool = False) -> None:
+        self.rewound_to: str | None = None
+        self.closed = False
+        self.rewound_after_close = False
+        self._fails = fails
+
+    async def rewind_files(self, user_message_id: str) -> None:
+        if self.closed:
+            self.rewound_after_close = True
+        if self._fails:
+            raise RuntimeError("no checkpoint for that message")
+        self.rewound_to = user_message_id
+
+    async def __aexit__(self, *_exc) -> None:
+        self.closed = True
+
+
+def checkpointing_session(monkeypatch, *, fails: bool = False, supported: bool = True):
+    """A session whose client can checkpoint and whose dropped prompt is known.
+
+    `_drops_turn` reads the SDK's own transcript off disk, which no test has --
+    so it is stubbed here. What is under test is what the rewind *does* with the
+    uuid, not the parse that finds it, which `_drops_turn` owns.
+    """
+    import agent
+
+    monkeypatch.setattr(agent, "checkpointing_supported", lambda *_: supported)
+    session = session_with(conversation())
+    # Mapped rather than constant. A stub that answers "prompt-3" whatever it is
+    # asked cannot tell "the earliest dropped prompt" from "some prompt", which
+    # is the claim the multi-turn test below is making.
+    prompts = {None: "prompt-1", "entry-1": "prompt-2", "entry-2": "prompt-3"}
+    monkeypatch.setattr(session, "_drops_turn", lambda anchor: prompts.get(anchor))
+    client = FakeCheckpointClient(fails=fails)
+    session.client = client
+    return session, client
+
+
+def test_the_files_go_back_to_the_prompt_the_rewind_drops(workspace, monkeypatch):
+    """Not to the anchor. The anchor is the *end of the last kept turn* and the
+    files should be as they were before the first dropped prompt ran, which is
+    the next user message after it."""
+    session, client = checkpointing_session(monkeypatch)
+    outcome = asyncio.run(session.rewind_to(4))
+
+    assert outcome["files"] is True
+    assert client.rewound_to == "prompt-3"
+
+
+def test_the_files_are_rewound_before_the_client_is_closed(workspace, monkeypatch):
+    """`rewind_files` is a control request and `rewind_to` closes the client.
+    Ordered the other way round this is the one half of a rewind that would
+    silently never run -- and it would fail into the same `except` as an SDK
+    that cannot checkpoint at all, so nothing would say so."""
+    session, client = checkpointing_session(monkeypatch)
+    asyncio.run(session.rewind_to(4))
+
+    assert client.closed is True, "the rewind still has to drop the client"
+    assert client.rewound_after_close is False
+
+
+def test_a_multi_turn_rewind_still_restores_the_files(workspace, monkeypatch):
+    """`resume_drops_turn` is only sent for a single-turn rewind because the SDK
+    validates it. That restriction is about the *conversation*; restoring files
+    to the earliest dropped prompt is right for any number of turns."""
+    session, client = checkpointing_session(monkeypatch)
+    outcome = asyncio.run(session.rewind_to(2))
+
+    assert outcome["files"] is True
+    # The prompt at index 2, not the one at index 4: two exchanges go, and the
+    # files belong at the point before the *first* of them ran.
+    assert client.rewound_to == "prompt-2"
+    assert session._rewind_drops is None, "two turns go, so the SDK is not told one does"
+
+
+def test_rewinding_to_the_very_first_prompt_still_restores_the_files(workspace, monkeypatch):
+    """The "start over" rewind, and the one where the work matters most.
+
+    Rewinding to index 0 keeps nothing, so there is no last-entry-of-the-last-
+    kept-turn to anchor on -- and `dropped_prompt` was computed only `if anchor`,
+    so this case moved the transcript and left every file the session had
+    written. A missing anchor means "the first prompt in the conversation", not
+    "no prompt at all".
+    """
+    session, client = checkpointing_session(monkeypatch)
+    outcome = session and asyncio.run(session.rewind_to(0))
+
+    assert outcome["ok"] is True
+    assert outcome["files"] is True
+    assert client.rewound_to == "prompt-1"
+
+
+def test_an_sdk_that_cannot_checkpoint_rewinds_everything_else(workspace, monkeypatch):
+    session, client = checkpointing_session(monkeypatch, supported=False)
+    outcome = asyncio.run(session.rewind_to(4))
+
+    assert outcome["ok"] is True
+    assert outcome["files"] is False
+    assert client.rewound_to is None
+    assert len(session.settled) == 5, "the transcript still moved"
+
+
+def test_a_failed_file_rewind_does_not_take_the_rewind_down(workspace, monkeypatch):
+    """Every reason this can fail is ordinary -- a prompt with no checkpoint, a
+    session already gone -- and none of them is a reason to refuse to rewind the
+    transcript."""
+    session, client = checkpointing_session(monkeypatch, fails=True)
+    outcome = asyncio.run(session.rewind_to(4))
+
+    assert outcome["ok"] is True
+    assert outcome["files"] is False
+    assert session.settled[-1]["kind"] == rewind.MARK_KIND
+
+
+def test_the_restore_is_only_claimed_when_it_happened(workspace, monkeypatch):
+    """Most conversations edit no files, so an absence is the common case and
+    reporting it reads as a failure of something never attempted."""
+    session, _ = checkpointing_session(monkeypatch, supported=False)
+    outcome = asyncio.run(session.rewind_to(4))
+    assert "files" not in outcome["message"]
+
+    session, _ = checkpointing_session(monkeypatch)
+    outcome = asyncio.run(session.rewind_to(4))
+    assert "files it edited are back" in outcome["message"]
+
+
+def test_the_marker_says_what_the_restore_did_and_did_not_cover(workspace):
+    """The agent works mostly through Bash, so "files were restored" on its own
+    would be read as a promise the checkpointing does not make."""
+    marker = rewind.record(dropped=[user("x")], resumed=True, files=True)
+    assert marker["files"] is True
+    assert "anything a command wrote was not" in marker["text"]
+
+    quiet = rewind.record(dropped=[user("x")], resumed=True)
+    assert quiet["files"] is False
+    assert "restored" not in quiet["text"]
+
+
+def test_checkpointing_support_is_detected_rather_than_assumed(workspace):
+    import agent
+
+    assert agent.checkpointing_supported(_sdk_stub(fields=("enable_file_checkpointing",))) is True
+    assert agent.checkpointing_supported(_sdk_stub(fields=("resume",))) is False
+    assert agent.checkpointing_option(_sdk_stub(fields=("enable_file_checkpointing",))) == {
+        "enable_file_checkpointing": True
+    }
+    assert agent.checkpointing_option(_sdk_stub(fields=("resume",))) == {}
+
+
 def test_a_turn_that_starts_while_the_client_is_closing_aborts_the_rewind(workspace):
     """`close` tears down a CLI subprocess and the composer is live throughout.
     A prompt sent in that window has already appended to `settled` and started a

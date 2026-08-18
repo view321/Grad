@@ -53,12 +53,19 @@ def test_the_colours_are_the_ones_the_handoff_specifies(name, value):
 def test_every_state_accent_is_a_real_token():
     assert set(tokens.STATE_ACCENT) == {"ok", "attention", "broken", "neutral"}
     assert set(tokens.STATE_ACCENT.values()) <= set(tokens.COLOUR.values())
+    # Keyed rather than valued, so the mapping means the same thing in a palette
+    # it was not written against.
+    assert set(tokens.STATE_ACCENT_KEYS) == set(tokens.STATE_ACCENT)
+    for theme in tokens.PALETTES:
+        assert set(tokens.STATE_ACCENT_KEYS.values()) <= set(tokens.palette(theme))
 
 
 def test_every_series_colour_is_a_real_token():
     assert set(tokens.SERIES.values()) <= set(tokens.COLOUR.values())
     for name in tokens.SERIES:
         assert f"--grad-series-{name}:" in tokens.css_variables()
+    for theme in tokens.PALETTES:
+        assert set(tokens.SERIES_KEYS.values()) <= set(tokens.palette(theme))
 
 
 def test_no_chart_series_borrows_a_chromatic_state_accent():
@@ -79,6 +86,14 @@ def test_no_chart_series_borrows_a_chromatic_state_accent():
         tokens.STATE_ACCENT["broken"],
     }
     assert set(tokens.SERIES.values()) & chromatic == set()
+    # And in every palette, which is the version of the claim that survives a
+    # second one being added: a dark `link` that happened to land on the dark
+    # `broken` would put a state's colour in a chart without changing a rule.
+    for theme in tokens.PALETTES:
+        active = tokens.palette(theme)
+        accents = {active[tokens.STATE_ACCENT_KEYS[s]] for s in ("ok", "attention", "broken")}
+        series = {active[key] for key in tokens.SERIES_KEYS.values()}
+        assert series & accents == set(), theme
 
 
 @pytest.mark.parametrize(
@@ -95,6 +110,147 @@ def test_chart_fills_are_drawn_from_the_series_ramp(selector):
     sheet = tokens.stylesheet()
     block = sheet.split(selector, 1)[1].split("}", 1)[0]
     assert "--grad-series-" in block, f"{selector} does not use a series colour: {block}"
+
+
+# ---------------------------------------------------------------------------
+# the second palette
+# ---------------------------------------------------------------------------
+def relative_luminance(hex_colour: str) -> float:
+    """WCAG 2.1 relative luminance, for the contrast check below."""
+    value = hex_colour.lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    channels = []
+    for i in (0, 2, 4):
+        c = int(value[i : i + 2], 16) / 255
+        channels.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    r, g, b = channels
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a: str, b: str) -> float:
+    la, lb = relative_luminance(a), relative_luminance(b)
+    lo, hi = sorted((la, lb))
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_both_palettes_carry_exactly_the_same_tokens():
+    """A key in one and not the other is a rule that renders as `unset` -- which
+    is not a visible failure, it is the *inherited* colour, so the element looks
+    plausible and is wrong."""
+    assert set(tokens.DARK) == set(tokens.COLOUR)
+
+
+@pytest.mark.parametrize("theme", sorted(tokens.PALETTES))
+def test_every_ground_carries_legible_text_in_every_palette(theme):
+    """The rule the light palette got to satisfy by inspection.
+
+    Inspection does not survive a second palette: `on-series-third` was white on
+    `link`, which is 5.6:1 in cream and 2.4:1 in the dark, and the first anyone
+    would have known is an unreadable spend meter at night.
+    """
+    active = tokens.palette(theme)
+    failures = []
+    for ground, text in tokens.FOREGROUND.items():
+        ratio = contrast(active[ground], active[text])
+        if ratio < 4.5:
+            failures.append(f"{ground}/{text} = {ratio:.2f}:1")
+    for series, text in tokens.SERIES_FOREGROUND.items():
+        ratio = contrast(active[tokens.SERIES_KEYS[series]], active[text])
+        if ratio < 4.5:
+            failures.append(f"series-{series}/{text} = {ratio:.2f}:1")
+    assert not failures, f"{theme}: " + ", ".join(failures)
+
+
+def hue_degrees(hex_colour: str) -> float:
+    import colorsys
+
+    value = hex_colour.lstrip("#")
+    r, g, b = (int(value[i : i + 2], 16) / 255 for i in (0, 2, 4))
+    return colorsys.rgb_to_hsv(r, g, b)[0] * 360
+
+
+@pytest.mark.parametrize("theme", sorted(tokens.PALETTES))
+def test_the_three_state_accents_stay_distinguishable(theme):
+    """"One accent per state" is only information if the states do not converge.
+
+    Measured as **hue** separation and deliberately not as contrast ratio. The
+    first version of this test used the luminance formula above and failed on a
+    perfectly good pair -- the dark palette's teal and its yellow are 1.48:1 and
+    are not remotely confusable, because a contrast ratio says how legible one
+    is *on* the other and nothing about telling two fills apart side by side.
+    Yellow, teal and crimson are read by hue; that is the thing to hold.
+    """
+    active = tokens.palette(theme)
+    hues = {
+        state: hue_degrees(active[tokens.STATE_ACCENT_KEYS[state]])
+        for state in ("ok", "attention", "broken")
+    }
+    for a, b in (("ok", "attention"), ("ok", "broken"), ("attention", "broken")):
+        gap = abs(hues[a] - hues[b]) % 360
+        assert min(gap, 360 - gap) >= 30, f"{theme}: {a} and {b} share a hue"
+
+
+def test_the_accents_keep_their_hues_across_the_two_palettes():
+    """The vocabulary is "yellow needs you, teal passed, red broke". A dark theme
+    that renegotiated that would be a different design rather than the same one
+    at night -- so the values may move for legibility and the hues may not."""
+    for state in ("ok", "attention", "broken"):
+        key = tokens.STATE_ACCENT_KEYS[state]
+        gap = abs(hue_degrees(tokens.COLOUR[key]) - hue_degrees(tokens.DARK[key])) % 360
+        assert min(gap, 360 - gap) <= 20, state
+
+
+def test_the_dark_palette_is_actually_dark():
+    """Stated as an assertion because the failure mode is subtle: a palette that
+    inverted the text and forgot a ground reads as light with white text."""
+    dark = tokens.palette("dark")
+    for ground in ("paper", "paper-raised", "paper-sunk", "desk"):
+        assert relative_luminance(dark[ground]) < 0.08, ground
+    assert relative_luminance(dark["ink"]) > 0.5
+
+
+def test_the_emphasis_ground_does_not_become_the_brightest_thing_on_screen():
+    """The whole reason `fill` exists. The app bar, the status bar and every
+    table head are `background: var(--grad-fill)`, and they were
+    `var(--grad-ink)` -- so a palette that only swapped ink and paper would have
+    given the dark theme a white app bar and white table headers."""
+    dark = tokens.palette("dark")
+    assert relative_luminance(dark["fill"]) < relative_luminance(dark["ink"])
+    # And still distinct from the page it sits on, or the bar stops being one.
+    assert contrast(dark["fill"], dark["paper"]) > 1.15
+
+
+def test_the_hard_shadow_never_becomes_a_glow():
+    """`SHADOW_SHELL` is an 8px offset block. Drawn in `ink` it is near-black on
+    cream and near-*white* in the dark palette, which is a glow."""
+    assert "var(--grad-shadow-ink)" in tokens.SHADOW_SHELL
+    for theme in tokens.PALETTES:
+        assert relative_luminance(tokens.palette(theme)["shadow-ink"]) < 0.05, theme
+
+
+def test_the_switch_is_one_attribute_and_ships_in_the_same_sheet():
+    """Both palettes travel in one stylesheet because `ui/app.py` adds it once,
+    at import, with `shared=True` -- there is no second injection to make, so a
+    theme change is an attribute on `<html>` and the cascade does the rest. That
+    is also what keeps it inside the design's motion rule: an attribute flip is
+    an instant state swap, not a transition."""
+    sheet = tokens.stylesheet()
+    assert f':root[{tokens.THEME_ATTRIBUTE}="dark"]' in sheet
+    for name, value in tokens.DARK.items():
+        assert f"--grad-{name}: {value};" in sheet, name
+    # The non-colour half is emitted once: a second copy would be a second place
+    # for the handle width to disagree with `layout.py`.
+    assert sheet.count("--grad-handle:") == 1
+
+
+def test_an_unknown_theme_falls_back_rather_than_failing():
+    """What a settings file written by a newer version looks like from an older
+    one. The answer is the design's default, not a stylesheet that will not
+    generate and takes the window with it."""
+    assert tokens.palette("solarized") == tokens.COLOUR
+    assert tokens.palette(None) == tokens.COLOUR
+    assert tokens.palette("DARK") == tokens.DARK
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +284,14 @@ def test_no_shadow_in_the_system_has_a_blur():
 
 
 def test_the_structural_border_is_two_pixels_of_ink():
-    assert tokens.BORDER_STRUCTURAL == f"2px solid {tokens.COLOUR['ink']}"
+    """Through the custom property rather than the literal.
+
+    It used to interpolate `COLOUR['ink']` at import, which put `2px solid
+    #14100C` in the sheet -- so `--grad-border` was pinned to the light palette
+    by an f-string and no re-declaration of `--grad-ink` could move it. The
+    claim is unchanged; what it resolves through is."""
+    assert tokens.BORDER_STRUCTURAL == "2px solid var(--grad-ink)"
+    assert "--grad-border: 2px solid var(--grad-ink);" in tokens.css_variables()
 
 
 def test_the_minimum_pane_matches_the_layout_model():

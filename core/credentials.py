@@ -59,6 +59,20 @@ ASTA_KEY = "asta_api_key"
 # belongs in a file you can read; the thing that authorises it does not.
 KAGGLE_KEY = "kaggle_key"
 
+# The ninth and tenth, and the fourth path that can reach a machine. Modal
+# authenticates with a token *pair* and both halves are secret -- unlike Kaggle,
+# where the username is a name and only the key authorises, and unlike HF, where
+# the namespace is config. `ak-...` identifies the token rather than the account,
+# so there is nothing here worth putting in a file you can read.
+#
+# Both are stored rather than exported. `modal.Client.from_credentials` takes
+# them as arguments and sends them as gRPC headers, so unlike every other
+# backend in this project the secret never has to enter a child's environment at
+# all -- which is the strongest form of what §9 asks for, and the reason
+# `tools/modal.py` never sets MODAL_TOKEN_ID.
+MODAL_TOKEN_ID = "modal_token_id"
+MODAL_TOKEN_SECRET = "modal_token_secret"
+
 #: Every credential this project knows, in one tuple so nothing derived from it
 #: can be added to and then forgotten. `status()` reports these,
 #: `tools/jobs.py` accepts these, and `scrub_environment` removes the `GRAD_*`
@@ -74,6 +88,8 @@ ALL: tuple[str, ...] = (
     CLAUDE_TOKEN,
     ASTA_KEY,
     KAGGLE_KEY,
+    MODAL_TOKEN_ID,
+    MODAL_TOKEN_SECRET,
 )
 
 

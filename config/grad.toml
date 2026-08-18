@@ -229,6 +229,68 @@ Tpu1VmV38 = "tpu"
 TpuV5E8 = "tpu"
 TpuV6E8 = "tpu"
 
+[modal]
+# Modal runs the pipeline in a Sandbox: a container started from a registry
+# image with the code copied in, an entrypoint, and a GPU. It is the one backend
+# here that bills per *second* against a published rate table, which is why it
+# needs none of Kaggle's hours machinery -- the [spend] ceilings above are
+# already the right instrument, and `collect` prices the real elapsed seconds.
+#
+# Authentication is a token pair, both halves secret, both in the OS credential
+# store:
+#   python -m tools.jobs credential set modal_token_id
+#   python -m tools.jobs credential set modal_token_secret
+#   python -m tools.modal account --check --json
+#
+# Unlike every other backend here, the secret never enters a child process:
+# `modal.Client.from_credentials` takes it as an argument and sends it as a gRPC
+# header. There is nothing to scrub because nothing is exported.
+default_gpu = "H100"
+# The Modal App every sandbox is created under. One name rather than one per
+# run, so the Modal dashboard groups a project's work the way the ledger does.
+app_name = "grad"
+# Where the sandbox writes what `collect` reads back. A Modal Volume, because a
+# sandbox's filesystem is gone once it exits and `metrics.json` has to outlive
+# it -- see `tools/modal.py`. Created on first use.
+volume_name = "grad-runs"
+mount_path = "/grad/out"
+# Where the pipeline is copied to inside the image, and the working directory
+# the entrypoint runs in.
+workdir = "/grad/pipeline"
+poll_interval_s = 20
+# Modal's own ceiling on a Sandbox's lifetime is 24 hours and it is hard: the
+# container is killed there whatever the job was doing. This is the local bound,
+# taken from the spec's `[estimate] hours` plus a margin, and it refuses a spec
+# asking for more rather than starting a run that cannot finish.
+max_hours = 24.0
+timeout_margin = 1.25
+
+[modal.gpu_rates]
+# Dollars per *hour*, converted from Modal's published per-second prices (H100 is
+# $0.001097/s = $3.9492/h). Per hour rather than per second because that is the
+# unit the rest of this file and every estimate in a spec already use.
+#
+# `collect` prices the sandbox's real start and end against this table, so a rate
+# that is stale in the optimistic direction makes the ceiling decoration. Modal
+# publishes these at modal.com/pricing; check them when a new card appears.
+"T4" = 0.5904
+"L4" = 0.7992
+"A10G" = 1.1016
+"L40S" = 1.9512
+"A100-40GB" = 2.0988
+"A100-80GB" = 2.4984
+"H100" = 3.9492
+"H200" = 4.5396
+"B200" = 6.2496
+#
+# GPU time only. Modal also bills for the CPU and memory a sandbox holds
+# ($0.0000131/core/s and $0.00000222/GiB/s), and those are deliberately not in
+# this table: `tools/modal.py` passes no `cpu=` or `memory=`, so the allocation
+# is Modal's default and this side does not know what it is. A rate that cannot
+# be multiplied by a quantity is not a price, and two entries sitting here
+# unused would read as if they were being charged. They are small next to an
+# H100 and they are not zero, so the run record says the cost excludes them.
+
 # SSH hosts are a fixed inventory; an unknown name is a configuration error,
 # never an ad-hoc connection. Uncomment and fill in for a real host.
 #

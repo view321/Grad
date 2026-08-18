@@ -772,11 +772,26 @@ def window_args() -> dict[str, Any]:
 
     A size is always returned; a position only when there is a saved one that
     lands on a screen that exists right now.
+
+    **`text_select` is here because pywebview's default is `False`, and its
+    default is not a preference -- it injects
+    `body { user-select: none; cursor: default }` into the page.** Everything in
+    the workspace is text somebody might need to copy: a run id to paste into a
+    command, a traceback to search for, a metric out of the ledger, the agent's
+    own answer. None of it could be selected in the desktop app, and all of it
+    could in the browser UI, which is why this survived -- development happens
+    in a browser and the injected rule is not in any stylesheet to grep for.
+
+    Turning it on restores what `ui/tokens.py` already assumed. The sheet puts
+    `user-select: none` on exactly three things -- the title bar, the split
+    handle, and everything while a drag is in flight -- which is a set that only
+    makes sense if selection is *on* everywhere else. It was written against the
+    browser, where it is.
     """
     saved = read_geometry()
     width = max(MIN_SIZE[0], int(saved.get("width") or DEFAULT_SIZE[0]))
     height = max(MIN_SIZE[1], int(saved.get("height") or DEFAULT_SIZE[1]))
-    args: dict[str, Any] = {"width": width, "height": height}
+    args: dict[str, Any] = {"width": width, "height": height, "text_select": True}
     if saved.get("maximized"):
         args["maximized"] = True
     if "x" in saved and "y" in saved:

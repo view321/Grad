@@ -99,6 +99,14 @@ def _start_kernel(name: str, kernel_name: str) -> dict[str, Any]:
             stdout=fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
+            # Explicit rather than inherited, because this kernel has two
+            # parents. Started from the agent's Bash it would inherit
+            # `agent.interpreter_env`'s copy; started from the notebook window
+            # it inherits the desktop app's environment, which has none -- and
+            # "reading a paper crashes in the notebook but not in the shell" is
+            # a difference nobody should have to discover. See
+            # `core/spawn.py:utf8_env`.
+            env={**os.environ, **spawn.utf8_env()},
             **spawn.detached(),
         )
     conn.with_suffix(".pid").write_text(str(proc.pid), encoding="utf-8")

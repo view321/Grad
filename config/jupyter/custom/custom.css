@@ -201,4 +201,5 @@ body, .jp-Notebook, .jp-NotebookPanel { background: #F7F3E8; }
 .cm-operator, .cm-punctuation { color: #8A8272; }
 .cm-editor .cm-ruler { border-right: 1px dashed rgba(20,16,12,0.3); }
 .cm-cursor { border-left: 2px solid #14100C; }
-.cm-editor .cm-selectionBackground { background: #FFD400 !important; }
+.cm-editor .cm-selectionBackground { background: #FFD400 !important;
+                                       color: #14100C !important; }

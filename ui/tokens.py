@@ -56,11 +56,169 @@ COLOUR: dict[str, str] = {
     "ink-rule": "#4A443A",
     "row-alt": "#FDFAF2",
     "attention-row": "#FFFBE8",
+    # -- role tokens -------------------------------------------------------
+    # Everything above names a *colour*. The seven below name a *job*, and they
+    # exist because the light palette gets to conflate jobs that a dark one
+    # cannot. In cream-and-ink, `ink` is simultaneously the text on paper, the
+    # fill of the app bar, and the text on a yellow chip. Invert the ground and
+    # those three want to move in different directions: the text goes light, the
+    # app bar must stay dark or it becomes the brightest thing on screen, and
+    # the text on yellow must not move at all, because the yellow did not.
+    #
+    # So a fill and its foreground are named as a pair, and `test_ui_tokens.py`
+    # holds every pair to 4.5:1 *in both palettes*. That is the property that
+    # makes a second palette safe to add: a contrast rule you can only check by
+    # eye is a contrast rule that is already broken somewhere you have not
+    # looked.
+    #
+    # In this palette each one equals the colour it replaced, so the light
+    # stylesheet renders exactly as it did before they existed.
+    #: The emphasis ground: app bar, status bar, table head, focused title bar,
+    #: active button. "Inverted from the page", which is ink here and a raised
+    #: dark grey in the dark palette -- not the light one `ink` becomes.
+    "fill": "#14100C",
+    #: Text and hairline borders on `fill`.
+    "fill-ink": "#F7F3E8",
+    #: Text on the yellow. Fixed across both palettes, because `attention` is
+    #: fixed across both -- a brand mark that changed value with the theme would
+    #: stop being one.
+    "on-attention": "#14100C",
+    #: Text on the crimson. The `#fff` the handoff names ("`#A3122F` fill, white
+    #: text"), given a name so the dark sheet cannot be searched for stray
+    #: literals and find the one that is deliberate.
+    "on-broken": "#FFFFFF",
+    #: Text on `verified-tint`, which is a *tint* and not the fill: the fill
+    #: stays teal in both palettes and carries `verified-ink`, while the tint
+    #: inverts with the ground and needs a foreground that inverts with it.
+    "verified-tint-ink": "#04302C",
+    #: The hard shadow. Ink here; **not** `ink` in the dark palette, where an
+    #: 8px offset block of near-white is a glow rather than a shadow.
+    "shadow-ink": "#14100C",
+    #: What shows through behind the JupyterLab iframe before it paints. Was a
+    #: `#fff` literal, which is a white flash on every retile in a dark theme.
+    "iframe-ground": "#FFFFFF",
+    #: One per chart series, because a series fill is a fill like any other and
+    #: the segment labels sit inside it. `base` tracks `paper` in both palettes
+    #: (the series is `ink`, so its foreground is whatever ink is legible on);
+    #: the other two are pinned dark and light respectively by what their fills
+    #: do when the ground inverts.
+    "on-series-base": "#F7F3E8",
+    "on-series-alt": "#14100C",
+    "on-series-third": "#FFFFFF",
+}
+
+#: The dark palette: the same keys, none added and none missing.
+#:
+#: Not a computed inversion. Inverting lightness mechanically gives a blue-grey
+#: screen and a muddy yellow, and the two colours this design is *about* --
+#: `attention` and `verified` -- are the two an inversion damages most. These
+#: are chosen against the same rules the light table was: warm greys rather than
+#: neutral ones, one accent per state, and a foreground for every fill.
+#:
+#: `attention`, `verified` and `broken` keep their hues. They are the vocabulary
+#: -- "yellow needs you, teal passed, red broke" -- and a theme that renegotiated
+#: them would be a different design rather than the same one at night.
+DARK: dict[str, str] = {
+    "ink": "#EFE8DA",
+    "paper": "#17140F",
+    "paper-raised": "#211D16",
+    "paper-sunk": "#100E0A",
+    "desk": "#0A0806",
+    "rule-soft": "rgba(239,232,218,0.16)",
+    "rule-mid": "rgba(239,232,218,0.32)",
+    "attention": "#FFD400",
+    # Lifted from #12A594: the light palette's teal is a *fill* under dark text,
+    # and here it also has to read as a stroke on a dark ground -- the band, the
+    # progress fill and the `ok` chip's border all draw with it.
+    "verified": "#1FC7B3",
+    "verified-ink": "#04302C",
+    "verified-tint": "#0E2E29",
+    "broken": "#D8324F",
+    "broken-tint": "#2C0F17",
+    "broken-ink": "#FF9AAB",
+    "broken-ink-2": "#FF8299",
+    "link": "#E8845C",
+    "muted": "#A79E8B",
+    "muted-2": "#8F8776",
+    "literal": "#45D6C2",
+    "hatch-a": "#1C1913",
+    "hatch-b": "#252118",
+    "ink-rule": "#4A443A",
+    "row-alt": "#1B1712",
+    "attention-row": "#241F0E",
+    # The emphasis ground goes *up* from paper here, not down to near-black.
+    # Dark UI convention and the handoff's own logic agree for once: elevation
+    # reads as light, and an app bar darker than the window it sits on would be
+    # a hole rather than a bar.
+    "fill": "#2E2822",
+    "fill-ink": "#EFE8DA",
+    "on-attention": "#14100C",
+    "on-broken": "#FFFFFF",
+    "verified-tint-ink": "#8AE6D6",
+    "shadow-ink": "#000000",
+    "iframe-ground": "#1E1B16",
+    "on-series-base": "#17140F",
+    "on-series-alt": "#14100C",
+    # `link` is light enough here that white on it is 2.4:1. The other two
+    # foregrounds are unchanged by the inversion; this one had to move.
+    "on-series-third": "#2A1008",
+}
+
+#: The two palettes by name. `light` is the handoff's and is the default
+#: everywhere -- a theme setting that has never been touched resolves to it.
+PALETTES: dict[str, dict[str, str]] = {"light": COLOUR, "dark": DARK}
+DEFAULT_THEME = "light"
+
+#: Every ground in the system, and the token that is legible on it.
+#:
+#: This is the table that makes a second palette safe. The rule "one accent per
+#: state" is enforceable because `STATE_ACCENT` is total; the rule "text on a
+#: fill can be read" needs the same treatment, and until there were two palettes
+#: it did not have it -- the light one is legible by inspection and inspection
+#: does not scale to a ground somebody inverts.
+#:
+#: `test_ui_tokens.py` holds every pair here to WCAG 4.5:1 **in both palettes**,
+#: which is what caught `on-series-third`: white on the light palette's `link`
+#: is 5.6:1 and white on the dark one's is 2.4:1, and nothing else would have
+#: said so until a spend meter was unreadable at night.
+FOREGROUND: dict[str, str] = {
+    "paper": "ink",
+    "paper-raised": "ink",
+    "paper-sunk": "ink",
+    "desk": "ink",
+    "row-alt": "ink",
+    "attention-row": "ink",
+    "fill": "fill-ink",
+    "attention": "on-attention",
+    "broken": "on-broken",
+    "verified": "verified-ink",
+    "verified-tint": "verified-tint-ink",
+    "broken-tint": "broken-ink",
+    "iframe-ground": "ink",
+}
+
+#: The same claim for the chart ramp, kept separate because the keys on the left
+#: are series names rather than palette entries.
+SERIES_FOREGROUND: dict[str, str] = {
+    "base": "on-series-base",
+    "alt": "on-series-alt",
+    "third": "on-series-third",
 }
 
 # The four state accents, and the rule that governs them. `one accent per state,
 # never two in the same element` is a property of this mapping being total: a
 # state that is not here has no accent, rather than borrowing one.
+#:
+#: Named by palette *key* rather than by value, so the mapping means the same
+#: thing in both palettes -- "ok is whatever `verified` is here". Resolved
+#: against the light palette below for the callers that want a colour.
+STATE_ACCENT_KEYS: dict[str, str] = {
+    "ok": "verified",
+    "attention": "attention",
+    "broken": "broken",
+    "neutral": "ink",
+}
+
 STATE_ACCENT: dict[str, str] = {
     "ok": COLOUR["verified"],
     "attention": COLOUR["attention"],
@@ -82,11 +240,16 @@ STATE_ACCENT: dict[str, str] = {
 # None of these three are chromatic accents, so a chart can be read as a chart
 # and a yellow fill can go back to meaning "this needs you".
 # `test_ui_tokens.py` holds the two mappings disjoint.
-SERIES: dict[str, str] = {
-    "base": COLOUR["ink"],
-    "alt": COLOUR["muted"],
-    "third": COLOUR["link"],
+# Keyed the same way `STATE_ACCENT_KEYS` is, and for the same reason: the claim
+# "a series is never a state accent" is about the *mapping*, so it has to be
+# checkable in whichever palette is on screen rather than in one of them.
+SERIES_KEYS: dict[str, str] = {
+    "base": "ink",
+    "alt": "muted",
+    "third": "link",
 }
+
+SERIES: dict[str, str] = {name: COLOUR[key] for name, key in SERIES_KEYS.items()}
 
 # ---------------------------------------------------------------------------
 # type
@@ -104,13 +267,28 @@ TYPE_SCALE: tuple[float, ...] = (
 # ---------------------------------------------------------------------------
 # structure
 # ---------------------------------------------------------------------------
-BORDER_STRUCTURAL = f"2px solid {COLOUR['ink']}"
-BORDER_HAIRLINE = f"1px solid {COLOUR['rule-soft']}"
-BORDER_SECONDARY = f"1px dashed {COLOUR['rule-mid']}"
-BORDER_PENDING = f"2px dashed {COLOUR['ink']}"
+# Written as `var()` references rather than as interpolated hex, and that is the
+# one change that made a second palette possible at all.
+#
+# These used to read `f"2px solid {COLOUR['ink']}"`, evaluated at import -- so
+# `--grad-border` reached the browser as a literal `2px solid #14100C` and no
+# amount of re-declaring `--grad-ink` further down could move it. Every
+# structural rule in the sheet is built from these four, which meant every
+# border and both shadows were pinned to the light palette by an f-string.
+#
+# Indirection through the custom property costs nothing (the browser resolves it
+# at use) and buys the whole feature: one `:root` block per theme, and every
+# derived value follows.
+BORDER_STRUCTURAL = "2px solid var(--grad-ink)"
+BORDER_HAIRLINE = "1px solid var(--grad-rule-soft)"
+BORDER_SECONDARY = "1px dashed var(--grad-rule-mid)"
+BORDER_PENDING = "2px dashed var(--grad-ink)"
 
-SHADOW_SHELL = f"8px 8px 0 {COLOUR['ink']}"
-SHADOW_CARD = f"6px 6px 0 {COLOUR['ink']}"
+# `shadow-ink`, not `ink`. The offset block is near-black in both palettes: in
+# the dark one `ink` is near-white, and an 8px white slab under every window is
+# a glow, which is the opposite of what a shadow is for.
+SHADOW_SHELL = "8px 8px 0 var(--grad-shadow-ink)"
+SHADOW_CARD = "6px 6px 0 var(--grad-shadow-ink)"
 
 RADIUS = "0"
 STRIPE_WIDTH = "6px"          # cell / ledger-entry state stripe
@@ -127,10 +305,55 @@ MIN_PANE_PX = 320             # the handoff's minimum pane width
 BLINK = "gradblink 1.1s steps(1) infinite"
 
 
-def css_variables() -> str:
-    """`:root` block. Everything else in the stylesheet reads from here."""
-    lines = [f"    --grad-{name}: {value};" for name, value in COLOUR.items()]
-    lines += [f"    --grad-series-{name}: {value};" for name, value in SERIES.items()]
+def palette(theme: str | None = None) -> dict[str, str]:
+    """One palette by name, falling back to light rather than raising.
+
+    An unknown name is what a settings file written by a newer version looks
+    like from an older one, and the answer to that is the design's default --
+    not a stylesheet that fails to generate and takes the window with it.
+    """
+    return PALETTES.get(str(theme or DEFAULT_THEME).lower(), COLOUR)
+
+
+def resolved_theme() -> str:
+    """The palette this workspace is set to, or the default. Never raises.
+
+    One copy, because there were three: `ui/render.py`, `ui/splash.py` and
+    `ui/state.py` each had the same try-settings-except-default, and one of them
+    fell back to a literal `"light"` rather than to `DEFAULT_THEME` -- which is
+    the drift `_check_number`'s docstring warns about, arriving on schedule.
+
+    Here rather than in `core/settings.py` because the fallback is a *design*
+    fact: an unreadable setting resolves to the palette the design ships, and
+    `palette()` already makes the same choice for an unknown name.
+    """
+    try:
+        from core import settings  # noqa: PLC0415 - keeps `core` off the import path
+
+        return settings.theme()
+    except Exception:  # noqa: BLE001 - a theme is never worth failing to draw
+        return DEFAULT_THEME
+
+
+def colour_variables(theme: str | None = None) -> str:
+    """Just the colours, for one palette. The part that differs between themes."""
+    active = palette(theme)
+    lines = [f"    --grad-{name}: {value};" for name, value in active.items()]
+    lines += [
+        f"    --grad-series-{name}: {active[key]};" for name, key in SERIES_KEYS.items()
+    ]
+    return "\n".join(lines)
+
+
+def css_variables(theme: str | None = None) -> str:
+    """`:root` block. Everything else in the stylesheet reads from here.
+
+    The non-colour half is emitted once, with the light palette, because none of
+    it varies: a border is two pixels in both themes and its colour is a `var()`
+    reference resolved at use. That split is what lets `themed_variables` emit a
+    second block containing only the table that actually changes.
+    """
+    lines = [colour_variables(theme)]
     lines += [
         f"    --grad-font-sans: {FONT_SANS};",
         f"    --grad-font-mono: {FONT_MONO};",
@@ -146,6 +369,33 @@ def css_variables() -> str:
         f"    --grad-min-pane: {MIN_PANE_PX}px;",
     ]
     return ":root {\n" + "\n".join(lines) + "\n}"
+
+
+#: The attribute the shell sets on `<html>`, and the selector the dark block is
+#: scoped by. One attribute rather than a class because `ui/static/tiling.js`
+#: and the Lab iframe both need to read the current theme without knowing what
+#: else is on the element.
+THEME_ATTRIBUTE = "data-grad-theme"
+
+
+def themed_variables() -> str:
+    """The override block for every palette that is not the default.
+
+    Both palettes ship in one stylesheet, which is what makes switching instant
+    and reload-free: `ui/app.py` adds the sheet once, at import, with
+    `shared=True`, so there is no second injection to make -- the switch is one
+    attribute on the document element and the cascade does the rest. That also
+    satisfies the design's motion rule for free, since an attribute flip is an
+    instant state swap rather than a transition.
+    """
+    blocks = []
+    for name in PALETTES:
+        if name == DEFAULT_THEME:
+            continue
+        blocks.append(
+            f':root[{THEME_ATTRIBUTE}="{name}"] {{\n{colour_variables(name)}\n}}'
+        )
+    return "\n\n".join(blocks)
 
 
 def _quasar_reset() -> str:
@@ -172,6 +422,24 @@ def _quasar_reset() -> str:
 .grad-app .q-field__native, .grad-app .q-field__input {
     font-family: var(--grad-font-sans); color: var(--grad-ink); }
 .grad-app .q-tab { text-transform: none; letter-spacing: 0; }
+
+/* The one rule in here that is deliberately *not* scoped to the app root.
+   Quasar renders a select's popup into a portal at `<body>` level, so it is
+   not inside `.grad-app` and nothing above reaches it -- which is why the
+   squared corners declared for `.grad-app .q-menu` have never applied to the
+   three selects in this app. That was invisible while Quasar's white default
+   sat under a cream design; against a dark one it is a white card in the
+   middle of the screen. `ui.run(dark=False)` stays as it is: Quasar's dark
+   mode would fight every token here, and this is all it was needed for. */
+.q-menu {
+    border-radius: 0 !important; box-shadow: none !important;
+    background: var(--grad-paper-raised); color: var(--grad-ink);
+    border: var(--grad-border);
+}
+.q-menu .q-item { font-family: var(--grad-font-mono); font-size: 12px; }
+.q-menu .q-item.q-manual-focusable--focused,
+.q-menu .q-item:hover { background: var(--grad-paper-sunk); }
+.q-menu .q-item.q-item--active { background: var(--grad-fill); color: var(--grad-fill-ink); }
 """
 
 
@@ -204,8 +472,8 @@ html, body { height: 100%; overflow: hidden; }
     line-height: 1.55;
 }
 .grad-app a { color: var(--grad-link); text-decoration: underline; text-underline-offset: 2px; }
-.grad-app a:hover { color: var(--grad-ink); background: var(--grad-attention); }
-.grad-app ::selection { background: var(--grad-attention); color: var(--grad-ink); }
+.grad-app a:hover { color: var(--grad-on-attention); background: var(--grad-attention); }
+.grad-app ::selection { background: var(--grad-attention); color: var(--grad-on-attention); }
 .grad-app :focus-visible { outline: 2px solid var(--grad-ink); outline-offset: 2px; }
 
 .grad-mono { font-family: var(--grad-font-mono); }
@@ -239,8 +507,8 @@ def _shell() -> str:
     height: calc(100vh - 28px); margin: 14px; overflow: hidden;
 }
 .grad-appbar {
-    display: flex; align-items: stretch; background: var(--grad-ink);
-    color: var(--grad-paper); border-bottom: var(--grad-border); flex: 0 0 auto;
+    display: flex; align-items: stretch; background: var(--grad-fill);
+    color: var(--grad-fill-ink); border-bottom: var(--grad-border); flex: 0 0 auto;
 }
 .grad-appbar-cell {
     display: flex; align-items: center; gap: 10px; padding: 10px 14px;
@@ -248,12 +516,12 @@ def _shell() -> str:
     font-family: var(--grad-font-mono); font-size: 12px;
 }
 .grad-appbar-cell.right { border-right: 0; border-left: 1px solid var(--grad-ink-rule); }
-.grad-appbar-cell.brand { border-right: 2px solid var(--grad-paper); }
+.grad-appbar-cell.brand { border-right: 2px solid var(--grad-fill-ink); }
 .grad-mark {
     width: 22px; height: 22px; background: var(--grad-attention);
-    border: 2px solid var(--grad-paper); display: flex; align-items: center;
+    border: 2px solid var(--grad-fill-ink); display: flex; align-items: center;
     justify-content: center; font-family: var(--grad-font-mono); font-size: 13px;
-    font-weight: 700; color: var(--grad-ink);
+    font-weight: 700; color: var(--grad-on-attention);
 }
 .grad-wordmark { font-family: var(--grad-font-mono); font-size: 15px; font-weight: 700;
                  letter-spacing: 0.22em; }
@@ -267,10 +535,10 @@ def _shell() -> str:
    the stylesheet they sit. */
 .grad-appbar .grad-btn.grad-appbar-btn {
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
-    padding: 3px 8px; border: 1.5px solid var(--grad-paper); cursor: pointer;
+    padding: 3px 8px; border: 1.5px solid var(--grad-fill-ink); cursor: pointer;
     background: transparent; color: inherit;
 }
-.grad-appbar .grad-btn.grad-appbar-btn:hover { background: var(--grad-paper); color: var(--grad-ink); }
+.grad-appbar .grad-btn.grad-appbar-btn:hover { background: var(--grad-fill-ink); color: var(--grad-fill); }
 
 /* The `⋯` button carries a menu, so it gets the caret's job: a little wider
    than a word button, and legible as a target rather than as punctuation.
@@ -300,9 +568,9 @@ def _shell() -> str:
 }
 /* Open is the state worth reading off the list at a glance, so it is the one
    that gets ink -- the mark alone is too quiet at eleven rows. */
-.grad-menu-row.open { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-menu-row.open { background: var(--grad-fill); color: var(--grad-fill-ink); }
 .grad-menu-row.open .mark, .grad-menu-row.open .hint { opacity: 0.7; }
-.grad-menu-row.open:hover { background: var(--grad-broken); color: #fff; }
+.grad-menu-row.open:hover { background: var(--grad-broken); color: var(--grad-on-broken); }
 /* A session is called whatever was first asked in it, so its name gets the row
    and the count beside it gets what it needs -- the reverse of a window list,
    where the names are one word and the hints are the sentence. */
@@ -342,12 +610,12 @@ def _shell() -> str:
     opacity: 0.55; font-size: 11px; width: 100%;
     overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }
-.grad-step.open { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-step.open { background: var(--grad-fill); color: var(--grad-fill-ink); }
 .grad-step.open .mark, .grad-step.open .hint { opacity: 0.7; }
 
 .grad-statusbar {
     display: flex; align-items: center; gap: 14px; padding: 0 12px;
-    background: var(--grad-ink); color: var(--grad-paper);
+    background: var(--grad-fill); color: var(--grad-fill-ink);
     font-family: var(--grad-font-mono); font-size: 11px;
     height: 30px; flex: 0 0 auto; border-top: var(--grad-border);
 }
@@ -359,7 +627,7 @@ def _shell() -> str:
    replaced, 0.89 relative luminance against 0.69); what makes it recede is
    dropping the fill, and with it the hue's claim on the eye. */
 .grad-statusbar .count {
-    border: 1.5px solid var(--grad-paper); padding: 1px 6px; font-weight: 700;
+    border: 1.5px solid var(--grad-fill-ink); padding: 1px 6px; font-weight: 700;
 }
 """
 
@@ -389,19 +657,19 @@ def _tiling() -> str:
     flex: var(--grad-fraction, 1) 1 0; overflow: hidden;
 }
 .grad-handle {
-    flex: 0 0 var(--grad-handle); background: var(--grad-ink); cursor: col-resize;
+    flex: 0 0 var(--grad-handle); background: var(--grad-fill); cursor: col-resize;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 3px; user-select: none;
 }
 .grad-handle.row { cursor: row-resize; flex-basis: var(--grad-handle);
                    flex-direction: row; }
-.grad-handle span { width: 2px; height: 2px; background: var(--grad-paper); display: block; }
+.grad-handle span { width: 2px; height: 2px; background: var(--grad-fill-ink); display: block; }
 .grad-handle.dragging { background: var(--grad-broken); }
 
 .grad-window { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto;
                background: var(--grad-paper); overflow: hidden; }
-.grad-window.focused .grad-titlebar { background: var(--grad-ink); color: var(--grad-paper); }
-.grad-window.focused .grad-titlebar .grad-winctl { color: var(--grad-paper); }
+.grad-window.focused .grad-titlebar { background: var(--grad-fill); color: var(--grad-fill-ink); }
+.grad-window.focused .grad-titlebar .grad-winctl { color: var(--grad-fill-ink); }
 .grad-titlebar {
     display: flex; align-items: center; gap: 10px; padding: 0 10px;
     height: var(--grad-titlebar); flex: 0 0 var(--grad-titlebar);
@@ -425,7 +693,7 @@ def _tiling() -> str:
 /* The Lab iframe lives outside the pane tree (see ui/static/tiling.js): a
    reparented iframe is destroyed and recreated by the browser, which would
    reload JupyterLab -- kernel and all -- on every retile. */
-.grad-iframe-host { position: absolute; border: 0; background: #fff; z-index: 5; }
+.grad-iframe-host { position: absolute; border: 0; background: var(--grad-iframe-ground); z-index: 5; }
 .grad-iframe-anchor { flex: 1 1 auto; min-height: 0; }
 
 /* Dragging a title bar to retile. Three pieces of feedback, and none of them
@@ -442,7 +710,7 @@ def _tiling() -> str:
 }
 .grad-drag-ghost {
     position: fixed; z-index: 41; pointer-events: none;
-    background: var(--grad-ink); color: var(--grad-paper);
+    background: var(--grad-fill); color: var(--grad-fill-ink);
     font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
     text-transform: uppercase; letter-spacing: 0.14em; padding: 3px 8px;
 }
@@ -453,9 +721,9 @@ def _tiling() -> str:
     outline: 2px dashed var(--grad-ink); outline-offset: -2px; opacity: 0.6;
 }
 .grad-window .grad-titlebar.grad-swap-target {
-    background: var(--grad-attention); color: var(--grad-ink);
+    background: var(--grad-attention); color: var(--grad-on-attention);
 }
-.grad-window .grad-titlebar.grad-swap-target .grad-winctl { color: var(--grad-ink); }
+.grad-window .grad-titlebar.grad-swap-target .grad-winctl { color: var(--grad-on-attention); }
 body.grad-dragging { cursor: grabbing; }
 /* Text selection and iframe hit-testing both eat a drag that crosses a pane. */
 body.grad-dragging * { user-select: none !important; }
@@ -472,11 +740,11 @@ def _controls() -> str:
     cursor: pointer; line-height: 1;
 }
 .grad-btn:hover { background: var(--grad-paper-sunk); }
-.grad-btn.primary { background: var(--grad-attention); }
+.grad-btn.primary { background: var(--grad-attention); color: var(--grad-on-attention); }
 .grad-btn.primary:hover { background: var(--grad-attention); filter: brightness(0.94); }
 .grad-btn.ok { background: var(--grad-verified); color: var(--grad-verified-ink); }
-.grad-btn.danger { background: var(--grad-broken); color: #fff; }
-.grad-btn.active { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-btn.danger { background: var(--grad-broken); color: var(--grad-on-broken); }
+.grad-btn.active { background: var(--grad-fill); color: var(--grad-fill-ink); }
 .grad-btn.dashed { border: var(--grad-pending); background: transparent; opacity: 0.75; }
 .grad-btn[disabled], .grad-btn.disabled {
     background: var(--grad-paper-sunk); opacity: 0.5; pointer-events: none;
@@ -487,7 +755,7 @@ def _controls() -> str:
    `.active`'s paper text in place -- paper on paper, illegible. Keep the
    inverted ink fill and most of its contrast. */
 .grad-btn.active[disabled], .grad-btn.active.disabled {
-    background: var(--grad-ink); color: var(--grad-paper); opacity: 0.85;
+    background: var(--grad-fill); color: var(--grad-fill-ink); opacity: 0.85;
 }
 .grad-btn.ghost { border: 0; background: transparent; padding: 6px 8px; }
 .grad-btn.ghost:hover { background: var(--grad-paper-sunk); }
@@ -501,9 +769,9 @@ def _controls() -> str:
     white-space: nowrap; text-transform: uppercase; letter-spacing: 0.06em;
 }
 .grad-chip.ok { background: var(--grad-verified); color: var(--grad-verified-ink); border-color: var(--grad-ink); }
-.grad-chip.attention { background: var(--grad-attention); color: var(--grad-ink); }
-.grad-chip.broken { background: var(--grad-broken); color: #fff; }
-.grad-chip.solid { background: var(--grad-ink); color: var(--grad-paper); }
+.grad-chip.attention { background: var(--grad-attention); color: var(--grad-on-attention); }
+.grad-chip.broken { background: var(--grad-broken); color: var(--grad-on-broken); }
+.grad-chip.solid { background: var(--grad-fill); color: var(--grad-fill-ink); }
 .grad-chip.outline { background: transparent; }
 .grad-chip.dashed { border: var(--grad-pending); background: transparent; }
 .grad-chip .dot { width: 7px; height: 7px; background: currentColor; }
@@ -545,17 +813,17 @@ def _data() -> str:
 .grad-bar .seg { display: flex; align-items: center; justify-content: center;
                  font-family: var(--grad-font-mono); font-size: 10px; font-weight: 700;
                  overflow: hidden; white-space: nowrap; }
-.grad-bar .seg.base { background: var(--grad-series-base); color: var(--grad-paper); }
-.grad-bar .seg.chat { background: var(--grad-series-base); color: var(--grad-paper); }
-.grad-bar .seg.tool { background: var(--grad-series-alt); color: var(--grad-ink); }
-.grad-bar .seg.opus { background: var(--grad-series-third); color: #fff; }
-.grad-bar .seg.broken { background: var(--grad-broken); color: #fff; }
+.grad-bar .seg.base { background: var(--grad-series-base); color: var(--grad-on-series-base); }
+.grad-bar .seg.chat { background: var(--grad-series-base); color: var(--grad-on-series-base); }
+.grad-bar .seg.tool { background: var(--grad-series-alt); color: var(--grad-on-series-alt); }
+.grad-bar .seg.opus { background: var(--grad-series-third); color: var(--grad-on-series-third); }
+.grad-bar .seg.broken { background: var(--grad-broken); color: var(--grad-on-broken); }
 .grad-bar.thin { height: 12px; border-width: 1.5px; }
 
 .grad-table { width: 100%; border-collapse: collapse; font-family: var(--grad-font-mono);
               font-size: 12px; }
 .grad-table thead th {
-    background: var(--grad-ink); color: var(--grad-paper); text-align: left;
+    background: var(--grad-fill); color: var(--grad-fill-ink); text-align: left;
     padding: 7px 9px; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
     font-weight: 700; white-space: nowrap;
 }
@@ -586,8 +854,8 @@ def _data() -> str:
                       font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
                       flex: 0 0 18px; }
 .grad-status-square.ok { background: var(--grad-verified); color: var(--grad-verified-ink); }
-.grad-status-square.attention { background: var(--grad-attention); color: var(--grad-ink); }
-.grad-status-square.broken { background: var(--grad-broken); color: #fff; }
+.grad-status-square.attention { background: var(--grad-attention); color: var(--grad-on-attention); }
+.grad-status-square.broken { background: var(--grad-broken); color: var(--grad-on-broken); }
 
 /* Ledger band strip: predicted band, observed tick, falsifier bounds. */
 .grad-band { position: relative; height: 30px; border: 1.5px solid var(--grad-ink);
@@ -668,7 +936,7 @@ def _data() -> str:
 .grad-diff { font-family: var(--grad-font-mono); font-size: 12px; line-height: 1.65;
              background: var(--grad-paper-raised); border: 1.5px solid var(--grad-ink); }
 .grad-diff div { padding: 1px 9px; white-space: pre-wrap; }
-.grad-diff .add { background: var(--grad-verified-tint); color: var(--grad-verified-ink); }
+.grad-diff .add { background: var(--grad-verified-tint); color: var(--grad-verified-tint-ink); }
 .grad-diff .del { background: var(--grad-broken-tint); color: var(--grad-broken-ink-2); }
 .grad-diff .meta { background: var(--grad-paper-sunk); opacity: 0.7; }
 
@@ -706,8 +974,8 @@ def _data() -> str:
                background: repeating-linear-gradient(135deg,
                    var(--grad-hatch-a) 0 8px, var(--grad-hatch-b) 8px 16px);
                display: flex; align-items: center; justify-content: center; }
-.grad-figure .tag { position: absolute; left: 0; bottom: 0; background: var(--grad-ink);
-                    color: var(--grad-paper); font-family: var(--grad-font-mono);
+.grad-figure .tag { position: absolute; left: 0; bottom: 0; background: var(--grad-fill);
+                    color: var(--grad-fill-ink); font-family: var(--grad-font-mono);
                     font-size: 10px; padding: 3px 7px; }
 """
 
@@ -741,7 +1009,7 @@ def _chat() -> str:
 .grad-msg.user .bubble { max-width: 88%; border: var(--grad-border);
                          background: var(--grad-paper-raised); padding: 11px; font-size: 14px; }
 .grad-msg.grad .bubble { padding-left: 23px; font-size: 14px; }
-.grad-avatar { width: 16px; height: 16px; background: var(--grad-attention);
+.grad-avatar { width: 16px; height: 16px; background: var(--grad-attention); color: var(--grad-on-attention);
                border: 1.5px solid var(--grad-ink); display: inline-flex;
                align-items: center; justify-content: center;
                font-family: var(--grad-font-mono); font-size: 10px; font-weight: 700; }
@@ -768,9 +1036,9 @@ def _chat() -> str:
 .grad-card > .head { display: flex; align-items: center; gap: 9px; padding: 6px 10px;
                      font-family: var(--grad-font-mono); font-size: 11px; font-weight: 700;
                      text-transform: uppercase; letter-spacing: 0.1em; }
-.grad-card > .head.attention { background: var(--grad-attention); color: var(--grad-ink); }
-.grad-card > .head.ink { background: var(--grad-ink); color: var(--grad-paper); }
-.grad-card > .head.broken { background: var(--grad-broken); color: #fff; }
+.grad-card > .head.attention { background: var(--grad-attention); color: var(--grad-on-attention); }
+.grad-card > .head.ink { background: var(--grad-fill); color: var(--grad-fill-ink); }
+.grad-card > .head.broken { background: var(--grad-broken); color: var(--grad-on-broken); }
 .grad-card > .body { padding: 11px; background: var(--grad-paper-raised); }
 .grad-card.gate { border-color: var(--grad-broken); }
 
@@ -836,8 +1104,8 @@ def _chat() -> str:
  * question the pane was opened to ask. Paper rather than ink, because the chip
  * sits on the card's ink head. */
 .grad-card.tool > .head .grad-chip.ok {
-    background: transparent; color: var(--grad-paper);
-    border: 1.5px solid var(--grad-paper); opacity: 0.7;
+    background: transparent; color: var(--grad-fill-ink);
+    border: 1.5px solid var(--grad-fill-ink); opacity: 0.7;
 }
 
 /* The agent statusline: always on screen, and the switch for the reasoning
@@ -873,7 +1141,7 @@ def _chat() -> str:
 .grad-statusline .context.warn {
     opacity: 1; border: 1.5px solid var(--grad-ink); }
 .grad-statusline .context.attention {
-    opacity: 1; background: var(--grad-attention); color: var(--grad-ink); }
+    opacity: 1; background: var(--grad-attention); color: var(--grad-on-attention); }
 /* The two parts of the bar that are controls rather than reports, so they are
    the parts drawn as such. Effort sits to the left of the reasoning switch:
    both are about the agent's thinking, and this one changes what it does while
@@ -888,7 +1156,7 @@ def _chat() -> str:
 .grad-statusline .effort.set { border-style: solid; opacity: 1; }
 .grad-statusline .effort:hover { background: var(--grad-paper-raised); }
 .grad-chat.reasoning-on .grad-statusline .reasoning {
-    background: var(--grad-ink); color: var(--grad-paper); }
+    background: var(--grad-fill); color: var(--grad-fill-ink); }
 
 /* The compaction marker: a rule across the transcript, not a message. Nothing
    was said at this point -- what happened is that everything above it stopped
@@ -1010,6 +1278,7 @@ def stylesheet() -> str:
     return "\n".join(
         [
             css_variables(),
+            themed_variables(),
             _base(),
             _shell(),
             _tiling(),
