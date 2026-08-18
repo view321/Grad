@@ -1,0 +1,15 @@
+# A blank issue is a bug report with none of the three fields that make one
+# actionable: platform, version, and `--check`. The forms ask for those, so the
+# blank route stays closed.
+blank_issues_enabled: false
+contact_links:
+  - name: Question about how something works
+    url: https://github.com/view321/Grad/discussions
+    about: >-
+      Not sure whether it is broken or you are holding it wrong? Ask here.
+      "I could not tell what to do next" is useful feedback, not a silly question.
+  - name: The engineering record
+    url: https://github.com/view321/Grad/blob/main/CLAUDE_README.md
+    about: >-
+      Every gate, every decision, and what each one cost to learn. If you are
+      about to ask why something refuses, the answer is probably in here.

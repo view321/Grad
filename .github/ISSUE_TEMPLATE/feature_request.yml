@@ -1,0 +1,49 @@
+name: Feature request
+description: Something is missing, or a gate refuses work it should allow.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you were trying to do
+      description: >-
+        The research task, not the feature. "I wanted to compare three learning
+        rate schedules and had to register three predictions by hand" says more
+        than "add batch prediction registration".
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part
+      options:
+        - Retrieval (paper_search, paper_ingest)
+        - The gates (preflight, ledger, budget, quota)
+        - Submitters (Kaggle, HF Jobs, SSH)
+        - Notebooks and the Lab window
+        - Report and citations
+        - The wiki
+        - The desktop app / workspace
+        - Install and setup
+        - The agent loop or system prompt
+        - Something else
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        If you are proposing that a gate should stop refusing something: say what
+        it refused and what you knew that it did not. The gates are deliberately
+        mechanical rather than persuadable — see
+        [what it refuses to do](https://github.com/view321/Grad#what-it-refuses-to-do) —
+        so the interesting cases are the ones where the *record* was wrong, not
+        where the rule was.

@@ -1,0 +1,83 @@
+name: I ran it — here is how far I got
+description: The single most useful thing you can file. Nothing has to be broken.
+labels: ["feedback", "first-run"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Grad has one author and one machine. What it has never had is somebody
+        else's afternoon.
+
+        **This is not a bug report and nothing has to have gone wrong.** Where you
+        stopped is the finding — including "I read the README and did not install
+        it", which is a real answer about the README.
+
+  - type: dropdown
+    id: furthest
+    attributes:
+      label: How far did you get?
+      options:
+        - I read the README and decided not to install
+        - Install failed
+        - Installed, but could not get authenticated
+        - Authenticated, but did not know what to type first
+        - Ran a paper search
+        - Got a pipeline written
+        - Submitted a run to real hardware
+        - Collected a run and recorded a verdict
+        - All the way to a paper or notebook
+    validations:
+      required: true
+
+  - type: textarea
+    id: stopped
+    attributes:
+      label: What stopped you, or what you did next
+      description: |
+        If you stopped: what were you looking at, and what did you expect to see?
+        If you did not stop: what did you use it for, and did the output hold up?
+
+        Vague is fine. "The funnel window had a warning I did not understand and I
+        lost the thread" is more useful than a stack trace.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Which credentials did you have?
+      multiple: true
+      options:
+        - Claude Pro
+        - Claude Max
+        - Claude Team or Enterprise
+        - Voyage AI key
+        - OpenRouter key
+        - Kaggle account
+        - Hugging Face token
+        - My own GPU over SSH
+    validations:
+      required: false
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows (installed with install.ps1)
+        - Windows (manual pip install)
+        - Linux
+        - macOS
+    validations:
+      required: true
+
+  - type: textarea
+    id: anything
+    attributes:
+      label: Anything else
+      description: >-
+        Things that felt wrong, things that felt good, a feature you assumed was
+        there. If you have a strong opinion about the cream-and-ink look or the
+        absence of a dark theme, this is the place.
+    validations:
+      required: false

@@ -1,0 +1,82 @@
+name: Bug report
+description: Something broke, refused when it should not have, or crashed.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Grad is in development and has had one machine to run on. A bug you hit
+        is very likely a bug nobody has seen, so the details below are the whole
+        difference between a fix and a guess.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+      placeholder: |
+        I clicked "search" in the funnel window with a Voyage key stored, and
+        the window showed NO CORPUS instead of results.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows (installed with install.ps1)
+        - Windows (manual pip install)
+        - Linux
+        - macOS
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `grad --version` (or `python agent.py --version` from a checkout)."
+      placeholder: v0.2.0+a1b2c3d (modified)
+    validations:
+      required: true
+
+  - type: textarea
+    id: check
+    attributes:
+      label: Environment report
+      description: |
+        Paste the output of `grad --check` (or `python agent.py --check`).
+
+        **This contains no credentials.** It reports whether a token is present
+        as a true/false, and names any environment variables it removed without
+        their values. It does include your workspace path, which contains your
+        username — redact that line if you would rather not post it.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        `%LOCALAPPDATA%\Grad\logs\grad.log` on Windows, `~/.local/state/grad/logs/grad.log`
+        elsewhere. The last 50 lines around the failure is usually plenty. If a
+        CLI refused, its JSON envelope is better than the log.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Before filing
+      options:
+        - label: >-
+            I checked [Status](https://github.com/view321/Grad#status) — the HF Jobs
+            and SSH submitters, the evolutionary loop, and the report generator's
+            model-driven half have not yet run against live services, so breakage
+            there is expected rather than surprising. (Still worth reporting.)
+          required: false

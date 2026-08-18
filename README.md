@@ -294,6 +294,19 @@ Three things to know before trusting it with a budget:
   and the browser UI, and everything that matters — the ledger, the gates, the
   notebooks, the submitters — works there.
 
+### If you run it
+
+The most useful thing anyone can send right now is **where they stopped** —
+[`I ran it — here is how far I got`](https://github.com/view321/Grad/issues/new?template=ran_it.yml).
+Nothing has to have broken. "I read this far and did not install it" is a finding
+about this page. A project with one author and one machine cannot find the things
+that only a second machine has.
+
+Something actually broken goes to the
+[bug report form](https://github.com/view321/Grad/issues/new?template=bug_report.yml),
+which asks for `grad --check` — a report of booleans and variable names that
+carries no credentials. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.
+
 ---
 
 ## Documentation
@@ -304,6 +317,7 @@ Three things to know before trusting it with a budget:
 | [`HANDOFF.md`](HANDOFF.md) · [`HANDOFF-2.md`](HANDOFF-2.md) | the design documents of record |
 | [`prompts/system.md`](prompts/system.md) | the entire system prompt — read it, edit it |
 | [`skills/`](skills) | workflows loaded on demand, not into the default context |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to report what broke, and what the CI checks before a change lands |
 
 ---
 
