@@ -18,7 +18,7 @@ import json
 
 import pytest
 
-from core import rewind
+from core import config as config_mod, rewind
 from ui import app as app_mod
 from ui import sessions
 
@@ -353,3 +353,159 @@ def _sdk_stub(fields: tuple[str, ...] = ("resume", "resume_session_at", "resume_
         "ClaudeAgentOptions", [(name, str, dataclasses.field(default=None)) for name in fields]
     )
     return types.SimpleNamespace(ClaudeAgentOptions=options)
+
+
+def test_rewind_support_is_detected_rather_than_assumed(workspace):
+    """The other half of the feature detection. `rewind_option` decides what to
+    send; this decides what the user is told was going to happen, and the two
+    have to agree or the message describes a rewind the SDK is about to ignore."""
+    import agent
+
+    assert agent.rewind_supported(_sdk_stub()) is True
+    assert agent.rewind_supported(_sdk_stub(fields=("resume",))) is False
+
+
+def test_an_sdk_that_cannot_resume_is_not_told_the_memory_went_back(workspace, monkeypatch):
+    """An anchor is only half the condition. Reporting `resumed` on the strength
+    of the anchor alone claimed the agent had forgotten turns it was still being
+    charged for -- the one outcome `core/rewind.py` is written to surface."""
+    import agent
+
+    monkeypatch.setattr(agent, "rewind_supported", lambda *_: False)
+    session = session_with(conversation())
+    outcome = asyncio.run(session.rewind_to(4))
+
+    assert outcome["ok"] is True
+    assert outcome["resumed"] is False
+    assert "still remembers" in outcome["message"]
+    assert "claude-agent-sdk" in outcome["message"], "the fix is an upgrade; say so"
+    # Nothing armed and nothing claimed: a marker carrying an anchor no SDK will
+    # honour would survive a restart as a rewind still waiting to be applied.
+    assert session._rewind_at is None
+    assert session.settled[-1].get("anchor") is None
+
+
+def test_a_turn_that_starts_while_the_client_is_closing_aborts_the_rewind(workspace):
+    """`close` tears down a CLI subprocess and the composer is live throughout.
+    A prompt sent in that window has already appended to `settled` and started a
+    turn, and finishing the rewind would overwrite both -- the prompt gone from
+    the screen with its turn still running."""
+    session = session_with(conversation())
+    original = list(session.settled)
+
+    async def close_and_let_a_turn_in() -> None:
+        session.busy = True
+
+    session.close = close_and_let_a_turn_in
+    outcome = asyncio.run(session.rewind_to(4))
+
+    assert outcome["ok"] is False
+    assert "in flight" in outcome["message"], "say which of the two guards refused"
+    assert session.settled == original, "the transcript was not touched"
+
+
+def test_a_refused_drops_turn_check_reconnects_without_it(workspace):
+    """The SDK documents that refusal as deterministic and says to resume plainly
+    rather than retry the claim. The transcript has already been rewound by the
+    time this runs, so a refusal that propagated would leave a session that
+    cannot be reconnected at all, showing turns the agent is not being rebuilt to
+    match -- strictly worse than a rewind nobody validated."""
+    import agent
+
+    attempts: list[str | None] = []
+
+    class Refuses:
+        def __init__(self, options=None):
+            self.options = options
+
+        async def __aenter__(self):
+            attempts.append(getattr(self.options, "resume_drops_turn", None))
+            if len(attempts) == 1:
+                raise RuntimeError(f"{app_mod._REWIND_REFUSED} prompt-3")
+            return self
+
+    session = session_with(conversation())
+    session._rewind_at = "entry-2"
+    session._rewind_drops = "prompt-3"
+    asyncio.run(session._connect(agent, Refuses, config_mod.load(reload=True)))
+
+    assert len(attempts) == 2, "it retried rather than giving up"
+    assert attempts[0] == "prompt-3", "the first attempt carried the check"
+    assert attempts[1] is None, "the second dropped it rather than repeating it"
+    assert session.client is not None, "the session reconnected"
+
+
+def test_an_unrelated_connect_failure_is_not_retried(workspace):
+    """The retry is scoped to that one refusal. Retrying everything would hide a
+    real connection failure behind a second identical one."""
+    import agent
+
+    attempts: list[int] = []
+
+    class Broken:
+        def __init__(self, options=None):
+            pass
+
+        async def __aenter__(self):
+            attempts.append(1)
+            raise RuntimeError("the CLI is not installed")
+
+    session = session_with(conversation())
+    session._rewind_drops = "prompt-3"
+    with pytest.raises(RuntimeError):
+        asyncio.run(session._connect(agent, Broken, config_mod.load(reload=True)))
+    assert len(attempts) == 1
+    assert session.client is None, "a half-built client would never reconnect"
+
+
+# ---------------------------------------------------------------------------
+# the draft the rewind leaves behind
+# ---------------------------------------------------------------------------
+class _Composer:
+    """A workspace shrunk to the four things the session-switch path touches."""
+
+    def __init__(self) -> None:
+        self.chat_draft = ""
+        self.rebuilds = 0
+        self.session = self
+        self.said: list[str] = []
+
+    def say(self, message: str) -> None:
+        self.said.append(message)
+
+    def rebuild_chat(self) -> None:
+        self.rebuilds += 1
+
+    async def new_session(self) -> str:
+        return "new session"
+
+    async def open_session(self, session_id: str) -> str:
+        return f"opened {session_id}"
+
+
+def test_a_rewound_prompt_does_not_follow_the_user_into_another_session(workspace):
+    """`chat_draft` is workspace state because it has to survive the rebuild a
+    rewind triggers, and the composer is seeded from it on every draw. Left set
+    across a switch, the prompt dropped in one conversation reappears in the
+    next one's box, where it reads as something typed there and is one Enter
+    away from being asked of the wrong agent."""
+    from ui.windows import chat as chat_win
+
+    space = _Composer()
+    space.chat_draft = "the prompt session A dropped"
+    asyncio.run(chat_win._switch(space, "session-b"))
+
+    assert space.chat_draft == ""
+    assert space.rebuilds == 1, "the window still redraws for the new conversation"
+
+
+def test_a_new_session_starts_with_an_empty_box_too(workspace):
+    """Same leak, the other door out of a conversation."""
+    from ui.windows import chat as chat_win
+
+    space = _Composer()
+    space.chat_draft = "the prompt session A dropped"
+    asyncio.run(chat_win._fresh(space))
+
+    assert space.chat_draft == ""
+    assert space.rebuilds == 1

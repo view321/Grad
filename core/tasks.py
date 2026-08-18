@@ -186,8 +186,64 @@ def alive_pids(pids: Iterable[int], *, max_age_s: float = 0.0) -> set[int]:
         except (ProcessLookupError, OSError):
             continue
         else:
-            live.add(pid)
+            # The signal landing is not the same as the process running, and the
+            # gap between those two is a POSIX-only state Windows has no word
+            # for. See `_zombie`.
+            if not _zombie(pid):
+                live.add(pid)
     return live
+
+
+def _zombie(pid: int) -> bool:
+    """Has this process exited without anybody collecting its exit status?
+
+    `kill(pid, 0)` succeeds for a zombie -- the pid is still a row in the process
+    table, holding nothing but a status nobody has read -- so a liveness check
+    built on the signal alone calls a dead task running for as long as its parent
+    stays up without reaping it.
+
+    Which is exactly the arrangement here. `spawn.detached()` is
+    `start_new_session` off Windows: it gives the supervisor its own session so a
+    Ctrl+C cannot reach it, and it does **not** reparent. The supervisor stays a
+    child of whoever spawned it. From a CLI that is fine -- the CLI exits, init
+    inherits the corpse and reaps it -- but anything long-lived that starts a
+    supervisor in-process keeps the zombie, and `stop` then waits out its whole
+    grace period watching a process that died immediately, reports
+    `"stopped": false`, and never writes the exit event that would have kept the
+    task from reading as `lost`.
+
+    Read rather than reaped. `os.waitpid(pid, WNOHANG)` would answer the same
+    question and clear the entry, but it would also take a child out from under
+    whichever `subprocess.Popen` is holding it, and this function is called from
+    a two-second UI poll across every pid in the registry -- an observer should
+    not be the thing that collects statuses.
+
+    **Linux only.** macOS has no `/proc`, so a zombie there still reads as alive
+    and this returns False; that is the pre-existing behaviour rather than a
+    regression, and it is untested here because there is no macOS runner in CI.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+    except (OSError, ValueError):
+        return False
+    return _stat_is_zombie(data)
+
+
+def _stat_is_zombie(data: bytes) -> bool:
+    """The state field of a `/proc/<pid>/stat` line, read safely.
+
+    Split out from the file read so it can be tested off Linux, where there is no
+    `/proc` to point it at.
+
+    `comm` is parenthesised and may itself contain spaces and brackets -- a
+    process is free to be named `(a b) c` -- so the state is the first field
+    after the *last* ')', not the third whitespace-separated token. Splitting on
+    whitespace alone reads the wrong field for any process whose name contains a
+    space, which is most of the interesting ones.
+    """
+    fields = data.rpartition(b")")[2].split()
+    return bool(fields) and fields[0] == b"Z"
 
 
 def pid_alive(pid: int | None) -> bool:

@@ -703,25 +703,59 @@ class Session:
         if not plan["ok"]:
             return {"ok": False, "message": plan["reason"]}
 
+        import agent  # noqa: PLC0415 - imported here so the UI can load without the SDK
+
         anchor = plan["anchor"]
-        drops = self._drops_turn(anchor) if anchor and plan["turns"] == 1 else None
+        # Whether the *installed* SDK will honour that anchor, asked before
+        # anything is promised. An anchor is only half the condition: an SDK
+        # without `resume_session_at` ignores it, the conversation comes back
+        # whole, and a message claiming the memory went back would be describing
+        # the one outcome `core/rewind.py` exists to make impossible to miss.
+        resumed = bool(anchor) and agent.rewind_supported()
+        drops = self._drops_turn(anchor) if resumed and plan["turns"] == 1 else None
         # The client goes before anything is written, so a rewind cannot leave a
         # live conversation running against a transcript that has moved out from
         # under it. `start()` builds the replacement on the next turn.
         await self.close()
-        self._rewind_at = anchor
+        # Checked again, because `close` is the one long await in here -- it
+        # tears down a CLI subprocess -- and the composer is live throughout it.
+        # A prompt submitted in that window runs `ask`, which sets `busy`,
+        # appends to `settled` and starts a turn; carrying on from here would
+        # overwrite that transcript with the rewound one, so the prompt would
+        # vanish from the screen with its turn still running against a client
+        # this just closed. The guard at the top was true when it was read.
+        if self.busy:
+            return {
+                "ok": False,
+                "message": "a turn started while the rewind was in flight — interrupt it first",
+            }
+        # Armed only when it will actually be honoured. Left set against an SDK
+        # that ignores it, the marker would survive a restart claiming a rewind
+        # was still pending that nothing was ever going to apply.
+        self._rewind_at = anchor if resumed else None
         self._rewind_drops = drops
 
         self.settled = [
             *plan["keep"],
-            rewind.record(dropped=plan["dropped"], resumed=bool(anchor), anchor=anchor),
+            rewind.record(
+                dropped=plan["dropped"], resumed=resumed, anchor=anchor if resumed else None
+            ),
         ]
         self._persist()
 
         turns = plan["turns"]
         what = "one exchange" if turns == 1 else f"{turns} exchanges"
-        if anchor:
+        if resumed:
             message = f"rewound {what} — the agent's memory goes back too, on the next turn"
+        elif anchor:
+            # There is a live conversation and a point to cut it at; what is
+            # missing is an SDK that accepts one. Named separately because the
+            # fix is an upgrade, which is worth saying rather than leaving the
+            # user to conclude the feature is broken.
+            message = (
+                f"rewound {what} on screen — this claude-agent-sdk cannot resume at a point, "
+                "so the agent still remembers them (upgrade claude-agent-sdk for the other half)"
+            )
         elif self.sdk_session_id:
             # An anchor from a conversation this session is no longer in. Named
             # rather than folded into the case below, because "there was no live
@@ -733,7 +767,7 @@ class Session:
             )
         else:
             message = f"rewound {what} on screen — there is no conversation to put back"
-        return {"ok": True, "message": message, "prompt": plan["prompt"], "resumed": bool(anchor)}
+        return {"ok": True, "message": message, "prompt": plan["prompt"], "resumed": resumed}
 
     def _drops_turn(self, anchor: str) -> str | None:
         """The uuid of the prompt this rewind means to discard, for the CLI's check.

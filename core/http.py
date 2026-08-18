@@ -586,12 +586,9 @@ class Asta:
         self.deadline = float(cfg.get("retrieval", "request_deadline_s", 300))
         self.ttl = float(cfg.get("retrieval", "cache_ttl_s", 604800))
         self.interval = float(cfg.get("retrieval", "min_request_interval_s", 1.1))
-        try:
-            self.key = credentials.get(credentials.ASTA_KEY, required=False)
-        except ConfigError:
-            # Same reasoning as Context7: an optional credential whose *store* is
-            # unreachable must not make an anonymous call impossible.
-            self.key = None
+        # Optional, and an unreachable store counts as absent -- see
+        # `credentials.get`, which answers that for every optional read now.
+        self.key = credentials.get(credentials.ASTA_KEY, required=False)
         self._session: str | None = None
         self._protocol = MCP_PROTOCOL_VERSION
         self._id = 0
@@ -1059,14 +1056,12 @@ class Context7:
         self.interval = float(cfg.get("docs", "min_request_interval_s", 0.5))
         # Free from their dashboard, and it raises rate limits rather than
         # unlocking anything -- so its absence is a note, not an error. That
-        # includes the case where the credential *store* is unreachable: on a
-        # machine with no keyring installed, `credentials.get` raises even for
-        # an optional credential, and letting that propagate would make an
-        # anonymous lookup impossible for want of a key it does not need.
-        try:
-            self.key = credentials.get(credentials.CONTEXT7_KEY, required=False)
-        except ConfigError:
-            self.key = None
+        # includes the case where the credential *store* is unreachable, which
+        # `credentials.get` now answers with `None` for any optional read rather
+        # than leaving each caller to catch it; this site used to do the catching
+        # and the two beside it did not, which is how a headless Linux host lost
+        # anonymous retrieval for want of keys it does not need.
+        self.key = credentials.get(credentials.CONTEXT7_KEY, required=False)
 
     @property
     def authenticated(self) -> bool:

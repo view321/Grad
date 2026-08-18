@@ -10,6 +10,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Nothing here writes to the repository, and a workflow that runs on
+# `pull_request` reads code it did not write. `contents: read` is the whole
+# permission set it needs; the default is considerably wider.
+permissions:
+  contents: read
+
 jobs:
   # --------------------------------------------------------------------------
   # The suite, on the platforms the README claims
@@ -33,6 +39,11 @@ jobs:
         python: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Nothing in this job talks to git again, and a checkout that leaves
+          # its token in `.git/config` leaves it where every later step -- and
+          # every dependency those steps install -- can read it.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -86,6 +97,11 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Nothing in this job talks to git again, and a checkout that leaves
+          # its token in `.git/config` leaves it where every later step -- and
+          # every dependency those steps install -- can read it.
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:

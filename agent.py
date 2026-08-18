@@ -215,16 +215,49 @@ def rewind_option(sdk: Any, resume_at: str | None, drops_turn: str | None) -> di
     """
     if not resume_at:
         return {}
-    try:
-        fields = {field.name for field in dataclasses.fields(sdk.ClaudeAgentOptions)}
-    except TypeError:
-        return {}
+    fields = _option_fields(sdk)
     if "resume_session_at" not in fields:
         return {}
     options: dict[str, Any] = {"resume_session_at": resume_at}
     if drops_turn and "resume_drops_turn" in fields:
         options["resume_drops_turn"] = drops_turn
     return options
+
+
+def _option_fields(sdk: Any) -> set[str]:
+    """The option names this SDK accepts, or nothing if it cannot be asked."""
+    try:
+        return {field.name for field in dataclasses.fields(sdk.ClaudeAgentOptions)}
+    except TypeError:
+        return set()
+
+
+def rewind_supported(sdk: Any = None) -> bool:
+    """Can the installed SDK put a conversation back to an earlier point?
+
+    Asked separately from `rewind_option` because the answer is needed before
+    the option is built: an anchor the SDK will not accept is a rewind that
+    cleans the screen and leaves the model remembering everything, and telling
+    someone their memory went back when it did not is the exact failure
+    `core/rewind.py` is written to avoid. The caller words its result on this.
+
+    Feature-detected rather than pinned to an SDK floor, which is deliberate and
+    is the same call `thinking_option` makes. A hard minimum would refuse to
+    start for want of a capability the rest of the app does not need, on the
+    surface -- permission-mode names and option sets -- that has moved most
+    between releases. Degrading and saying so costs one sentence; a floor costs
+    everyone on an older SDK the whole application.
+
+    Answers False rather than raising when there is no SDK at all: the UI is
+    allowed to load without one, and a window asking whether a button should
+    promise something is not the place to discover it is missing.
+    """
+    if sdk is None:
+        try:
+            sdk = _sdk()
+        except BaseException:  # noqa: BLE001 - `_sdk` exits rather than raising ImportError
+            return False
+    return "resume_session_at" in _option_fields(sdk)
 
 
 def thinking_option(cfg: Any, sdk: Any) -> dict[str, Any]:

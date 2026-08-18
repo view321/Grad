@@ -46,13 +46,25 @@ pip install -e ".[dev,agent,notebook,retrieval,remote,ui,lab,math]"
 python -m pytest -q
 ```
 
-Three tests fail on an unmodified tree for reasons that are not regressions: two
-in `tests/test_desktop_app.py` fail when a real Grad instance already holds the
-single-instance lock, and
-`tests/test_wakeup.py::test_the_deadline_is_reported_as_a_deadline` compares an
-ISO timestamp against a wake id suffix and so depends on the time of day. A green
-local run is **1698 passed, 3 failed, 1 skipped**. CI deselects the time-of-day
-one and runs with nothing holding the lock, so CI expects a clean pass.
+Two failures on an unmodified tree are conditions rather than regressions, and
+each has its own condition:
+
+- the two lock tests in `tests/test_desktop_app.py` fail **if a real Grad
+  instance is running**, because it is already holding the single-instance lock
+  they are about. Quit the app and they pass.
+- `tests/test_wakeup.py::test_the_deadline_is_reported_as_a_deadline` compares an
+  ISO timestamp against a wake id suffix, so it **depends on the time of day**.
+  It is a real defect and is deselected in CI rather than deleted, so that it
+  stays visible locally where a human can tell it from a regression.
+
+No fixed pass/fail count is given on purpose. The number moves with every test
+added, and it is not portable anyway: the count you get depends on your platform
+and Python version, which is exactly what CI exists to cover and a local run does
+not. Compare a suspicious failure against a clean tree with `git stash`, not
+against a number written down here.
+
+CI runs with nothing holding the lock and deselects the time-of-day test, so it
+expects a clean pass on every leg.
 
 What the CI checks, and why it is shaped the way it is:
 

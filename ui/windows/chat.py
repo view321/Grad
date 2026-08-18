@@ -138,11 +138,29 @@ def _sessions(ui: Any, workspace: Any) -> None:
 
 async def _fresh(workspace: Any) -> None:
     workspace.say(await workspace.session.new_session())
-    workspace.rebuild_chat()
+    _left_for_another_session(workspace)
 
 
 async def _switch(workspace: Any, session_id: str) -> None:
     workspace.say(await workspace.session.open_session(session_id))
+    _left_for_another_session(workspace)
+
+
+def _left_for_another_session(workspace: Any) -> None:
+    """Redraw for a conversation that is not the one just left.
+
+    The draft goes with it, and that is the whole reason this is a function
+    rather than two calls to `rebuild_chat`. `chat_draft` is workspace state
+    rather than window state -- it has to be, because its job is to survive the
+    rebuild a rewind triggers -- and the composer is seeded from it on every
+    draw. So a rewound prompt that was never sent stayed in it across a session
+    switch and reappeared in the next conversation's box, where it reads as
+    something typed there and is one Enter away from being asked of the wrong
+    agent. Cleared here because this is where "a different conversation" is
+    decided; `new_session` and `open_session` belong to the session and cannot
+    see the workspace holding the draft.
+    """
+    workspace.chat_draft = ""
     workspace.rebuild_chat()
 
 
