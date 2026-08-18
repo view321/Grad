@@ -179,6 +179,10 @@ def build_options(
         "disallowed_tools": DENIED_TOOLS,
         "permission_mode": mode,
         "cwd": str(paths.root()),
+        # The other half of `cwd`. Without it the agent's shell resolves `python`
+        # through the launcher's ambient PATH, which on this platform is not the
+        # environment Grad is running in -- see `interpreter_env`.
+        "env": interpreter_env(),
         "hooks": hook_matchers,
         # Off by default in the SDK, and the default is why an answer used to
         # arrive in one lump: without it `receive_response` yields nothing until
@@ -188,6 +192,7 @@ def build_options(
         "include_partial_messages": True,
     }
     options.update(rewind_option(sdk, resume_at, drops_turn))
+    options.update(checkpointing_option(sdk))
     options.update(thinking_option(cfg, sdk))
     # How hard it thinks, from `core/effort.py`. Applied here rather than
     # anywhere later because there is nowhere later: the SDK exposes no control
@@ -196,6 +201,101 @@ def build_options(
     # rebuild.
     options.update(effort.option(cfg, sdk))
     return sdk.ClaudeAgentOptions(**options)
+
+
+def interpreter_env() -> dict[str, str]:
+    """The environment the agent's shell runs in, so that `python` means this one.
+
+    `cwd` was the only thing this session told its shell about the world, and
+    `PATH` is the other half of that sentence. A `Bash` call inherits the
+    launcher's ambient environment, and `core/spawn.py:console_script` already
+    documents what that means on the platform this ships to: Grad is started
+    from a shortcut pointing at `.venv\\Scripts\\pythonw.exe`, Explorer hands it
+    the machine's environment, and so the interpreter is the venv's while `PATH`
+    is not. That reasoning was applied to `shutil.which` there and never to the
+    shell the model types into.
+
+    **What it costs is worse than a missing package.** Every tool in the system
+    prompt is spelled `python -m tools.<name>`, so the resolution of the bare
+    word `python` decides *which Grad* the agent's own instrument panel is. On a
+    machine carrying a second one on `PATH` -- a stale global install, an
+    editable checkout -- the answer is not this one, and the app then reads the
+    workspace through one installation while the agent writes it through
+    another. Nothing in either would ever name that disagreement.
+
+    So the interpreter running this process wins, and it wins by being *first*
+    rather than by being alone: `PATH` is prepended to, never replaced, because
+    the agent legitimately needs `git`, `docker` and `latexmk` and this is not
+    the place to decide what a research machine has on it.
+
+    Three details are load-bearing.
+
+    `sysconfig` is asked for the scripts directory rather than taking
+    `sys.executable`'s parent, because the two differ on a non-venv install:
+    `python.exe` sits in `C:\\Python314` and `pip.exe` in `C:\\Python314
+    \\Scripts`, and a fix that does not cover `pip` does not cover the command
+    people actually get wrong.
+
+    Nothing here is venv-specific, deliberately. The invariant is "the agent's
+    `python` is the `python` running Grad", which is the right one under a venv,
+    a conda environment or a bare system install -- and a check for a venv would
+    turn the third case into a silent no-op.
+
+    `PYTHONPATH` is set only when Grad is not an installed distribution, which
+    is the checkout someone runs with `python agent.py` and never pip-installed.
+    Unconditionally exporting the install directory would put `config`, `data`,
+    `notes` and `figures` on the import path as namespace packages, and `import
+    data` is a thing research code genuinely does.
+
+    `PYTHONUTF8` comes from `core/spawn.py:utf8_env`, which explains at length
+    why reading arXiv LaTeX on a Windows machine crashes twice over and why
+    remembering `encoding="utf-8"` is not enough to stop it. It is here rather
+    than in the prompt for the reason the gates are programs rather than
+    sentences: the model does get this right most of the time, and most of the
+    time is not a property.
+    """
+    import sysconfig  # noqa: PLC0415 - only this function needs it
+
+    from core import spawn  # noqa: PLC0415
+
+    scripts = sysconfig.get_path("scripts") or str(Path(sys.executable).parent)
+    ambient = os.environ.get("PATH", "")
+    # Prepend rather than append, and skip the work when it is already in front:
+    # a session rebuilt by a compaction runs this again, and PATH should not grow
+    # a copy of the same directory once per compaction.
+    parts = ambient.split(os.pathsep) if ambient else []
+    if not parts or Path(parts[0] or ".") != Path(scripts):
+        ambient = os.pathsep.join([scripts, *parts]) if parts else scripts
+    env = {"PATH": ambient, **spawn.utf8_env()}
+
+    # `pip` and `uv` both read this, and an ambient one pointing at a *different*
+    # environment is the exact confusion this function exists to end -- so it is
+    # set to what is true here rather than left to whatever Explorer passed in.
+    if sys.prefix != sys.base_prefix:
+        env["VIRTUAL_ENV"] = sys.prefix
+
+    if not _installed_as_distribution():
+        install = str(paths.install_dir())
+        existing = os.environ.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join([install, existing]) if existing else install
+    return env
+
+
+def _installed_as_distribution() -> bool:
+    """Is this Grad on the interpreter's path by installation rather than by cwd?
+
+    False is the safe answer on any failure: it adds `PYTHONPATH`, and a
+    redundant entry costs nothing next to an agent whose every tool call raises
+    `ModuleNotFoundError` because its cwd is the workspace and the workspace has
+    no `tools/` in it.
+    """
+    try:
+        import importlib.metadata as md  # noqa: PLC0415
+
+        md.distribution("grad")
+        return True
+    except Exception:  # noqa: BLE001 - see the docstring
+        return False
 
 
 def rewind_option(sdk: Any, resume_at: str | None, drops_turn: str | None) -> dict[str, Any]:
@@ -222,6 +322,55 @@ def rewind_option(sdk: Any, resume_at: str | None, drops_turn: str | None) -> di
     if drops_turn and "resume_drops_turn" in fields:
         options["resume_drops_turn"] = drops_turn
     return options
+
+
+def checkpointing_option(sdk: Any) -> dict[str, Any]:
+    """Ask the CLI to keep a copy of a file before the agent changes it.
+
+    This is the third half of a rewind. `core/rewind.py` moves the transcript,
+    `resume_session_at` moves the model's memory, and until this flag neither of
+    them moved the *work*: a turn that rewrote a training script and was then
+    rewound left the rewritten script on disk, with a conversation that no longer
+    contained the instruction that produced it. The two surfaces the user can see
+    agreed with each other and disagreed with the filesystem, which is the worst
+    of the three arrangements.
+
+    Feature-detected, like `thinking_option` and `rewind_option` above, and for
+    the same reason: this option is newer than most of what this file passes, and
+    an SDK without it must give a session that cannot restore files rather than
+    one that cannot be built.
+
+    **What it does not cover.** The backups are taken by the CLI around its own
+    file-editing tools, so `Write` and `Edit` are the case it is for. Most of
+    what this agent does is a `Bash` command -- and a file a *command* wrote is
+    outside that, as is anything on the other side of a submitter. That is not a
+    gap worth closing here: the ledger is append-only precisely so the record of
+    a run cannot be rewound, and a rewind that reached into `ledger/runs.jsonl`
+    would be undoing evidence rather than work. `ui/app.py:rewind_to` words its
+    result on what actually moved rather than on what was asked for.
+
+    Deliberately not combined with `session_store`, which the SDK rejects
+    outright (`_internal/session_store_validation.py`). Nothing here sets one.
+    """
+    if "enable_file_checkpointing" not in _option_fields(sdk):
+        return {}
+    return {"enable_file_checkpointing": True}
+
+
+def checkpointing_supported(sdk: Any = None) -> bool:
+    """Can this SDK put files back? Asked before anything promises it.
+
+    Separate from the option for the reason `rewind_supported` is separate from
+    `rewind_option`: the answer decides what the rewind's result *says*, and a
+    message claiming the work went back when it did not is the failure
+    `core/rewind.py` is written to make impossible.
+    """
+    if sdk is None:
+        try:
+            sdk = _sdk()
+        except BaseException:  # noqa: BLE001 - `_sdk` exits rather than raising ImportError
+            return False
+    return "enable_file_checkpointing" in _option_fields(sdk)
 
 
 def _option_fields(sdk: Any) -> set[str]:
@@ -319,8 +468,19 @@ def preflight_environment() -> dict[str, Any]:
     hydrated = credentials.hydrate_environment()
     cfg = config_mod.load()
     project_id = budget.current_project()
+    shell = interpreter_env()
     return {
         "removed_env": removed,
+        # What the agent's own `python` resolves to, which is the diagnostic that
+        # would have found the defect this reports on: `prompts/system.md` spells
+        # every tool `python -m tools.<name>`, so a second Grad earlier on PATH
+        # means the app and the agent are reading the same workspace through
+        # different installations. Names and booleans only -- this output goes
+        # into bug reports.
+        "interpreter": sys.executable,
+        "shell_path_head": shell["PATH"].split(os.pathsep)[0],
+        "venv": sys.prefix if sys.prefix != sys.base_prefix else None,
+        "installed_as_distribution": _installed_as_distribution(),
         "oauth_token_present": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
         "oauth_token_source": (
             "environment" if ambient else ("credential store" if hydrated else "absent")

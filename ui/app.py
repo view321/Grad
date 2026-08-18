@@ -712,7 +712,18 @@ class Session:
         # whole, and a message claiming the memory went back would be describing
         # the one outcome `core/rewind.py` exists to make impossible to miss.
         resumed = bool(anchor) and agent.rewind_supported()
-        drops = self._drops_turn(anchor) if resumed and plan["turns"] == 1 else None
+        # The first prompt after the anchor: the one this rewind is dropping, and
+        # therefore the point the files should go back to. Read once and used
+        # twice, because the two uses want different conditions -- the SDK only
+        # accepts `resume_drops_turn` for a single-turn rewind, while restoring
+        # files to the *earliest* dropped prompt is right for any number of them.
+        dropped_prompt = self._drops_turn(anchor) if anchor else None
+        drops = dropped_prompt if resumed and plan["turns"] == 1 else None
+        # Files first, because this one is a control request and the two after it
+        # are not: `rewind_files` needs a live client, and the next statement
+        # closes it. Ordering the other way round would have made this the only
+        # half of a rewind that silently never ran.
+        restored = await self._rewind_files(dropped_prompt)
         # The client goes before anything is written, so a rewind cannot leave a
         # live conversation running against a transcript that has moved out from
         # under it. `start()` builds the replacement on the next turn.
@@ -738,7 +749,10 @@ class Session:
         self.settled = [
             *plan["keep"],
             rewind.record(
-                dropped=plan["dropped"], resumed=resumed, anchor=anchor if resumed else None
+                dropped=plan["dropped"],
+                resumed=resumed,
+                anchor=anchor if resumed else None,
+                files=restored,
             ),
         ]
         self._persist()
@@ -767,7 +781,48 @@ class Session:
             )
         else:
             message = f"rewound {what} on screen — there is no conversation to put back"
-        return {"ok": True, "message": message, "prompt": plan["prompt"], "resumed": resumed}
+        # Only said when it happened. A rewind that restored nothing says nothing
+        # about files rather than reporting an absence: the common case is a
+        # conversation that edited none, and "no files were restored" reads as a
+        # failure of something that was never attempted.
+        if restored:
+            message += "; files it edited are back as they were"
+        return {
+            "ok": True,
+            "message": message,
+            "prompt": plan["prompt"],
+            "resumed": resumed,
+            "files": restored,
+        }
+
+    async def _rewind_files(self, dropped_prompt: str | None) -> bool:
+        """Put the files back to what they were before the dropped prompt ran.
+
+        Best effort by construction, and the return value is the whole point:
+        the caller words its result on it rather than announcing a restore it did
+        not perform. Every reason this can decline is a real and ordinary one --
+        an SDK too old to checkpoint, a rewind with no live conversation to name
+        a prompt in, a session that has already been closed -- and none of them
+        is a reason to refuse to rewind the transcript.
+
+        Narrower than it sounds, which the message the caller builds is careful
+        about: the CLI checkpoints around its own editing tools, so this returns
+        work the agent did with `Write` and `Edit`. What a `Bash` command wrote
+        stays written, and that includes everything a submitter did on a backend.
+        The ledger is append-only for exactly that reason -- an undo that reached
+        into `ledger/runs.jsonl` would be erasing evidence, not work.
+        """
+        import agent  # noqa: PLC0415 - imported here so the UI can load without the SDK
+
+        client = self.client
+        if client is None or not dropped_prompt or not agent.checkpointing_supported():
+            return False
+        try:
+            await client.rewind_files(dropped_prompt)
+        except Exception:  # noqa: BLE001 - see the docstring
+            log.debug("the files did not move with the rewind", exc_info=True)
+            return False
+        return True
 
     def _drops_turn(self, anchor: str) -> str | None:
         """The uuid of the prompt this rewind means to discard, for the CLI's check.

@@ -58,9 +58,9 @@ search result.
   under the project's ceiling, and no stale uncollected run. These are programs
   that refuse, not sentences in a prompt.
 - **Compute where you have it.** The same verbs — `submit`, `status`, `collect`
-  — against Hugging Face Jobs, any SSH host you can reach, and Kaggle's free
-  GPU/TPU, where an hours-based quota is enforced because a dollar ceiling
-  measures nothing.
+  — against Modal (H100s and up, billed by the second), Hugging Face Jobs, any
+  SSH host you can reach, and Kaggle's free GPU/TPU, where an hours-based quota
+  is enforced because a dollar ceiling measures nothing.
 - **Evidence that outlives the session.** An append-only ledger of expectations
   and results. Replicated runs are compared interval against interval, so
   "matches the prediction" is a statement with a spread behind it.
@@ -135,6 +135,7 @@ have no second rail.
 |---|---|
 | `hf_token` | Hugging Face Jobs |
 | `kaggle_key` + account | free GPU/TPU, rationed by the hour |
+| `modal_token_id` + `modal_token_secret` | Modal sandboxes: H100/H200/B200 by the second |
 | SSH host or key | your own box |
 | `openrouter_key` | a second rail for reranking |
 | `context7_key`, `asta_api_key` | higher rate limits on docs and discovery |
@@ -257,7 +258,7 @@ Each is a CLI with `--json` on every subcommand.
 | `paper_ingest` | arXiv LaTeX → section-aware chunks → the local index |
 | `nb` | persistent Jupyter kernel: `exec`, `verify`, `restart` |
 | `preflight` | the QA gate, and the record the submitters read |
-| `jobs` / `gpu` / `kaggle` | the same verbs against three backends |
+| `jobs` / `gpu` / `kaggle` / `modal` | the same verbs against four backends |
 | `ledger` | `expect`, `query`, `verdict`, `falsify`, `abandon`, `verify` |
 | `quota` / `budget` | what was spent, and what may still be |
 | `evolve` | evolutionary search as a budgeted campaign |

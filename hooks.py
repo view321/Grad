@@ -63,6 +63,34 @@ _DENIED_COMMANDS: dict[str, Denial] = {
         "gates in §6 and the weekly accelerator allowance the dollar ceilings cannot see",
         "python -m tools.kaggle submit --spec <spec> --expect <expectation_id> --json",
     ),
+    # The environment rail, and the only one here that is about *this* machine
+    # rather than a remote. `agent.interpreter_env` puts Grad's own scripts
+    # directory first on PATH, so bare `pip` now resolves correctly -- but it
+    # resolves correctly by *ordering*, and ordering is a property a `cd`, a
+    # `PATH=...` prefix or a wrapper script can quietly change. `python -m pip`
+    # cannot: it installs into the interpreter that runs it, which is the same
+    # interpreter the kernel (`tools/nb.py`) and the dry run
+    # (`tools/preflight.py`) use, so a package the agent installs is a package
+    # the notebook can import.
+    #
+    # This machine is the argument: `pip` had three entries on PATH ahead of the
+    # venv's, and `python` was a global install carrying a second, editable Grad.
+    "pip": Denial(
+        "bare pip is denied: it installs into whichever environment PATH happens to name, "
+        "which is not necessarily the interpreter running Grad, the Jupyter kernel and the "
+        "preflight dry run",
+        "python -m pip install <package>",
+    ),
+    "pip3": Denial(
+        "bare pip3 is denied for the same reason as pip: the environment it installs into is "
+        "decided by PATH rather than by the interpreter",
+        "python -m pip install <package>",
+    ),
+    "conda": Denial(
+        "conda is denied: it manages a separate environment from the one Grad, the kernel and "
+        "the preflight dry run all share, so a package installed here is not importable there",
+        "python -m pip install <package>",
+    ),
 }
 
 # Cost-bearing commands, denied while the current project is over budget
@@ -347,6 +375,11 @@ def probe(commands: list[str] | None = None) -> list[dict[str, Any]]:
         # speed bump is still a speed bump.
         "true\nssh gpu-box nvidia-smi",
         "rm -r -f ledger/",
+        # The environment rail. `python -m pip` is in the list precisely because
+        # it must come back *not* denied: a probe that only showed the refusals
+        # would not say whether the route out of them still works.
+        "pip install torch",
+        "python -m pip install torch",
         "python -m tools.gpu submit --spec pipeline/spec.toml --expect exp-1 --json",
         # Denied only while the current project is over budget, so its verdict
         # here depends on ledger state -- which is the point: the probe reports

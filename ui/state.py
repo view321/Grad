@@ -84,18 +84,29 @@ def load_layout(project: str | None) -> layout_mod.Layout:
 def opening_windows() -> tuple[str, ...]:
     """What opens when this workspace has never been arranged.
 
-    The mock's four -- unless the agent has no credentials, in which case those
-    four windows are four windows that cannot do anything, and the first thing
-    on screen should be the one that fixes it.
+    The mock's four -- unless this machine is mid-setup, in which case those four
+    windows are four windows that cannot do anything, and the first thing on
+    screen should be the one that fixes it.
 
     Only reached when there is no saved layout, so this costs a credential-store
-    read once per fresh workspace and nothing thereafter. And only the *token* is
-    checked (`models.setup_needed`): an unconfigured backend means no remote
-    training, which is a real limitation and not a reason to put a wizard in
-    front of someone who opened the app to read a ledger.
+    read once per fresh workspace and nothing thereafter -- and
+    `models.first_run_needed` rather than the full `first_run` is what keeps
+    that true, because the full one loads a `Config` and this path must not.
+
+    **Widened from "no token" to "no token *or* no project".** The token was the
+    right question when it was the only blocking one, and it stopped being so
+    when projects became the thing every run, ceiling and report is filed
+    against: a workspace with a token and no project opens four windows, three
+    of which are empty because there is nothing to file against, and nothing on
+    screen says that is the reason. The panel at the top of the setup window
+    explains both.
+
+    Still narrow in the way that matters: an unconfigured *backend* does not
+    open this window. Remote training is a real limitation and not a reason to
+    put a wizard in front of someone who opened the app to read a ledger.
     """
     try:
-        if models.setup_needed():
+        if models.first_run_needed():
             return ("setup", *registry.defaults())
     except Exception:  # noqa: BLE001 - never the reason a workspace will not open
         log.debug("could not decide the opening arrangement", exc_info=True)
@@ -882,6 +893,32 @@ class Workspace:
             + (" — takes effect on the next turn" if running else "")
         )
         return level
+
+    def theme(self) -> str:
+        """Which palette this workspace draws in. Never raises.
+
+        Read on the build path of every page, so an unreadable overlay has to be
+        a cream window rather than a window that does not open.
+        """
+        from core import settings as settings_mod  # noqa: PLC0415
+
+        try:
+            return settings_mod.theme()
+        except Exception:  # noqa: BLE001 - see the docstring
+            return "light"
+
+    def set_theme(self, name: str) -> str:
+        """Record the choice. Returns what is now in effect.
+
+        Refuses nothing silently: an unknown name raises out of `settings` and
+        the caller keeps the page on the palette that is still recorded, which
+        is the only arrangement where the screen and the file agree.
+        """
+        from core import settings as settings_mod  # noqa: PLC0415
+
+        settings_mod.set_theme(name)
+        self.say(f"theme: {name}")
+        return name
 
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""

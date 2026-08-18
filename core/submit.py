@@ -239,6 +239,7 @@ COLLECTORS = {
     "hf_jobs": "python -m tools.jobs collect",
     "kaggle": "python -m tools.kaggle collect",
     "ssh": "python -m tools.gpu collect",
+    "modal": "python -m tools.modal collect",
 }
 
 
@@ -535,7 +536,29 @@ def finish(
         record["samples"] = replicated
     ls.append_run_event(record)
     archive_quietly(run_id)
+    # A collected run is the first of the three moments the workspace history
+    # marks. After the ledger write, never before: a checkpoint that ran first
+    # would commit a state the ledger does not yet describe, and the ordering
+    # matters more than it looks because this is the record the commit exists to
+    # preserve. Failure here is swallowed by `checkpoint` itself -- see
+    # `core/vcs.py` for why a wedged git must not fail a collect.
+    checkpoint_workspace(f"collected {run_id} ({status})")
     return record
+
+
+def checkpoint_workspace(reason: str) -> None:
+    """Commit the workspace, if it is versioned at all. Never raises.
+
+    A thin wrapper rather than a direct call so the import stays off the hot
+    path of every module that already imports this one, and so the three call
+    sites read as one decision rather than three.
+    """
+    try:
+        from core import vcs  # noqa: PLC0415
+
+        vcs.checkpoint(reason)
+    except Exception:  # noqa: BLE001 - a history is never worth a failed command
+        logging.getLogger("grad.vcs").debug("checkpoint skipped", exc_info=True)
 
 
 def archive_quietly(run_id: str) -> dict[str, Any] | None:

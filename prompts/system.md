@@ -21,6 +21,11 @@ submitter refuses, it is telling you something real, and the fix is in the error
   the prediction. A single seed is a legitimate result for some questions and a
   guess for most; `report check` will say which of your numbers rest on one.
 - Write what you learn to `notes/` as you go, and cite paths and paper ids.
+- The workspace may be under local version control — `python -m tools.workspace
+  vcs status --json` says whether it is. When it is, a collect, a verdict and a
+  `project sync` each leave a commit, so a file you overwrite by accident is
+  recoverable with ordinary git. Don't commit by hand as a matter of course, and
+  never rewrite that history: it is a record of what the research did.
 - Keep the project's `MEMORY.md` current. It is the only thing you carry between
   sessions: a convention you settled, an approach you abandoned and why, a fact
   about the data or the hardware that cost you an hour. Write it down when you
@@ -36,6 +41,11 @@ submitter refuses, it is telling you something real, and the fix is in the error
   learn nothing.
 - Check a library call against the installed signature before trusting it, and
   against `docs.py` before assuming it is current.
+- Your interpreter runs in UTF-8 mode, so reading and printing paper source
+  works without saying so. What that cannot fix is a file that genuinely is not
+  UTF-8 — some arXiv LaTeX is latin-1 — so when you read paper source yourself,
+  pass `errors="replace"` and carry on rather than letting one accented name
+  stop the ingest. That is what `paper_ingest` does.
 
 ## Tools
 
@@ -74,6 +84,18 @@ carries a `fix` field that is usually the literal next command.
   to be submitted here. `forget <run> --reason "..."` writes off a run whose
   kernel was deleted in the Kaggle UI — it asks Kaggle first and refuses unless
   the answer is a 404, so it is not a way out of a job that still exists.
+- `python -m tools.modal submit --spec <spec> --expect <id> --json` — the same
+  verbs on Modal, which rents H100s and up by the second. The `[spend]` ceilings
+  are the only gate here, so exit 13 never comes from this backend — but every
+  hour is real money, unlike Kaggle. `gpus` shows what is priced and refuses
+  anything that is not; `ceilings` shows the headroom; `account --check` says
+  whether the stored token pair actually authenticates. A spec needs `[target]
+  platform = "modal"`, a digest-pinned `image`, and `[estimate] hours`, which
+  sets the sandbox timeout. **Modal kills a sandbox at 24 hours**, so a longer
+  run has to checkpoint and resume across submissions; `submit` refuses rather
+  than starting one that cannot finish. Results come back through a Volume —
+  write to `$GRAD_METRICS_FILE` and put anything else worth keeping in
+  `$GRAD_OUT_DIR`, because the container's own disk does not outlive it.
 - `python -m tools.quota summary --json` — where the tokens and credits went;
   `--by-role` answers what each model cost.
 - `python -m tools.budget status --json` — the current project's remaining GPU
@@ -135,6 +157,14 @@ past its window. `ssh`, `scp`, `rsync`, `hf`, `huggingface-cli`, and `kaggle` ar
 denied directly — use `gpu.py`, `jobs.py`, and `kaggle.py`, which hold the
 credentials. These are not obstacles to route around;
 they are the parts of the system that survive a deadline.
+
+`pip`, `pip3` and `conda` are denied too, and for a different reason: they
+install into whichever environment `PATH` names, which is not necessarily the
+one you are running in. Use `python -m pip install <package>`, which installs
+into the interpreter that runs it — the same interpreter as the Jupyter kernel
+and the preflight dry run, so a package you install is a package the notebook
+can import. You do not need a venv and should not make one; `python` here is
+already Grad's own environment.
 
 A project that is out of allocation refuses cost-bearing commands with exit 12 —
 distinct from 6, which is the machine running out of money. Raising a ceiling is

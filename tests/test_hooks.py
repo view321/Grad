@@ -52,12 +52,36 @@ def test_direct_credential_reads_are_denied():
 @pytest.mark.parametrize(
     "command",
     [
+        "pip install torch",
+        "pip3 install -r requirements.txt",
+        "pip.exe install numpy",
+        "/c/Python314/Scripts/pip install torch",
+        "conda install pytorch",
+        "cd pipeline && pip install -e .",
+    ],
+)
+def test_installing_through_path_rather_than_the_interpreter_is_denied(command):
+    """`agent.interpreter_env` puts the right scripts directory first on PATH,
+    but it does so by *ordering*, and a wrapper or a `PATH=` prefix can change
+    an ordering. `python -m pip` installs into the interpreter that runs it,
+    which is the one the kernel and the preflight dry run also use."""
+    denial = evaluate_bash(command)
+    assert denial is not None
+    assert denial.suggestion == "python -m pip install <package>"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "python -m tools.gpu submit --spec pipeline/spec.toml --expect exp-1 --json",
         "python -m tools.jobs collect run-1 --json",
         "pytest -q",
         "git status",
         "rm figures/001.png",
         "ls -la",
+        # The route out of the pip denial has to stay open, or the rail is a wall.
+        "python -m pip install torch",
+        "python -m pip install -r pipeline/requirements.txt",
     ],
 )
 def test_the_intended_path_is_allowed(command):

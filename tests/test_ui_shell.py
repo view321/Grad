@@ -166,9 +166,12 @@ def test_the_window_menu_marks_what_is_open(rendered):
     _open_window_menu(client, space)
 
     rows = _menu_rows(client)
-    assert len(rows) == len(registry.ids()) + len(shell.PRESET_ROWS)
+    assert len(rows) == len(registry.ids()) + len(shell.PRESET_ROWS) + len(shell.THEME_ROWS)
     assert [r.props.get("title") for r in rows].count(None) == 0
-    assert len([r for r in rows if "open" in r.classes]) == 1
+    # Two marked rows, and they mean different things: one window is open, and
+    # one theme is in effect. The arrangement presets are actions and carry no
+    # state, which is why they are not in this count.
+    assert len([r for r in rows if "open" in r.classes]) == 2
     assert "open" in _menu_row(client, "chat").classes
 
 
@@ -922,7 +925,11 @@ def test_creating_a_project_on_a_configured_machine_opens_nothing(rendered, monk
 
     monkeypatch.setattr(tasks_mod, "run_tool", fake_run_tool)
     monkeypatch.setattr("ui.state.run_tool", fake_run_tool)
-    monkeypatch.setattr(models_mod, "setup_needed", lambda: False)
+    # `first_run_needed`, not `setup_needed`: the opening arrangement asks the
+    # wider question now (a token *and* a project), and `run_tool` is faked here
+    # so no project is actually created -- without this the machine under test
+    # is not the configured one the name promises.
+    monkeypatch.setattr(models_mod, "first_run_needed", lambda: False)
 
     _, space = rendered(["projects"])
     asyncio.run(space.create_project("proj-a", "A"))

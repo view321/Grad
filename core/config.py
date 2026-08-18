@@ -225,6 +225,40 @@ DEFAULTS: dict[str, Any] = {
             "a100-large": 4.13,
         },
     },
+    # Modal Sandboxes: the fourth submitter, and the first whose billing model
+    # the §6 dollar ceilings were already the right instrument for. Modal charges
+    # per second against a published table, so unlike Kaggle there is nothing
+    # here to ration in another unit -- `[spend]` is the gate, and `collect`
+    # prices the elapsed time against `gpu_rates` below.
+    "modal": {
+        "default_gpu": "H100",
+        "app_name": "grad",
+        # A Volume, because a Sandbox's filesystem does not outlive it and
+        # `collect` runs after it has exited. See `tools/modal.py`.
+        "volume_name": "grad-runs",
+        "mount_path": "/grad/out",
+        "workdir": "/grad/pipeline",
+        "poll_interval_s": 20,
+        # Modal kills a Sandbox at 24 hours whatever it was doing, so a spec
+        # asking for more is refused rather than started.
+        "max_hours": 24.0,
+        "timeout_margin": 1.25,
+        # Dollars per hour, from Modal's published per-second prices. An
+        # accelerator absent from this table is refused at submit rather than
+        # booked at zero: `[spend]` is this backend's only gate, and a ceiling
+        # that cannot price a run is not bounding it.
+        "gpu_rates": {
+            "T4": 0.5904,
+            "L4": 0.7992,
+            "A10G": 1.1016,
+            "L40S": 1.9512,
+            "A100-40GB": 2.0988,
+            "A100-80GB": 2.4984,
+            "H100": 3.9492,
+            "H200": 4.5396,
+            "B200": 6.2496,
+        },
+    },
     # Kaggle kernels: a third submitter, and the first whose scarce resource is
     # not money. Every run costs $0.00, so the §6 dollar ceilings can never
     # refuse one -- which would make them decoration on this backend rather than
@@ -802,6 +836,21 @@ def _validate(cfg: Config, path: Path) -> None:
             "[hf.flavor_rates] must be a table of flavor -> dollars per hour",
             fix=f"fix the [hf.flavor_rates] section in {path}",
         )
+    modal_rates = cfg.get("modal", "gpu_rates", {})
+    if not isinstance(modal_rates, dict):
+        raise ConfigError(
+            "[modal.gpu_rates] must be a table of GPU name -> dollars per hour",
+            fix=f"fix the [modal.gpu_rates] section in {path}",
+        )
+    for name, value in modal_rates.items():
+        # Checked here rather than at submit, where the failure would be a run
+        # that got as far as the ceiling before anything noticed the ceiling
+        # could not be computed.
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ConfigError(
+                f"[modal.gpu_rates] {name} must be a non-negative number of dollars per hour",
+                fix=f'write it as "{name}" = 3.9492 in {path}',
+            )
     cfg.hosts  # noqa: B018 - raises ConfigError on a malformed inventory
 
 

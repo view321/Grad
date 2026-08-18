@@ -85,6 +85,22 @@ def _jupyter_config_dir() -> Path:
     return paths.root() / "config" / "jupyter"
 
 
+def _install_theme() -> dict[str, Any]:
+    """Generate Lab's stylesheet for the workspace's palette. Never raises.
+
+    Imports `ui` lazily and tolerates its absence: `tools/lab.py` is a CLI and
+    runs on installs without the `ui` extra, where there is no palette to apply
+    and no desktop app to match.
+    """
+    try:
+        from core import settings  # noqa: PLC0415
+        from ui import jupyter_theme  # noqa: PLC0415
+
+        return jupyter_theme.install(settings.theme())
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        return {"theme": None, "written": [], "seeded": [], "error": f"{type(exc).__name__}: {exc}"}
+
+
 def _read_state() -> dict[str, Any]:
     return jsonl.read_json(_state_path()) or {}
 
@@ -188,6 +204,14 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     log = _log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
 
+    # Before the server, because both files below are read at startup: the sheet
+    # by `--custom-css` and the base-theme selection by Lab's own settings
+    # loader. This is also what puts them in the workspace at all -- see
+    # `ui/jupyter_theme.py:install`, which seeds a config directory the
+    # recommended split has never had one in. Failure is reported, not raised: a
+    # Lab server that starts unstyled beats one that does not start.
+    theming = _install_theme()
+
     env = {
         **os.environ,
         # Read by config/jupyter/jupyter_server_config.py, so the framing
@@ -246,6 +270,10 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         "log": str(log),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "listening": _listening(port),
+        # Reported rather than silent, because the failure it can carry is
+        # invisible: an unstyled Lab looks like a working Lab until you notice
+        # it is not the same application as the window around it.
+        "theme": theming,
     }
     jsonl.write_json(_state_path(), record)
     if not record["listening"]:

@@ -80,6 +80,52 @@ def detached() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
+def utf8_env() -> dict[str, str]:
+    """Environment for a Python child that will meet text from the internet.
+
+    Python's `open()` defaults to `locale.getpreferredencoding()`, which on
+    Windows is the ANSI code page rather than UTF-8. On the machine this was
+    found on that is **cp1251** -- a Cyrillic code page, on a machine doing
+    English-language ML research -- because the ANSI code page follows the
+    system locale and has nothing to do with what the files contain.
+
+    What the files contain is arXiv LaTeX, and there are two failures, one of
+    which survives doing the obvious thing right:
+
+        open(tex).read()
+        UnicodeDecodeError: 'charmap' codec can't decode byte 0x98
+
+        print(open(tex, encoding='utf-8').read())
+        UnicodeEncodeError: 'charmap' codec can't encode character '\\xf6'
+
+    The first is a curly quote -- `\\u2018` is `e2 80 98` in UTF-8, and cp1251
+    has no character at 0x98. The second is the one worth the paragraph: the
+    read was *correct*, and the crash moved to `print`, because the standard
+    streams take their encoding from the same code page. Remembering
+    `encoding="utf-8"` on every open is not sufficient and never was.
+
+    `PYTHONUTF8=1` is PEP 540's UTF-8 Mode and answers both: it makes
+    `getpreferredencoding` return utf-8, so `open()` defaults to it, and it
+    reconfigures stdin/stdout/stderr to utf-8 with `surrogateescape`.
+
+    **`PYTHONIOENCODING` is set too, and the error handler is why.** UTF-8 Mode
+    alone looked sufficient and is not: `PYTHONIOENCODING` takes precedence over
+    it for the standard streams, so an ambient one -- a stray export, a shell
+    profile, a CI image -- silently defeats half the fix and leaves the `print`
+    failure above exactly as it was. Setting it here overrides that.
+
+    It is spelled `utf-8:surrogateescape` rather than `utf-8` for the reason
+    that made leaving it out tempting: the bare form defaults the handler to
+    `strict`, which turns a byte that survived a lossy read into a crash on the
+    way out. Naming the handler keeps UTF-8 Mode's behaviour instead of
+    replacing it with a stricter one.
+
+    Nothing here is Windows-only. A Linux box with `LC_ALL=C` has the same
+    problem in ASCII, and the fix is the same two variables.
+    """
+    return {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:surrogateescape"}
+
+
 def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     """`subprocess.run`, without a window. Callers pass everything else."""
     return subprocess.run(argv, **{**quiet(), **kwargs})

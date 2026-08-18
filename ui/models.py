@@ -746,6 +746,18 @@ CREDENTIAL_NOTES: dict[str, tuple[str, str]] = {
         "Kaggle kernels — the free GPU/TPU backend; useless without the username",
         "backend",
     ),
+    # The ninth and tenth. Both halves are secret and either one alone
+    # authenticates nothing, so they are two rows rather than one -- the panel
+    # shows what is stored, and "half a token pair" is a state worth being able
+    # to see.
+    "modal_token_id": (
+        "Modal sandboxes — H100s and up, billed by the second; needs the secret too",
+        "backend",
+    ),
+    "modal_token_secret": (
+        "the other half of the Modal pair; neither authenticates alone",
+        "backend",
+    ),
     "voyage_key": ("the reranker and the local index's embeddings (costs credits)", "retrieval"),
     "openrouter_key": (
         "optional second rail for the reranker; Voyage is used by default",
@@ -841,6 +853,124 @@ def setup_needed() -> bool:
         return False
     stored, _ = _safe(lambda: credentials_mod.present(credentials_mod.CLAUDE_TOKEN), False)
     return not stored
+
+
+#: The first-run sequence: what a machine that has never been set up still needs,
+#: in the order it needs it, and what each one buys.
+#:
+#: `blocking` is the whole design of this. Two of the three genuinely stop the
+#: app being useful -- with no token nothing authenticates, and with no project
+#: every run is charged to nobody and no ceiling bounds anything. A backend does
+#: not: the kernel, the funnel and the ledger all work on this machine alone, and
+#: putting "configure a GPU backend" in front of someone who opened the app to
+#: read a paper would be the wizard this project already decided not to write.
+FIRST_RUN_STEPS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "token",
+        "title": "authenticate",
+        "why": "every model call goes through your Claude subscription; nothing runs without it",
+        "blocking": True,
+        "opens": "setup",
+        "step": "token",
+    },
+    {
+        "id": "project",
+        "title": "create a project",
+        "why": "every run, ceiling and report is filed against one — without it spend is unbounded",
+        "blocking": True,
+        "opens": "projects",
+        "step": None,
+    },
+    {
+        "id": "backend",
+        "title": "choose where runs execute",
+        "why": "optional: the notebook, the funnel and the ledger all work on this machine alone",
+        "blocking": False,
+        "opens": "setup",
+        "step": "backends",
+    },
+)
+
+
+def first_run_needed() -> bool:
+    """Is this machine mid-setup? The cheap half of `first_run`.
+
+    Separate because the caller is `ui/state.py:opening_windows`, which decides
+    what is on screen before anything is drawn, and its docstring promises the
+    decision costs a credential-store read and nothing else. `first_run` reads
+    the *backend* readiness too, and that loads a `Config` -- which is not free,
+    and, worse, repopulates the config cache. `Workspace.switch_root` clears
+    that cache on purpose when the workspace moves, and a reader on the layout
+    path put it straight back, leaving the new workspace resolving the old
+    one's configuration.
+
+    So the arrangement asks only what it acts on. The two blocking conditions
+    are exactly the ones that decide whether the setup window opens; the backend
+    is reported in the panel and never opens anything.
+    """
+    from core import budget as budget_mod
+
+    if setup_needed():
+        return True
+    current, _ = _safe(budget_mod.current_project, None)
+    if not current:
+        return True
+    exists, _ = _safe(lambda: budget_mod.exists(current), False)
+    return not exists
+
+
+def first_run() -> dict[str, Any]:
+    """What a fresh install still needs, and whether to say so at all.
+
+    **Derived, never stored, and that is deliberate.** The obvious design is a
+    `first_run_done` flag in the settings overlay, and it is wrong in both
+    directions: someone who dismisses the panel before creating a project never
+    sees it again on a machine that still has no project, and someone who moves
+    to a new workspace gets no panel because a *different* workspace once set a
+    flag. Reading the three conditions means the panel is present exactly while
+    it is true, and disappears by being satisfied rather than by being dismissed.
+
+    So there is nothing to reset and no state to migrate: `active` goes false the
+    moment a token and a project exist, which is the moment the panel has
+    finished being useful.
+
+    Never raises. This runs on the build path of the one window whose job is to
+    be usable when nothing else is.
+    """
+    from core import budget as budget_mod
+
+    done: dict[str, bool] = {}
+    done["token"] = not setup_needed()
+
+    def _has_project() -> bool:
+        # Both halves: a workspace can hold projects with none selected, and the
+        # selection file can name a project that was closed. Either way there is
+        # nothing for a run to be charged to.
+        current = budget_mod.current_project()
+        return bool(current) and budget_mod.exists(current)
+
+    done["project"], _ = _safe(_has_project, False)
+
+    def _has_backend() -> bool:
+        from core import config as config_mod
+        from tools import setup as setup_tool
+
+        return any(b.get("ready") for b in setup_tool.readiness(config_mod.load()))
+
+    done["backend"], _ = _safe(_has_backend, False)
+
+    steps = [{**step, "done": bool(done.get(step["id"]))} for step in FIRST_RUN_STEPS]
+    remaining = [s for s in steps if not s["done"]]
+    return {
+        "steps": steps,
+        "done": len([s for s in steps if s["done"]]),
+        "total": len(steps),
+        # Only the blocking ones decide whether this is a machine mid-setup. A
+        # workspace with a token and a project is set up; an unconfigured backend
+        # is a choice, not an unfinished step.
+        "active": any(s["blocking"] and not s["done"] for s in steps),
+        "next": remaining[0] if remaining else None,
+    }
 
 
 def setup_model() -> dict[str, Any]:
@@ -957,6 +1087,13 @@ def setup_model() -> dict[str, Any]:
         # Nothing here blocks the app; this is what the appbar and the first-run
         # arrangement ask about.
         "complete": token["ready"] and any(b["ready"] for b in backends),
+        # What a machine that has never been set up still needs. Folded into this
+        # model rather than fetched separately by the window, so the panel and
+        # the steps below it are one snapshot -- two reads could disagree, and
+        # "authenticate" ticking green above a token step that still says
+        # missing is exactly the kind of disagreement a first-run panel must not
+        # produce.
+        "first_run": _safe(first_run, {})[0] or {},
         "error": cfg_error or cred_error or backend_error,
     }
 

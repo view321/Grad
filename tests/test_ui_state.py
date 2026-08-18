@@ -34,9 +34,27 @@ def workspace_for(project: str | None = "proj") -> state_mod.Workspace:
 # ---------------------------------------------------------------------------
 # layout persistence
 # ---------------------------------------------------------------------------
-def test_a_fresh_workspace_opens_the_default_arrangement(workspace):
+def test_a_fresh_workspace_opens_the_default_arrangement(workspace, monkeypatch):
+    """On a *configured* machine. A workspace that is still mid-setup opens the
+    setup window as well -- see the test below, and `state.opening_windows`."""
+    from ui import models as models_mod
+
+    monkeypatch.setattr(models_mod, "first_run_needed", lambda: False)
     space = workspace_for()
     assert set(space.layout.windows) == set(registry.defaults())
+
+
+def test_a_workspace_that_is_still_mid_setup_opens_the_window_that_fixes_it(
+    workspace, monkeypatch
+):
+    """Widened from "no token" to "no token or no project": a workspace with a
+    token and nothing to charge a run to opens four windows, three of them empty
+    for a reason nothing on screen was saying."""
+    from ui import models as models_mod
+
+    monkeypatch.setattr(models_mod, "first_run_needed", lambda: True)
+    space = workspace_for()
+    assert "setup" in space.layout.windows
 
 
 def test_the_layout_persists_per_project(workspace):
@@ -55,7 +73,10 @@ def test_a_project_id_with_path_separators_cannot_escape_the_layout_directory(wo
     assert ".." not in path.name
 
 
-def test_an_unreadable_layout_file_falls_back_to_the_default(workspace):
+def test_an_unreadable_layout_file_falls_back_to_the_default(workspace, monkeypatch):
+    from ui import models as models_mod
+
+    monkeypatch.setattr(models_mod, "first_run_needed", lambda: False)
     state_mod.layout_dir().mkdir(parents=True, exist_ok=True)
     state_mod.layout_path("proj").write_text("{ not json", encoding="utf-8")
     assert set(workspace_for("proj").layout.windows) == set(registry.defaults())

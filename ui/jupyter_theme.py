@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Any
 
 from core import paths
 from ui import tokens
@@ -54,8 +55,19 @@ def repo_path() -> Path:
     return Path(__file__).resolve().parents[1] / "config" / "jupyter" / "custom" / "custom.css"
 
 
-def stylesheet() -> str:
-    c = tokens.COLOUR
+#: Which JupyterLab base each palette re-tokens. `custom.css` cannot register a
+#: named theme, so it overrides whichever base is selected -- and the base has to
+#: match, or dark defaults sit under cream overrides in every corner the sheet
+#: below does not name. There are a lot of those corners: the file browser, the
+#: command palette, the status bar, every menu.
+LAB_BASE: dict[str, str] = {
+    "light": "JupyterLab Light",
+    "dark": "JupyterLab Dark",
+}
+
+
+def stylesheet(theme: str | None = None) -> str:
+    c = tokens.palette(theme)
     return f"""{BANNER}
 
 /* ------------------------------------------------------------------ tokens */
@@ -220,8 +232,8 @@ body, .jp-Notebook, .jp-NotebookPanel {{ background: {c['paper']}; }}
 
 .jp-RenderedHTMLCommon table {{ border-collapse: collapse; font-family: {tokens.FONT_MONO}; }}
 .jp-RenderedHTMLCommon thead th {{
-  background: {c['ink']};
-  color: {c['paper']};
+  background: {c['fill']};
+  color: {c['fill-ink']};
   text-align: left;
   padding: 7px 9px;
   font-size: 10px;
@@ -235,17 +247,17 @@ body, .jp-Notebook, .jp-NotebookPanel {{ background: {c['paper']}; }}
 
 /* ----------------------------------------------------------------- chrome */
 .jp-SideBar, .jp-FileBrowser, .jp-DirListing {{ background: {c['paper-sunk']}; }}
-.jp-DirListing-item.jp-mod-selected {{ background: {c['ink']}; color: {c['paper']}; }}
+.jp-DirListing-item.jp-mod-selected {{ background: {c['fill']}; color: {c['fill-ink']}; }}
 .jp-Toolbar-item .jp-ToolbarButtonComponent:hover {{ background: {c['paper-sunk']}; }}
 .lm-TabBar-tab.lm-mod-current {{
-  background: {c['ink']} !important;
-  color: {c['paper']} !important;
+  background: {c['fill']} !important;
+  color: {c['fill-ink']} !important;
   border: 0;
 }}
 .lm-TabBar-tab {{ background: {c['paper-sunk']}; border-right: 1px solid {c['rule-soft']}; }}
 .jp-Statusbar, #jp-bottom-panel {{
-  background: {c['ink']};
-  color: {c['paper']};
+  background: {c['fill']};
+  color: {c['fill-ink']};
   font-family: {tokens.FONT_MONO};
   font-size: 11px;
 }}
@@ -259,15 +271,90 @@ body, .jp-Notebook, .jp-NotebookPanel {{ background: {c['paper']}; }}
 .cm-operator, .cm-punctuation {{ color: {c['muted']}; }}
 .cm-editor .cm-ruler {{ border-right: 1px dashed {c['rule-mid']}; }}
 .cm-cursor {{ border-left: 2px solid {c['ink']}; }}
-.cm-editor .cm-selectionBackground {{ background: {c['attention']} !important; }}
+.cm-editor .cm-selectionBackground {{ background: {c['attention']} !important;
+                                       color: {c['on-attention']} !important; }}
 """
 
 
-def write(path: Path | None = None) -> Path:
+def write(path: Path | None = None, theme: str | None = None) -> Path:
     path = path or repo_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(stylesheet(), encoding="utf-8")
+    path.write_text(stylesheet(theme), encoding="utf-8")
     return path
+
+
+def install(theme: str | None = None) -> dict[str, Any]:
+    """Put the sheet and the base-theme selection where Lab will read them.
+
+    Called by `tools/lab.py` before the server starts, and it closes two things
+    at once.
+
+    The first is the theme: `custom.css` re-tokens a base rather than
+    registering one, so the base has to match the palette or Lab's own chrome --
+    file browser, command palette, menus, every corner the sheet does not name
+    -- keeps the defaults of the wrong one.
+
+    The second predates the theme and is the larger of the two.
+    `JUPYTER_CONFIG_DIR` is `paths.root()/config/jupyter` -- the *workspace* --
+    and only the checkout has that directory in it. The installer asks for a
+    workspace separate from the code and gives good reasons for it, and every
+    install that took the advice has been starting Lab with `--custom-css`
+    aimed at a file that does not exist and `--ServerApp.config_file` at another
+    one. That is stock JupyterLab inside Grad's chrome, and the server config
+    that sets the framing headers never loading -- exactly the seam this module
+    was written to close, on the recommended layout.
+
+    So the shipped files are seeded when they are absent, the way
+    `core/paths.py:_shipped` resolves the other three code-adjacent paths, and
+    only `custom.css` is rewritten every time: it is generated, and the other two
+    are documents someone may have edited.
+
+    Never raises: a workspace whose config directory cannot be written is one
+    where Lab should still start, unstyled.
+    """
+    import shutil  # noqa: PLC0415
+
+    from core import jsonl  # noqa: PLC0415
+
+    chosen = str(theme or tokens.DEFAULT_THEME).lower()
+    if chosen not in LAB_BASE:
+        chosen = tokens.DEFAULT_THEME
+    result: dict[str, Any] = {"theme": chosen, "written": [], "seeded": [], "error": None}
+    try:
+        config_dir = target().parent.parent
+        shipped_dir = repo_path().parent.parent
+        config_dir.mkdir(parents=True, exist_ok=True)
+
+        # Seeded, not overwritten. `jupyter_server_config.py` reads
+        # GRAD_UI_ORIGIN and GRAD_LAB_PORT so the framing headers and the port
+        # cannot drift apart; a workspace without it has no framing policy at
+        # all, which is a security-relevant absence rather than a cosmetic one.
+        if shipped_dir != config_dir:
+            for name in ("jupyter_server_config.py", "overrides.json"):
+                source, destination = shipped_dir / name, config_dir / name
+                if source.is_file() and not destination.exists():
+                    shutil.copyfile(source, destination)
+                    result["seeded"].append(str(destination))
+
+        sheet = target()
+        write(sheet, chosen)
+        result["written"].append(str(sheet))
+
+        # Merged rather than replaced: `overrides.json` carries the handoff's
+        # 88-column ruler and whatever else has been set in it, and rewriting the
+        # file to hold one key would silently drop the rest.
+        overrides_path = config_dir / "overrides.json"
+        current = jsonl.read_json(overrides_path)
+        if not isinstance(current, dict):
+            current = jsonl.read_json(shipped_dir / "overrides.json") or {}
+        themes = dict(current.get("@jupyterlab/apputils-extension:themes") or {})
+        themes["theme"] = LAB_BASE[chosen]
+        current["@jupyterlab/apputils-extension:themes"] = themes
+        jsonl.write_json(overrides_path, current)
+        result["written"].append(str(overrides_path))
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

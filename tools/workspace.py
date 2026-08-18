@@ -320,5 +320,55 @@ def _remove(source: Path, names: list[str]) -> list[str]:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# version control
+# ---------------------------------------------------------------------------
+def _vcs_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "action",
+        choices=("init", "status", "log", "commit"),
+        help="init: start versioning this workspace; commit: checkpoint now",
+    )
+    p.add_argument("--message", default="manual checkpoint", help="the commit subject")
+    p.add_argument("--limit", type=int, default=20, help="how many checkpoints `log` shows")
+
+
+@cli.command("vcs", "keep a local history of the research", setup=_vcs_args)
+def cmd_vcs(args: argparse.Namespace) -> dict[str, Any]:
+    """Version the workspace, locally, with no remote.
+
+    `init` is deliberate and one-time: creating a repository inside somebody's
+    folder is a side effect they did not ask for. Everything after it is
+    automatic -- a run collected, a verdict recorded and a project's documents
+    regenerated each leave a commit, because those are the moments the system
+    already treats as meaningful.
+
+    There is no `push` and no remote, and that is a decision rather than an
+    omission: a research workspace holds the pipeline, the data pointers and
+    whatever a notebook has printed, and publishing it is not a thing to make
+    one flag away. See `core/vcs.py`.
+    """
+    from core import vcs  # noqa: PLC0415
+
+    if args.action == "init":
+        result = vcs.initialise()
+        if result.get("error"):
+            raise UsageError(result["error"], fix=result.get("fix"))
+        return {
+            **result,
+            "next": "nothing — collect, verdict and project sync now checkpoint on their own",
+        }
+    if args.action == "commit":
+        if not vcs.enabled():
+            raise UsageError(
+                "this workspace is not versioned",
+                fix="python -m tools.workspace vcs init --json",
+            )
+        return vcs.checkpoint(args.message)
+    if args.action == "log":
+        return {"root": str(vcs.root()), "checkpoints": vcs.history(args.limit)}
+    return vcs.status()
+
+
 if __name__ == "__main__":
     main(cli)

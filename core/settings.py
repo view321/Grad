@@ -52,7 +52,7 @@ VERSION = 1
 #:
 #: In `core/` rather than in the tool, because a *setting* naming a backend is
 #: read by the config layer, and `core` importing `tools` is backwards.
-BACKENDS: tuple[str, ...] = ("ssh", "hf_jobs", "kaggle")
+BACKENDS: tuple[str, ...] = ("ssh", "hf_jobs", "kaggle", "modal")
 
 #: The models the setup window offers as buttons. **Not a restriction.**
 #: `set_models` takes any non-empty string, because a hardcoded list of model ids
@@ -208,6 +208,44 @@ def set_backend(name: str, root: Path | None = None) -> dict[str, Any]:
         )
     document = load(root)
     document["backend"] = {"default": chosen}
+    return _write(document, root)
+
+
+# ---------------------------------------------------------------------------
+# theme
+# ---------------------------------------------------------------------------
+#: The palettes `ui/tokens.py` ships. Spelled out here rather than imported,
+#: because `core` importing `ui` is backwards -- the same reason `BACKENDS` is a
+#: tuple here rather than a reference to `tools/evolve.py`. `tests/
+#: test_settings.py` asserts the two lists still agree.
+THEMES: tuple[str, ...] = ("light", "dark")
+
+
+def theme(root: Path | None = None) -> str:
+    """Which palette the workspace draws in. `light` unless it was changed.
+
+    Per workspace, like everything else in this overlay, and that is the useful
+    scope rather than an accident of where it landed: the theme is read by the
+    splash process before any window exists, and a splash that flashed cream
+    before a dark workspace painted would be the one frame the whole setting is
+    judged on.
+
+    Never raises and never returns something `ui/tokens.py` cannot resolve: a
+    value written by a newer version falls back to the default there too.
+    """
+    chosen = str(load(root).get("theme") or "").strip().lower()
+    return chosen if chosen in THEMES else "light"
+
+
+def set_theme(name: str, root: Path | None = None) -> dict[str, Any]:
+    chosen = str(name or "").strip().lower()
+    if chosen not in THEMES:
+        raise UsageError(
+            f"unknown theme {name!r}",
+            fix=f"themes are: {', '.join(THEMES)}",
+        )
+    document = load(root)
+    document["theme"] = chosen
     return _write(document, root)
 
 

@@ -39,6 +39,18 @@ remote = ["keyring>=25.0", "huggingface-hub>=0.24"]
 # unrecognised and every kernel runs on CPU, which is a job that burns no quota
 # and produces nothing.
 kaggle = ["keyring>=25.0", "kaggle>=1.6.14"]
+# `tools/modal.py` imports the SDK rather than shelling out to the CLI, which is
+# the opposite of every other backend here and is the *stronger* position on §9:
+# `modal.Client.from_credentials` takes the token pair as arguments and sends
+# them as gRPC headers, so the secret never enters any process's environment --
+# not this one's and not a child's. Shelling out would have required writing
+# `.modal.toml` or exporting MODAL_TOKEN_ID, both of which are worse.
+#
+# The floor is where `Client.from_credentials` and `Sandbox.from_id` both exist:
+# without the first there is no way to authenticate without the environment, and
+# without the second `collect` cannot reach a sandbox `submit` started in an
+# earlier process, which is the whole submit/collect split.
+modal = ["keyring>=25.0", "modal>=0.64"]
 # NiceGUI 3 is a floor, not a preference: the window system needs `Element.move`
 # to reparent a window between panes without rebuilding it, and `shared=True` on
 # `add_head_html`/`add_body_html`, which 3.0 requires when global-scope markup

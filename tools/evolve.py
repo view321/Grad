@@ -149,7 +149,8 @@ STAGE_EVOLVE = quota_log.STAGE_EVOLVE
 BACKEND_SSH = "ssh"
 BACKEND_HF = "hf_jobs"
 BACKEND_KAGGLE = "kaggle"
-REMOTE_BACKENDS = (BACKEND_SSH, BACKEND_HF, BACKEND_KAGGLE)
+BACKEND_MODAL = "modal"
+REMOTE_BACKENDS = (BACKEND_SSH, BACKEND_HF, BACKEND_KAGGLE, BACKEND_MODAL)
 
 #: The checks a remote campaign's spec must have passed. Not `[preflight] checks`
 #: from the config, and that is the point: a machine configured to skip `smoke`
@@ -695,6 +696,24 @@ def _remote_target(args: argparse.Namespace, cfg: config_mod.Config) -> dict[str
         kind = cfg.accelerator_kind(accelerator)
         target.update({"accelerator": accelerator, "accelerator_kind": kind})
         _kaggle_hours_gate(cfg, args, sub, accelerator=accelerator, kind=kind)
+        return target
+
+    if args.remote == BACKEND_MODAL:
+        from tools import modal as modal_tool  # noqa: PLC0415 - optional deps
+
+        gpu = modal_tool.resolve_gpu(None, sub, cfg)
+        # Refused before generation 0, for the reason the HF branch below gives:
+        # an unpriced accelerator makes the campaign's projected cost a fiction,
+        # and the campaign budget gate is the only thing between a search and an
+        # allocation.
+        rate = modal_tool.gpu_rate(gpu, cfg)
+        if rate is None:
+            raise ConfigError(
+                f"Modal GPU {gpu!r} has no rate in [modal.gpu_rates], so a campaign on it "
+                "cannot be priced",
+                fix=f'add `"{gpu}" = <usd_per_hour>` under [modal.gpu_rates] in config/grad.toml',
+            )
+        target.update({"gpu": gpu, "rate_usd_per_hour": rate})
         return target
 
     from tools import jobs as jobs_tool  # noqa: PLC0415 - optional deps
@@ -1323,6 +1342,25 @@ def _run_on_backend(
         return kaggle_tool.evaluate_candidate(
             remote["sub"], cfg, artifacts=artifacts,
             accelerator=remote.get("accelerator"), **common,
+        )
+
+    if backend == BACKEND_MODAL:
+        from tools import modal as modal_tool  # noqa: PLC0415
+
+        return modal_tool.evaluate_candidate(
+            remote["sub"], cfg, artifacts=artifacts, gpu=remote.get("gpu"), **common
+        )
+
+    if backend != BACKEND_HF:
+        # Explicit rather than a fall-through, and this is a bug that already
+        # happened once in the making: `modal` was added to `REMOTE_BACKENDS`
+        # before it was added here, and the effect of the old `return
+        # jobs_tool...` at the end of this function was that `--remote modal`
+        # ran the whole campaign on Hugging Face Jobs. Silently, with the right
+        # hardware name in the log.
+        raise ConfigError(
+            f"no candidate evaluator is wired up for backend {backend!r}",
+            fix=f"--remote {'|'.join(REMOTE_BACKENDS)}",
         )
 
     from tools import jobs as jobs_tool  # noqa: PLC0415

@@ -7,12 +7,27 @@ happens again, and now there are three dead exchanges the model will re-read on
 every turn for the rest of the session. Nothing was wrong with the question; the
 only way to ask it cleanly was to start a new session and lose the thread.
 
-**A rewind is two operations and they fail independently.** Dropping records
+**A rewind is three operations and they fail independently.** Dropping records
 from the transcript is ours and always works. Putting the *model's* memory back
 is the SDK's: it needs an anchor -- the uuid of the last transcript entry of the
 last turn being kept -- handed to `resume_session_at` when the client is
 rebuilt. When there is no usable anchor the transcript rewinds anyway and the
 agent goes on remembering the dropped turns.
+
+Putting the *work* back is the SDK's too, by a different route: with
+`enable_file_checkpointing` on, `client.rewind_files(uuid)` restores files to
+their state at a given user message. It is a control request rather than an
+option, so it is the one half that has to happen while the client is still
+alive -- `ui/app.py:rewind_to` does it before `close()`, and doing it after
+would have made it the half that silently never ran.
+
+That third one is narrower than the other two and the wording everywhere is
+careful about it. The CLI checkpoints around its own editing tools, so a rewind
+returns what `Write` and `Edit` changed; a file a `Bash` command wrote stays
+written. For this agent that is most of them, and it is the right boundary
+rather than a shortfall: the ledger is append-only precisely so a run cannot be
+un-recorded, and an undo that reached into `ledger/runs.jsonl` would be erasing
+evidence rather than work.
 
 That degradation is deliberate, and it is reported rather than hidden, because
 it is the same split `ui/sessions.py` draws between resuming a conversation and
@@ -126,15 +141,27 @@ def plan(
 
 
 def record(
-    *, dropped: list[dict[str, Any]], resumed: bool, anchor: str | None = None
+    *,
+    dropped: list[dict[str, Any]],
+    resumed: bool,
+    anchor: str | None = None,
+    files: bool = False,
 ) -> dict[str, Any]:
     """The transcript entry a rewind leaves in place of what it dropped.
 
     A record rather than a silent truncation, for the reason a compaction leaves
     one: a transcript that quietly loses turns is indistinguishable from one that
     never had them, and the next confusing answer has nothing to point at. This
-    also makes a rewind honest about the half of itself that can fail -- the
-    marker says whether the agent's memory came back with the screen.
+    also makes a rewind honest about the halves of itself that can fail -- the
+    marker says whether the agent's memory came back with the screen, and whether
+    the work did.
+
+    `files` is stated only when it is true. The common rewind restores none --
+    most turns edit nothing -- and a marker reading "no files were restored"
+    describes a failure of something that was never attempted. What it claims is
+    also deliberately narrow: the CLI checkpoints around its own editing tools,
+    so this is `Write` and `Edit`, not what a `Bash` command wrote and not
+    anything a submitter did on a backend. See `agent.checkpointing_option`.
 
     `dropped` is carried whole, blocks and tool calls included, so the file keeps
     everything the conversation no longer does.
@@ -152,6 +179,11 @@ def record(
             "back, so the agent still remembers them and the next turn still pays "
             "for them."
         )
+    if files:
+        tail += (
+            " Files the agent edited were restored to their state before the first "
+            "dropped prompt; anything a command wrote was not."
+        )
     return {
         "role": "system",
         "kind": MARK_KIND,
@@ -162,6 +194,9 @@ def record(
         # back. It is what says *which* conversation the rewind was against when
         # a transcript has been through several.
         "anchor": anchor,
+        #: Whether the work moved with the conversation. Third of the three
+        #: claims a rewind makes, and the newest.
+        "files": bool(files),
     }
 
 
