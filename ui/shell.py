@@ -28,8 +28,13 @@ from ui.state import POLL_SECONDS, Workspace
 
 def build(workspace: Workspace) -> None:
     """Assemble the whole shell for one connected client."""
-    from nicegui import ui
+    from nicegui import context, ui
 
+    # Held for everything that has to reach this browser from outside a render.
+    # `context.client` resolves through the slot stack, which is empty in a
+    # spawned task -- see `Workspace.paint_theme`, whose first version was
+    # written without this and silently never repainted anything.
+    workspace.client = context.client
     apply_theme(workspace.theme())
 
     roots: dict[str, Any] = {}
@@ -307,26 +312,25 @@ def apply_theme(theme: str) -> None:
         logging.getLogger("grad.ui").debug("theme not applied at build", exc_info=True)
 
 
-async def switch_theme(workspace: Workspace, theme: str) -> None:
+def switch_theme(workspace: Workspace, theme: str) -> None:
     """Persist the choice and move the live page to it, in that order.
 
     The order matters on the one path that can fail: if the write refuses -- an
     unwritable app directory, a name a newer version wrote -- the page stays on
     the palette that is still recorded, rather than showing one that will be
     gone on the next launch.
+
+    **Synchronous, and that is the fix rather than a tidy-up.** This was a
+    coroutine handed to `Workspace.spawn`, which meant the repaint ran in a
+    spawned task -- where NiceGUI's slot stack is empty, `context.client` cannot
+    be resolved, and `ui.run_javascript` raises before it reaches a socket. The
+    write and the notice both succeeded, so the status bar said "theme: dark"
+    over a workspace that was still cream. There is nothing here to await:
+    `set_theme` writes a file and `paint_theme` fires a message, so making it a
+    coroutine bought only the task that broke it.
     """
-    import logging  # noqa: PLC0415
-
-    from nicegui import ui  # noqa: PLC0415
-
     workspace.set_theme(theme)
-    try:
-        await ui.run_javascript(
-            f'document.documentElement.setAttribute('
-            f'"{tokens.THEME_ATTRIBUTE}", "{kit.attr(theme)}")'
-        )
-    except Exception:  # noqa: BLE001 - the setting is written; the repaint is cosmetic
-        logging.getLogger("grad.ui").debug("theme repaint failed", exc_info=True)
+    workspace.paint_theme(theme)
 
 
 def _used_share(session: dict[str, Any]) -> float:
@@ -691,10 +695,7 @@ def _draw_windows_menu(workspace: Workspace, body: Any, menu: kit.Menu) -> None:
                 )
                 row.on(
                     "click",
-                    lambda _=None, t=name: (
-                        workspace.spawn(switch_theme(workspace, t), "theme"),
-                        menu.redraw(),
-                    ),
+                    lambda _=None, t=name: (switch_theme(workspace, t), menu.redraw()),
                 )
 
             kit.text(

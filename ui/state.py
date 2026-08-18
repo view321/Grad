@@ -207,6 +207,17 @@ class Workspace:
         #: destroyed. The window seeds the box from this on build and clears it
         #: on send.
         self.chat_draft: str = ""
+        #: The NiceGUI client this workspace was built for, set by `shell.build`.
+        #:
+        #: Held because `context.client` is resolved from the slot stack, which
+        #: is a contextvar and therefore empty in any spawned task -- so anything
+        #: that has to reach the browser from outside a render has no other way
+        #: to find it. See `paint_theme`, which is the bug that established this.
+        self.client: Any | None = None
+        #: The palette last pushed to that client, or None. Distinct from
+        #: `theme()`, which is what the *file* says: the two disagreeing is
+        #: precisely the failure this pair exists to make visible.
+        self.painted_theme: str | None = None
         #: Wakes that have arrived and not yet been turned into a prompt.
         #:
         #: A queue rather than a direct call, because the two ends are in
@@ -919,6 +930,51 @@ class Workspace:
         settings_mod.set_theme(name)
         self.say(f"theme: {name}")
         return name
+
+    def paint_theme(self, name: str) -> bool:
+        """Move the *live page* to a palette. Returns whether it got there.
+
+        **Through the client this workspace was built with, never through
+        `ui.run_javascript`.** That helper is `context.client.run_javascript`,
+        and `context.client` is resolved from NiceGUI's slot stack -- which is a
+        contextvar, and therefore *empty in any task that was spawned*. The
+        first version of this switched the theme from a coroutine handed to
+        `spawn`, so the write succeeded, the status bar said "theme: dark", and
+        the repaint raised `The current slot cannot be determined` into a debug
+        log nobody was reading. The setting changed and the screen did not.
+
+        `kit.run_js` documents the neighbouring version of this trap -- a live
+        slot that the handler has just deleted -- and the answer is the same
+        either way: hold the client, which `shell.build` has and which outlives
+        every element in it.
+
+        Fire-and-forget on purpose. `run_javascript` returns an
+        `AwaitableResponse` that sends when it is *not* awaited and waits for a
+        reply when it is, and there is no reply worth waiting for here: setting
+        an attribute cannot fail in a way this side could act on, and awaiting
+        it would add a one-second timeout to a click.
+
+        The return value is not decoration -- `tests/test_ui_theme.py` asserts
+        it, because "the setting was written" was exactly the assertion that
+        passed while the feature did nothing.
+        """
+        import json  # noqa: PLC0415
+
+        from ui import tokens  # noqa: PLC0415
+
+        client = self.client
+        if client is None:
+            return False
+        try:
+            client.run_javascript(
+                "document.documentElement.setAttribute("
+                f"{json.dumps(tokens.THEME_ATTRIBUTE)}, {json.dumps(str(name))})"
+            )
+        except Exception:  # noqa: BLE001 - a repaint is never worth a traceback
+            log.debug("could not repaint the theme", exc_info=True)
+            return False
+        self.painted_theme = name
+        return True
 
     def say(self, message: str | None) -> None:
         """A one-line notice in the status bar: what a button just did."""

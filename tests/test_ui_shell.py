@@ -175,6 +175,102 @@ def test_the_window_menu_marks_what_is_open(rendered):
     assert "open" in _menu_row(client, "chat").classes
 
 
+class RecordingClient:
+    """A client that records what was sent to the browser.
+
+    Faked rather than driven for real because the assertion is about *reaching*
+    a client at all. The bug this guards was that the repaint went through
+    `ui.run_javascript`, which resolves `context.client` from the slot stack --
+    empty in the spawned task the switch used to run in -- so nothing was ever
+    sent. A fake still catches that: code that does not use the held client
+    never touches this object.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def run_javascript(self, code: str, **_kwargs) -> None:
+        self.sent.append(code)
+
+
+def _theme_row(client: Client, theme: str):
+    from ui import kit
+
+    wanted = kit.attr(dict((t[0], t[2]) for t in shell.THEME_ROWS)[theme])
+    for element in _menu_rows(client):
+        if element.props.get("title") == wanted:
+            return element
+    raise AssertionError(f"no menu row for the {theme} theme")
+
+
+def test_choosing_a_theme_repaints_the_page_and_not_only_the_settings_file(rendered):
+    """The regression this file exists to hold.
+
+    Every part of the theme worked except the one that mattered: `set_theme`
+    wrote the file, `say` put "theme: dark" in the status bar, and the repaint
+    raised `The current slot cannot be determined` into a debug log. The setting
+    changed, the notice appeared, and the workspace stayed cream -- so an
+    assertion on the *file* passed while the feature did nothing.
+    """
+    from core import settings
+
+    client, space = rendered(["chat"])
+    space.client = RecordingClient()
+    _open_window_menu(client, space)
+
+    click(_theme_row(client, "dark"))
+
+    assert settings.theme() == "dark", "the choice is recorded"
+    assert space.painted_theme == "dark", "and the live page was told about it"
+    assert space.client.sent, "something has to reach the browser"
+    assert 'setAttribute("data-grad-theme", "dark")' in space.client.sent[-1]
+
+
+def test_the_repaint_survives_the_menu_redrawing_underneath_it(rendered):
+    """The click handler redraws the menu, which deletes the row that was
+    clicked. That is what emptied the slot the old version resolved its client
+    through -- so the redraw is part of the test, not incidental to it."""
+    client, space = rendered(["chat"])
+    space.client = RecordingClient()
+    _open_window_menu(client, space)
+
+    row = _theme_row(client, "dark")
+    click(row)
+    # The row really is gone: the assertion above would be vacuous otherwise.
+    assert row.id not in client.elements
+    assert space.painted_theme == "dark"
+
+
+def test_switching_back_repaints_again(rendered):
+    """Two switches, because a mechanism that fires once and then holds a stale
+    reference would pass the test above."""
+    client, space = rendered(["chat"])
+    space.client = RecordingClient()
+    _open_window_menu(client, space)
+
+    click(_theme_row(client, "dark"))
+    click(_theme_row(client, "light"))
+
+    assert space.painted_theme == "light"
+    assert len(space.client.sent) == 2
+
+
+def test_a_saved_theme_is_on_the_page_before_it_paints(rendered, monkeypatch):
+    """The other half, and it needs a different mechanism from the switch.
+
+    At build time there is no socket, so a `run_javascript` would be sent to
+    nobody -- and even a deferred one would let the page paint cream first and
+    flip. The attribute goes into the document as inline markup instead, so it
+    is set before the first frame.
+    """
+    from core import settings
+
+    settings.set_theme("dark")
+    client, _ = rendered(["chat"])
+
+    assert 'setAttribute("data-grad-theme", "dark")' in client.body_html
+
+
 def test_the_window_menu_toggles_in_place_rather_than_closing(rendered):
     """Opening three windows is three clicks. A menu that dismissed itself after
     each one would be three trips back to the same button."""
