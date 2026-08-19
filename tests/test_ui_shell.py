@@ -1491,3 +1491,77 @@ def test_a_populated_workspace_survives_the_full_gesture_sequence(rendered):
     space.tick()
     windows = [e for e in client.elements.values() if "grad-window" in getattr(e, "classes", [])]
     assert len(windows) == len(space.layout.windows)
+
+
+# ---------------------------------------------------------------------------
+# the composer's guard
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_second_enter_in_the_same_tick_sends_one_turn(rendered):
+    """Two prompts submitted before the first reaches `ask` must be one turn.
+
+    `Session.busy` alone cannot stop this and the composer is what opened the
+    gap. `busy` is set inside `ask`, and the composer deliberately yields once
+    before calling it so the browser receives the drawn prompt before the SDK
+    subprocess starts (see `Session._cold_start`). That yield is a real
+    suspension point sitting between the `busy` check and `busy` becoming True,
+    and a second Enter lands inside it.
+
+    Both harms are asserted because they are separate. The visible one is a user
+    message drawn in the transcript for a prompt the agent never received. The
+    worse one is that the second `send` runs on past its no-op `ask` into
+    `maybe_compact`, which drops the client -- underneath a turn that is live,
+    which is exactly what the comment above that call says must never happen.
+    """
+    import asyncio
+
+    client, space = rendered(["chat"])
+    session = space.session
+
+    asked: list[str] = []
+    compactions = 0
+
+    async def ask(prompt, _on_settle):
+        asked.append(prompt)
+        session.busy = True
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            session.busy = False
+
+    async def maybe_compact():
+        nonlocal compactions
+        compactions += 1
+        assert not session.busy, "compaction ran underneath a live turn"
+        return None
+
+    session.ask = ask
+    session.maybe_compact = maybe_compact
+
+    with client:
+        await asyncio.gather(space.chat_send("first"), space.chat_send("second"))
+
+    assert asked == ["first"], asked
+    assert compactions == 1, f"{compactions} compactions for one accepted prompt"
+    assert space.chat_sending is False, "the guard outlived the send that set it"
+
+
+@pytest.mark.asyncio
+async def test_the_guard_is_released_when_a_turn_raises(rendered):
+    """A flag cleared only on the success path is worse than the race.
+
+    One failed turn would leave `chat_sending` True forever, and every prompt
+    after it would be refused with "a turn is still running" for a turn that
+    ended. `finally` rather than a trailing assignment is the whole of the fix.
+    """
+    client, space = rendered(["chat"])
+
+    async def ask(_prompt, _on_settle):
+        raise RuntimeError("the SDK fell over")
+
+    space.session.ask = ask
+
+    with client, pytest.raises(RuntimeError):
+        await space.chat_send("hello")
+
+    assert space.chat_sending is False

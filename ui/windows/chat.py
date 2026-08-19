@@ -758,15 +758,35 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
         prompt = (prompt if isinstance(prompt, str) else (entry.value or "")).strip()
         if not prompt:
             return
-        if session.busy:
+        if workspace.chat_sending or session.busy:
             # Said, not swallowed. This guard is what stops two turns
             # interleaving into one block list, but it used to return in
             # silence -- so a prompt typed while the previous turn was still
             # winding down simply did not happen, with the text left in the box
             # and nothing to say why. That is the same symptom as the interrupt
             # bug it usually followed, and it made that bug much harder to see.
+            #
+            # `chat_sending` rather than `session.busy` alone, because `busy` is
+            # set inside `ask` and `_send` yields before it gets there: two
+            # Enters in the same tick both passed a `busy` that was still False.
+            # See `ui/state.py` for what the second one then did.
             workspace.say("a turn is still running — stop it first (Esc)")
             return
+        # Set before anything is cleared or drawn, so the window a second Enter
+        # could land in is closed rather than merely narrowed, and released in
+        # `finally` so an exception anywhere below -- including one from
+        # `maybe_compact` -- cannot leave the composer refusing every prompt
+        # after it. That is the failure this guard would otherwise trade for:
+        # a flag that is only cleared on the success path turns one bad turn
+        # into a dead composer, which is worse than the race.
+        workspace.chat_sending = True
+        try:
+            await _send(prompt)
+        finally:
+            workspace.chat_sending = False
+
+    async def _send(prompt: str) -> None:
+        """The send itself, with the guard held by its caller."""
         entry.value = ""
         # The draft is the composer's state across a rebuild, so it has to be
         # cleared where the box is -- otherwise the next redraw would put the
