@@ -151,6 +151,13 @@ def test_an_operator_inside_quotes_is_not_an_operator(command):
         'echo "$( ( (true) ) | ssh gpu-box ls )"',
         'echo "`(true) | ssh gpu-box ls`"',
         'echo "$( (unbalanced | ssh gpu-box ls )"',
+        # A body that takes no arguments: the command name is also the last
+        # token, so a retained closer made the head `ssh)"` rather than `ssh`.
+        'echo "$(ssh)"',
+        "echo \"`ssh`\"",
+        'echo "$(pip)"',
+        'echo "$(echo "$(ssh)")"',
+        "echo $(ssh)",
     ],
 )
 def test_quote_awareness_still_fails_closed(command):
@@ -174,7 +181,8 @@ def test_a_substitution_body_is_segmented_as_commands():
     assert _segments('echo "$(echo x | ssh box)"') == [
         'echo "',
         "echo x ",
-        " ssh box)\"",
+        " ssh box",
+        ')"',
     ]
     # Single quotes suppress substitution, as the shell does, so this is one
     # command and `ssh` is never a head.
@@ -193,6 +201,23 @@ def test_a_substitution_ends_at_its_matching_parenthesis():
     assert _segments('echo "$( (true) | ssh box )"') == [
         'echo "',
         " (true) ",
-        ' ssh box )"',
+        " ssh box ",
+        ')"',
     ]
     assert evaluate_bash('echo "$(cat f) | ssh box"') is None
+
+
+def test_the_closer_ends_a_segment_and_opens_the_next():
+    """Where the closing delimiter goes, which both directions depend on.
+
+    It cannot stay in the body's segment: a substitution that takes no
+    arguments is a single token, and `ssh)"` is not `ssh`, so the head never
+    matched and the deny list let it through. It cannot simply be dropped
+    either -- the quoted tail of `"$(date) ssh box"` would then head as `ssh`,
+    and that text is an argument to `echo` that no shell ever executes. Opening
+    the next buffer with it satisfies both: the body ends clean, and the tail
+    inherits a head that matches nothing."""
+    assert _segments('echo "$(ssh)"') == ['echo "', "ssh", ')"']
+    assert evaluate_bash('echo "$(ssh)"') is not None
+    assert _segments('echo "$(date) ssh box"') == ['echo "', "date", ') ssh box"']
+    assert evaluate_bash('echo "$(date) ssh box"') is None

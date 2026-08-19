@@ -326,9 +326,18 @@ def _segments(command: str) -> list[str]:
             if char == frame[1]:
                 if frame[1] == ")" and frame[2]:
                     frame[2] -= 1
+                    buf.append(char)
                 else:
                     quote = suspended.pop()[0]
-                buf.append(char)
+                    # The closer ends the segment instead of joining it. A body
+                    # that takes no arguments is a single token, and keeping the
+                    # delimiter made that token `ssh)"`, which is not `ssh` and
+                    # was not denied. It opens the *next* buffer rather than
+                    # being dropped, so the quoted tail of `"$(date) ssh box"`
+                    # inherits a harmless head instead of reading as a command
+                    # the shell never runs.
+                    out.append("".join(buf))
+                    buf = [char]
                 i += 1
                 continue
         if char in "'\"":
