@@ -174,6 +174,10 @@ def test_an_unrecognised_remote_state_is_not_finished(workspace):
     # marker's presence *is* the terminal signal.
     assert wk._remote_finished({"remote": {"exit_code": 0}}) is True
     assert wk._remote_finished({"remote": {}}) is False
+    # `tools/modal.py` calls it `state`, and a sandbox that is still running
+    # says so on every poll.
+    assert wk._remote_finished({"state": "running"}) is False
+    assert wk._remote_finished({"state": "completed"}) is True
 
 
 def test_a_run_with_no_status_is_not_a_finished_run(workspace, monkeypatch):
@@ -223,6 +227,51 @@ def test_a_terminal_status_still_fires_without_a_poll(workspace, monkeypatch):
         fired, detail = wk._check_run(run_id)
         assert fired is True, status
         assert detail["status"] == status
+
+
+def test_every_backend_that_can_be_collected_can_be_polled(workspace):
+    """`STATUS_TOOLS` and `core/submit.py:COLLECTORS` are the same list of
+    backends written twice, and they drifted: `modal` was in one and not the
+    other for as long as the backend existed.
+
+    Nothing failed. A platform with no entry here degrades to the ledger, and
+    the ledger only turns terminal when `collect` writes to it -- so the wake
+    fired *after* the agent had already collected the run it armed the wake to
+    be told about. Correct-looking, useless, and invisible unless you notice
+    that the wake on Modal is always the one that comes last.
+    """
+    from core import submit as submit_lib
+
+    assert set(wk.STATUS_TOOLS) == set(submit_lib.COLLECTORS)
+
+
+def test_a_modal_run_is_polled_rather_than_waited_out(workspace, monkeypatch):
+    """The whole path, since the fix needed both halves: the backend has to be
+    in the table, *and* `_remote_finished` has to understand what it answers."""
+    from core import ledger_store as ls
+
+    ls.append_run_event(
+        {"type": ls.T_RUN_SUBMITTED, "id": "run-modal", "status": "in_flight", "platform": "modal"}
+    )
+
+    asked: list[str] = []
+    payload = {"state": "running", "collected": False}
+
+    def _answers(tool, run_id):
+        asked.append(tool)
+        return {"run_id": run_id, **payload}
+
+    monkeypatch.setattr(wk, "_status_envelope", _answers)
+
+    fired, detail = wk._check_run("run-modal")
+    assert asked == ["tools.modal"], "a backend with a status command must be asked"
+    assert fired is False
+    assert detail["remote"] == "running"
+
+    payload["state"] = "completed"
+    fired, detail = wk._check_run("run-modal")
+    assert fired is True, "the sandbox stopped, and that is the whole condition"
+    assert detail["remote"] == "completed"
 
 
 # ---------------------------------------------------------------------------

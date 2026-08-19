@@ -282,14 +282,34 @@ def _wrapped_command(command: list[str], sub: Submission, out_dir: str) -> list[
     the working directory, and **the exit code is preserved across the copy**.
     `cp` failing must not turn a failed run into a successful one or the reverse,
     which is what `rc=$?` and the final `exit $rc` are for.
+
+    **Two guards, because that copy found a way to be worse than the loss it
+    prevents.** `_image` bakes the whole spec directory into the image, and a
+    preflight dry run writes `metrics.jsonl` into exactly that directory -- so a
+    metrics file from a *local CPU run* shipped inside the image, sat in the
+    working directory for the whole of the real run, and was copied over the real
+    metrics at exit. Exit 0, a sandbox that looked perfect, artifacts that looked
+    complete, and a `val_loss_final` in the ledger belonging to a different
+    experiment. The failure has no symptom at all; the only reason it was caught
+    is that the local file turned out byte-identical to the collected one.
+
+    So: the stale copy is removed *before* the command runs, which means any
+    metrics file in the working directory at exit was written by this run; and
+    the copy declines to overwrite a file the run already put in the Volume,
+    because `GRAD_METRICS_FILE` is the contract and a courtesy must not outrank
+    it. The courtesy is unchanged for the pipeline it exists for -- one that
+    ignores the variable writes its file here, finds nothing in the Volume to
+    protect, and still gets copied.
     """
     name = Path(sub.metrics_file).name
     inner = shlex.join(command)
     out = shlex.quote(out_dir)
     metrics = shlex.quote(name)
+    landed = shlex.quote(f"{out_dir}/{name}")
     script = (
-        f"mkdir -p {out}; {inner}; rc=$?; "
-        f"if [ -f {metrics} ]; then cp -f {metrics} {out}/ 2>/dev/null || true; fi; "
+        f"mkdir -p {out}; rm -f {metrics}; {inner}; rc=$?; "
+        f"if [ -f {metrics} ] && [ ! -f {landed} ]; "
+        f"then cp -f {metrics} {out}/ 2>/dev/null || true; fi; "
         "exit $rc"
     )
     return ["sh", "-c", script]
