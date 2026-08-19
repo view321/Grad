@@ -15,12 +15,36 @@ point is to compare the parser against the language, not against another parser
   * `( ... )` and `{ ...; }`, which run their contents;
   * `$( ... )` and backticks, which run their contents and are live inside
     double quotes;
-  * single quotes, which suppress all of it.
+  * single quotes, which suppress all of it;
+  * redirections, which move a stream and run nothing -- so the head of a
+    command carrying one is the head it had without it.
 
 Everything the module docstring names as a known bypass -- `bash -c`,
 `ssh host "cmd"`, aliases, `eval`, environment indirection -- is *not* generated.
 Those are architectural, the docstring says so, and a property suite that
 generated them would be asserting a claim the code has never made.
+
+**Heredocs are generated, and they are generated `commands()` cannot reach
+them.** A body lives on the lines *after* the command, so an opener composed as
+the left half of `a && b` would put `&& b` on the terminator line and the
+construct would stop being the one the oracle described. `heredoc_commands` is
+therefore a top-level strategy of its own rather than a node in the recursion --
+which costs nesting and buys an oracle that is exactly right.
+
+They were excluded before, on the reasoning that a body needs lines the grammar
+had no way to emit. Two bugs lived in that exclusion, and the second was
+introduced *by the fix for the first*: stripping heredoc bodies before matching
+(right for `cat`) also stripped them for `bash`, where the body is the program
+arriving on stdin -- and because the strip ran before segmentation it removed
+`ssh` from `bash <<EOF / ssh box / EOF` before the head rule ever ran. A
+generator emitting opener-plus-body-plus-terminator as one unit would have
+caught that the day it landed, which is the whole argument for this file.
+
+**Interpreter payloads stay out**, and that one is a decision. `bash -c "..."`
+is already excluded above as a known bypass; generating it would need the oracle
+to say what the payload runs, which is the parse the module declines to do. The
+heredoc node sidesteps that only because it never has to: for `bash <<EOF` the
+body is *shell*, so the oracle is the body's own heads.
 
 The oracle is allowed to under-claim and never to over-claim. `$(echo ls)` at
 command position really does run `ls` in a shell, and `heads` says only `echo`;
@@ -80,22 +104,79 @@ class Node:
         return any(head in hooks._DENIED_COMMANDS for head in self.heads)
 
 
-def _simple(head: str, spelling: str, args: list[str], assignment: str | None) -> Node:
+def _simple(
+    head: str,
+    spelling: str,
+    args: list[str],
+    assignment: str | None,
+    redirection: tuple[str, str] | None,
+) -> Node:
     """One command: an optional `VAR=value` prefix, a head, some arguments.
 
     `spelling` is how the head is written -- bare, path-qualified, or with the
     Windows extension `_head` strips. All four resolve to the same command, and
     a deny list that only knows the bare form is one `/usr/bin/` away from
     silent.
+
+    `redirection` attaches at the leaf and nowhere else, because that is where
+    the shell puts it: a redirection is part of a *simple* command, so
+    `>out if true; then ls; fi` is not a thing bash runs and generating one
+    would have the oracle asserting about a syntax error. Composed into the
+    operators, groups and substitutions by the recursion above, one leaf
+    redirection reaches every construct in the grammar anyway.
     """
     written = {"bare": head, "path": f"/usr/bin/{head}", "dot": f"./{head}",
                "exe": f"{head}.exe"}[spelling]
-    prefix = f"{assignment} " if assignment else ""
-    return Node(" ".join([prefix + written, *args]).strip(), (head,))
+    parts: list[str] = []
+    if assignment:
+        parts.append(assignment)
+    if redirection and redirection[0] == "lead":
+        parts.append(redirection[1])
+    parts.append(written)
+    parts.extend(args)
+    if redirection and redirection[0] == "trail":
+        parts.append(redirection[1])
+    return Node(" ".join(parts).strip(), (head,))
 
 
 _HEAD_SPELLINGS = st.sampled_from(["bare", "path", "dot", "exe"])
 _ASSIGNMENTS = st.sampled_from([None, "FOO=1", "LC_ALL=C"])
+
+#: Redirections, in both spacings, both positions, and with and without a file
+#: descriptor. **The head is unchanged by every one of them**, which is the whole
+#: assertion: a redirection moves a stream, it does not run a program, so
+#: `2>/dev/null ssh box` runs exactly what `ssh box` runs.
+#:
+#: This node is why the file exists in the form it does. The grammar generated
+#: every operator, `( )`, `{ ; }`, `$( )`, backticks and quotes -- the entire
+#: shell vocabulary *except* redirection -- and `SAFE_ARGS` contains no token
+#: with a `>` or a `<` in it. So the two fail-open bugs that lived in exactly
+#: that gap were invisible to a green suite by construction, and green CI was
+#: never evidence against them. A property suite that cannot express a bug does
+#: not fail to find it; it fails to be asked.
+#:
+#: Semantics are not in dispute for any of these, which is the bar the module
+#: docstring sets. `<<` is the one left out: a heredoc needs a body on the
+#: following lines, and a generator that emits the opener without one produces a
+#: string no shell would accept rather than a command with a known answer.
+#:
+#: The targets are ordinary filenames on purpose -- nothing here trips the three
+#: whole-string rules, so a denial from a generated command is still always
+#: attributable to the head that earned it.
+_REDIRECTIONS = st.sampled_from([
+    None,
+    ("lead", ">out.txt"), ("lead", "> out.txt"),
+    ("lead", ">>log.txt"), ("lead", ">> log.txt"),
+    ("lead", "<in.txt"), ("lead", "< in.txt"),
+    ("lead", "2>/dev/null"), ("lead", "2> /dev/null"),
+    ("lead", "2>&1"), ("lead", "1>&2"), ("lead", ">&2"),
+    ("lead", "&>out.txt"), ("lead", "&> out.txt"), ("lead", "&>>log.txt"),
+    ("lead", ">|out.txt"), ("lead", ">| out.txt"),
+    ("lead", "<<< word"),
+    ("trail", "> out.txt"), ("trail", ">>log.txt"), ("trail", "< in.txt"),
+    ("trail", "2>/dev/null"), ("trail", "2>&1"), ("trail", "&>out.txt"),
+    ("trail", ">|out.txt"), ("trail", "<<< word"),
+])
 
 
 def simple_commands(heads: list[str]) -> st.SearchStrategy[Node]:
@@ -105,6 +186,7 @@ def simple_commands(heads: list[str]) -> st.SearchStrategy[Node]:
         _HEAD_SPELLINGS,
         st.lists(st.sampled_from(SAFE_ARGS), max_size=3),
         _ASSIGNMENTS,
+        _REDIRECTIONS,
     )
 
 
@@ -213,6 +295,68 @@ def commands(heads: list[str], *, max_leaves: int = 4) -> st.SearchStrategy[Node
             ),
             max_leaves=max_leaves,
         )
+    )
+
+
+# ---------------------------------------------------------------------------
+# heredocs, which are their own top-level shape
+# ---------------------------------------------------------------------------
+#: Commands that take a heredoc and treat the body as **data**: they write it
+#: somewhere. The body of one of these runs nothing, whatever it says.
+DATA_CARRIERS = ["cat", "tee"]
+
+#: Commands that take a heredoc and treat the body as **the program**, arriving
+#: on stdin instead of in a `-c` argument. `bash -s` is the same thing spelled
+#: with the flag that says so.
+CODE_CARRIERS = ["bash", "sh", "zsh", "python", "python3", "bash -s"]
+
+#: Deliberately not `EOF`. The oracle depends on the terminator appearing on a
+#: line of its own and nowhere else, and a delimiter that no generated token can
+#: equal is what makes that true by construction rather than by luck.
+_DELIMITER = "GRADEOF"
+
+
+def _heredoc(inner: Node, carrier: str, form: str, redirect: str) -> Node:
+    """One heredoc: an opener, a body, and a terminator on its own line.
+
+    **The carrier decides what the body is**, and that is the entire property.
+    `cat <<EOF / ssh box / EOF` writes a file and runs `cat`. `bash <<EOF /
+    ssh box / EOF` runs `bash` *and* `ssh`. The two differ by one word and the
+    deny list has to tell them apart -- it did not, and the fix that made `cat`
+    right made `bash` a bypass of every entry in `_DENIED_COMMANDS`.
+
+    `form` covers `<<` against `<<-` and a bare delimiter against a quoted one.
+    Quoting the delimiter suppresses every expansion in the body, which makes it
+    the strongest "this is data" signal the shell has -- and, crucially, does
+    *not* make the body data when the carrier is an interpreter. That pair is
+    the trap this node exists to generate.
+    """
+    opener = {
+        "plain": f"<<{_DELIMITER}",
+        "quoted": f"<<'{_DELIMITER}'",
+        "dash": f"<<-{_DELIMITER}",
+        "spaced": f"<< {_DELIMITER}",
+    }[form]
+    text = f"{carrier} {opener}{redirect}\n{inner.text}\n{_DELIMITER}"
+    runs_body = hooks._is_interpreter(hooks._head(carrier))
+    return Node(text, (hooks._head(carrier),) + (inner.heads if runs_body else ()))
+
+
+def heredoc_commands(
+    heads: list[str], *, carriers: list[str] | None = None
+) -> st.SearchStrategy[Node]:
+    """Heredocs whose body is one simple command.
+
+    Top-level only -- see the module docstring. A body of one command rather
+    than an arbitrary node keeps the terminator unreachable from the body's own
+    text, which is what lets the oracle be exact instead of conservative.
+    """
+    return st.builds(
+        _heredoc,
+        simple_commands(heads),
+        st.sampled_from(carriers if carriers is not None else DATA_CARRIERS + CODE_CARRIERS),
+        st.sampled_from(["plain", "quoted", "dash", "spaced"]),
+        st.sampled_from(["", " > out.txt", " >> log.txt"]),
     )
 
 

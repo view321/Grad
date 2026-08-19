@@ -323,3 +323,107 @@ def test_submitting_without_an_expectation_is_refused(workspace, tmp_path):
     # Exit 4 (no preflight) or 5 (no expectation) -- both are gate refusals and
     # both must arrive before anything reaches Modal.
     assert caught.value.exit_code in (4, 5)
+
+
+# ---------------------------------------------------------------------------
+# what a run is priced at
+# ---------------------------------------------------------------------------
+def _in_flight(run_id="run-modal-1", *, hours_ago=6.0, timeout_s=7200):
+    """A Modal run submitted `hours_ago`, with a handle and no finish stamp."""
+    import datetime as dt
+
+    from core import ledger_store as ls
+
+    ls.append_run_event({
+        "type": ls.T_RUN_SUBMITTED,
+        "id": run_id,
+        "task": "t1",
+        "status": "in_flight",
+        "submitted_at": (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours_ago)
+        ).isoformat(),
+        "platform": "modal",
+        "estimate_usd": 1.0,
+        "target": {"gpu": "A100"},
+    })
+    handle = {"sandbox_id": "sb-1", "gpu": "A100", "timeout_s": timeout_s}
+    ls.append_run_event({"type": "run_handle", "id": run_id, "handle": handle})
+    return run_id, handle
+
+
+def _rate_config(monkeypatch):
+    monkeypatch.setattr(modal_tool, "gpu_rate", lambda *_a, **_k: 10.0)
+
+
+def test_a_late_collect_is_not_billed_for_the_delay(workspace, monkeypatch):
+    """The bug: the ceilings are checked against this number.
+
+    Cost ran from `submitted_at` to *now*, so it kept growing while a finished
+    run sat waiting to be collected. Collect the next morning and a night of
+    GPU time is booked against the project that nobody bought -- and because
+    the error is fail-closed, what happens next is a gate refusing the next
+    submission over money that was never spent, with "raise the ceiling" sitting
+    there as the obvious and wrong fix."""
+    import datetime as dt
+
+    from core import ledger_store as ls
+
+    _rate_config(monkeypatch)
+    run_id, handle = _in_flight(hours_ago=6.0)
+
+    # Observed to have stopped one hour in; collected five hours after that.
+    stopped = ls.parse_iso(ls.run(run_id)["submitted_at"]) + dt.timedelta(hours=1)
+    ls.append_run_event({
+        "type": submit_lib.T_RUN_FINISHED,
+        "id": run_id,
+        "finished_at": stopped.isoformat(),
+        "final_state": "completed",
+    })
+
+    cost, warning = modal_tool._actual_cost(ls.run(run_id), handle, config_mod.load())
+    assert cost == pytest.approx(10.0, abs=0.05)   # one hour, not six
+    assert "first seen to stop" in warning
+
+
+def test_a_run_nothing_watched_is_still_priced_to_now(workspace, monkeypatch):
+    """The fallback has to stay, and has to stay labelled.
+
+    A sandbox whose finish nothing ever observed has no better bound than now,
+    and that is the safe direction for a ceiling. What would not be safe is
+    letting the two cases look identical in the record."""
+    from core import ledger_store as ls
+
+    _rate_config(monkeypatch)
+    # A timeout long enough not to be what bounds this: the point of the test is
+    # the *now* fallback, and a cap doing the work would hide it.
+    run_id, handle = _in_flight(hours_ago=6.0, timeout_s=24 * 3600)
+
+    cost, warning = modal_tool._actual_cost(ls.run(run_id), handle, config_mod.load())
+    assert cost == pytest.approx(60.0, abs=0.5)    # six hours at $10
+    assert "nothing observed this sandbox stop" in warning
+
+
+def test_the_first_observation_wins(workspace, monkeypatch):
+    """Later polls must not move the stamp: the earliest observation is the
+    tightest bound, and a rule that overwrote it would push the number back in
+    the one direction this exists to prevent."""
+    from core import ledger_store as ls
+
+    run_id, _ = _in_flight()
+    submit_lib.record_finished(run_id, state="completed")
+    first = ls.run(run_id)["finished_at"]
+    submit_lib.record_finished(run_id, state="failed")
+    assert ls.run(run_id)["finished_at"] == first
+    assert ls.run(run_id)["final_state"] == "completed"
+
+
+def test_the_timeout_still_bounds_an_unwatched_run(workspace, monkeypatch):
+    """The belt to `finished_at`'s braces. A run submitted a week ago that
+    nothing ever polled cannot have cost a week: the sandbox could not have run
+    longer than Modal would let it."""
+    from core import ledger_store as ls
+
+    _rate_config(monkeypatch)
+    run_id, handle = _in_flight(hours_ago=24 * 7, timeout_s=3600)
+    cost, _ = modal_tool._actual_cost(ls.run(run_id), handle, config_mod.load())
+    assert cost == pytest.approx(10.0, abs=0.05)   # capped at the one-hour timeout

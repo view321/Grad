@@ -95,6 +95,16 @@ def quota_path() -> Path:
     return _p("ledger", "quota.jsonl")
 
 
+def credential_log_path() -> Path:
+    """Which credentials were read, when, and by what. Never the values.
+
+    Detection rather than prevention -- see `core/credentials.py`, which explains
+    why prevention is not on the table for a process that has to be able to
+    authenticate.
+    """
+    return _p("ledger", "credential_reads.jsonl")
+
+
 def preflight_dir() -> Path:
     return _p("ledger", "preflight")
 
@@ -184,12 +194,69 @@ def cache_dir() -> Path:
     return appdata.cache_dir()
 
 
+#: Directory names that mean "this is an installed copy of the code, not a
+#: checkout". Both spellings, because Debian renames the first.
+_INSTALL_DIRS = frozenset({"site-packages", "dist-packages"})
+
+
+def check_not_installed_copy() -> None:
+    """Refuse to treat an installed copy of the code as the workspace.
+
+    `root()`'s last resort is the directory the code sits in, which is right for
+    a checkout and wrong for everything else. `README.md` documents
+    `pip install -e`, and an install that records itself as non-editable puts the
+    code in `site-packages` -- so the fallback resolves there, and every ledger
+    write, every note and every figure lands inside the installed package. It
+    fails at nothing. It just writes the research somewhere no one will look,
+    somewhere the next `pip install` overwrites, and the only symptom is a
+    ledger that keeps coming up empty.
+
+    That happened, and it took a while to see, because "which copy of the code is
+    live" is invisible from inside the code -- the same class as a stale
+    `build/lib`. `direct_url.json` records the answer and nobody reads it, so
+    this asks the question directly at the one moment it is cheap to answer.
+
+    **`GRAD_ROOT` is the only exemption, and a remembered choice is not one.**
+    An environment variable is typed for this process and this run, so it is an
+    answer somebody is giving right now; the pointer file is a decision from some
+    earlier session that may well have been made *by* the bug -- a first run
+    under a non-editable install would remember the install directory, and
+    honouring that would make the guard agree with the state it exists to catch.
+    The cost is that `grad-workspace` has to be exempt as a tool, since it is
+    what rewrites the pointer.
+
+    Called from `core/cli.py` for every tool rather than from
+    `ensure_workspace()`, which fifteen tools never call -- among them every
+    submitter, whose ledger writes are the most expensive in the system to lose.
+    """
+    if os.environ.get("GRAD_ROOT"):
+        return
+    resolved = root()
+    if not _INSTALL_DIRS.intersection(resolved.parts):
+        return
+    from core.errors import ConfigError  # noqa: PLC0415 - only on the refusal path
+
+    raise ConfigError(
+        f"the workspace resolved to {resolved}, which is inside an installed "
+        "package rather than a research directory. Every ledger write would go "
+        "there and be lost on the next install",
+        fix=(
+            "reinstall editable from the checkout (`python -m pip install -e .`), "
+            "or set GRAD_ROOT to the directory the research should live in"
+        ),
+    )
+
+
 def ensure_workspace() -> None:
     """Create the directories the CLIs write into. Cheap and idempotent.
 
     `cache_dir` is absent on purpose: it lives under the app directory now, and
     `appdata.ensure` is what creates that side.
+
+    The check comes first, because the failure it catches is one where every
+    directory below is created successfully in a place that is wrong.
     """
+    check_not_installed_copy()
     for d in (
         ledger_dir(),
         preflight_dir(),

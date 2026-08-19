@@ -134,6 +134,19 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip build
+          # setuptools copies the source tree into `build/lib` and *reuses* that
+          # copy when it is already there, so a wheel built in a tree carrying a
+          # stale one ships whichever version of a module happened to be current
+          # the last time somebody built. A working tree here had a `build/lib`
+          # predating two deny-list fixes: loading both modules side by side and
+          # passing the same command, the live one allowed it and the built copy
+          # denied it. No diff shows that -- the file is not wrong, it is old.
+          #
+          # This job checks out fresh and never had the problem, which is the
+          # point of putting the line here anyway: this is the only place in the
+          # repository that builds a wheel, so it is the only place the rule can
+          # be read off rather than remembered.
+          rm -rf build dist
           python -m build --wheel
 
       - name: Install it somewhere that is not this repository

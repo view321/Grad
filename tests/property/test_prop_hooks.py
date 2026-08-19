@@ -102,6 +102,50 @@ def test_a_denied_word_as_an_argument_is_not_a_command(denied: str, safe: str) -
 
 
 # ---------------------------------------------------------------------------
+# heredocs, where the carrier decides whether the body is a program
+# ---------------------------------------------------------------------------
+@given(sg.heredoc_commands(sg.DENIED_HEADS + sg.SAFE_HEADS))
+def test_a_heredoc_body_runs_exactly_when_its_carrier_is_an_interpreter(
+    node: sg.Node,
+) -> None:
+    """`bash <<EOF` runs its body; `cat <<EOF` writes it.
+
+    One word apart, opposite answers, and the deny list has to tell them apart.
+    It did not: the fix that stopped `cat <<'EOF'` being denied for quoting the
+    deny list's own vocabulary removed the body *before segmentation*, so
+    `bash <<EOF / ssh box / EOF` lost its `ssh` before the head rule ran. Not a
+    hole in one regex -- a bypass of every entry in `_DENIED_COMMANDS`.
+
+    Generated rather than listed because the previous two rounds of this were
+    also found by hand, one construct at a time, and the point of this file is
+    to stop paying that way."""
+    assume(node.runs_denied())
+    note(sg.describe(node))
+    assert hooks.evaluate_bash(node.text) is not None
+
+
+@given(sg.heredoc_commands(sg.DENIED_HEADS, carriers=sg.DATA_CARRIERS))
+def test_a_data_heredoc_body_is_never_a_command(node: sg.Node) -> None:
+    """The direction the whole heredoc fix exists for.
+
+    A body handed to `cat` or `tee` is a file being written, however loudly it
+    quotes the deny list -- and writing a document *about* this file is how the
+    false denial was found in the first place. `runs_denied` is False for every
+    node here by construction, which is the oracle agreeing that these are data.
+    """
+    assert not node.runs_denied()
+    note(sg.describe(node))
+    assert hooks.evaluate_bash(node.text) is None
+
+
+@given(sg.heredoc_commands(sg.SAFE_HEADS))
+def test_a_safe_heredoc_is_never_denied(node: sg.Node) -> None:
+    """Neither carrier may deny a body that runs nothing denied."""
+    note(sg.describe(node))
+    assert hooks.evaluate_bash(node.text) is None
+
+
+# ---------------------------------------------------------------------------
 # the splitter itself
 # ---------------------------------------------------------------------------
 @given(sg.commands(sg.DENIED_HEADS + sg.SAFE_HEADS))

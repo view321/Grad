@@ -14,7 +14,7 @@ import json
 import pytest
 
 from core.cli import Cli
-from core.errors import EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, NotFound
+from core.errors import EXIT_CONFIG, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, NotFound
 from tools import ledger as ledger_cli, preflight as preflight_cli, quota as quota_cli
 
 
@@ -133,3 +133,60 @@ def test_a_command_with_only_a_summary_describes_itself_with_it(workspace, capsy
     out = capsys.readouterr().out
     assert "the summary and nothing else" in out
     assert "built-in function" not in out
+
+
+# ---------------------------------------------------------------------------
+# the install-shape guard, at the point every tool passes through
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "module",
+    ["jobs", "kaggle", "modal", "gpu", "nb", "preflight", "report", "quota", "ledger"],
+)
+def test_every_tool_refuses_a_workspace_inside_site_packages(
+    module, tmp_path, monkeypatch, capsys
+):
+    """The guard used to hang off `paths.ensure_workspace()`, which fifteen
+    tools never call.
+
+    The uncovered set was not a random fifteen: `jobs`, `kaggle`, `modal` and
+    `gpu` are the submitters, and a run record written into `site-packages` is
+    an uncollected run and real money. So it moved to `Cli.run`, which is the one
+    place every tool goes through -- one call instead of fifteen, and a tool
+    added tomorrow is covered on the day it is written rather than whenever
+    somebody remembers.
+
+    Parametrised over the modules rather than asserting on `Cli` directly,
+    because the property is *coverage* and a unit test of the check itself
+    cannot fail when a tool is missing from it."""
+    from importlib import import_module
+
+    installed = _as_installed_copy(tmp_path, monkeypatch)
+    cli = import_module(f"tools.{module}").cli
+    assert cli.checks_install is True
+    assert cli.run(["--json"]) == EXIT_CONFIG
+    out = json.loads(capsys.readouterr().out)
+    assert "site-packages" in out["error"]["message"]
+    assert out["error"]["fix"]
+    # Refused before anything was created, which is the point of the guard.
+    assert not (installed / "ledger").exists()
+
+
+def test_the_tool_that_fixes_it_is_exempt(tmp_path, monkeypatch):
+    """A guard that blocked its own remedy would leave `GRAD_ROOT` as the only
+    way out. `grad-workspace select` rewrites the pointer, which is the fix."""
+    from tools import workspace as workspace_cli
+
+    _as_installed_copy(tmp_path, monkeypatch)
+    assert workspace_cli.cli.checks_install is False
+    assert workspace_cli.cli.run(["show", "--json"]) != EXIT_CONFIG
+
+
+def _as_installed_copy(tmp_path, monkeypatch):
+    """Make `paths.root()` resolve somewhere that looks like an installed copy."""
+    from core import paths
+
+    installed = tmp_path / "venv" / "Lib" / "site-packages" / "grad"
+    installed.mkdir(parents=True)
+    monkeypatch.delenv("GRAD_ROOT", raising=False)
+    monkeypatch.setattr(paths, "root", lambda: installed)
+    return installed

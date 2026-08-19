@@ -656,6 +656,8 @@ def run_smoke(
         deadline=time.time() + float(caps["timeout_s"]),
         interval=float(cfg.get("modal", "poll_interval_s", 20) or 20),
     )
+    if state != "running":
+        submit_lib.record_finished(run_id, state=state)
     logs = _logs(sandbox)
     (artifacts / "smoke.log").write_text(logs, encoding="utf-8")
 
@@ -831,6 +833,13 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         return {"run_id": r.id, "state": "no_handle", "collected": bool(r.collected)}
     sandbox = _reattach(sandbox_id, _client())
     state, code = _state_of(sandbox)
+    if state != "running":
+        # `status` is not a command anyone runs for accounting reasons, which is
+        # exactly why it is worth doing here: it is very often the first thing to
+        # notice a sandbox has stopped, and the earliest observation is the
+        # tightest bound on what `collect` will later charge.
+        submit_lib.record_finished(r.id, state=state)
+        r = ls.run(r.id)
     return {
         "run_id": r.id,
         "sandbox_id": sandbox_id,
@@ -883,6 +892,10 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
             fix=f"python -m tools.modal collect {r.id} --wait --timeout 3600 --json",
             detail={"run_id": r.id, "state": state},
         )
+    # Before the download, the metrics read and the deviation maths, any of which
+    # can take a while and none of which is time the sandbox was running.
+    submit_lib.record_finished(r.id, state=state)
+    r = ls.run(r.id)
 
     artifacts = submit_lib.artifacts_dir(r.id)
     artifacts.mkdir(parents=True, exist_ok=True)
@@ -920,7 +933,11 @@ def cmd_collect(args: argparse.Namespace) -> dict[str, Any]:
             "metrics_error": metrics_error,
             "downloaded": downloaded,
             "cost_warning": cost_warning,
-            "cost_basis": "wall_clock",
+            # Which of the two wall clocks, recorded per run rather than assumed:
+            # a run whose finish nothing observed is still priced to `now`, and a
+            # reader comparing two records needs to be able to tell which is
+            # which without inferring it from the warning text.
+            "cost_basis": "wall_clock_to_finish" if r.get("finished_at") else "wall_clock",
         },
     )
     unjudged = [d for d in record["deviations"] if d.get("in_range") is not True]
@@ -943,14 +960,24 @@ def _actual_cost(r: ls.Run, handle: dict[str, Any], cfg: Config) -> tuple[float,
     **Wall clock from our own record, not Modal's accounting**, and the warning
     says so on every run rather than only when something went wrong. Modal bills
     per second from container start to exit; what is measurable here is the
-    interval between the ledger's `submitted_at` and now, which includes the
-    image pull and however long the run sat between finishing and being
-    collected. It is an upper bound, and the direction is the safe one for a
-    ceiling -- but it is not a measurement and the record must not imply it is.
+    interval between the ledger's `submitted_at` and the first moment anything
+    observed the sandbox stop. It still includes the image pull and the queue,
+    so it remains an upper bound -- the safe direction for a ceiling -- but it
+    is no longer an *unbounded* one.
 
-    Bounded by the sandbox's own timeout, because the container cannot have run
-    longer than Modal would let it: collecting a week later must not book a
-    week of H100 time against the project.
+    It used to run to `now`, which meant the number depended on when somebody
+    got around to collecting. That is the part worth naming: the ceilings are
+    checked against this figure, so a run collected the next morning booked a
+    night of H100 time against the project and the gate refused the next
+    submission over money nobody had spent. Fail-closed, so nothing was
+    over-allocated -- and the obvious remedy for a ceiling that trips wrongly is
+    to raise the ceiling, which would have been the wrong fix reached for the
+    wrong reason. `finished_at` is stamped by `status`, by `collect` and by the
+    smoke path, whichever sees the sandbox stop first.
+
+    Bounded by the sandbox's own timeout as well, because the container cannot
+    have run longer than Modal would let it -- the belt to that braces, and what
+    still covers a run whose finish nothing ever observed.
     """
     gpu = str(handle.get("gpu") or (r.get("target") or {}).get("gpu") or "")
     rate = gpu_rate(gpu, cfg)
@@ -963,11 +990,18 @@ def _actual_cost(r: ls.Run, handle: dict[str, Any], cfg: Config) -> tuple[float,
     timeout_h = float(handle.get("timeout_s") or 0) / 3600 or None
     if timeout_h:
         elapsed = min(elapsed, timeout_h)
+    observed = bool(r.get("finished_at"))
     return round(elapsed * rate, 4), (
-        "cost is wall clock from submission priced against [modal.gpu_rates], not Modal's own "
-        "billing. It is long in one direction (it includes the image pull and any delay before "
-        "collection) and short in another (GPU time only; the CPU and memory the sandbox held "
-        "are not counted). Collect promptly if the number matters."
+        "cost is wall clock priced against [modal.gpu_rates], not Modal's own billing. It runs "
+        + (
+            "from submission to the moment the sandbox was first seen to stop"
+            if observed
+            else "from submission to now, because nothing observed this sandbox stop -- "
+            "so it also counts however long the run sat waiting to be collected"
+        )
+        + ". It is long in one direction (the image pull and the queue are in it) and short in "
+        "another (GPU time only; the CPU and memory the sandbox held are not counted)."
+        + ("" if observed else " Collect promptly if the number matters.")
     )
 
 

@@ -601,11 +601,59 @@ def artifacts_dir(run_id: str) -> Path:
     return d
 
 
+#: One run event type, for the moment a backend was first observed to have
+#: stopped. Its own type rather than a field on `run_collected`, because the
+#: whole point is that it can be written long before a collection happens -- by
+#: `status`, by a `--wait`, by anything that polls.
+T_RUN_FINISHED = "run_finished"
+
+
+def record_finished(run_id: str, *, state: str) -> None:
+    """Stamp when the backend was first seen in a terminal state.
+
+    **First writer wins**, and that is the correctness condition rather than an
+    optimisation: the earliest observation is the tightest upper bound on when
+    the run actually stopped, so a later poll overwriting it would move the
+    number in the one direction this exists to prevent.
+
+    Cheap to call and safe to call often, which is deliberate -- `status` is not
+    a command anyone thinks of as accounting, and it is frequently the first
+    thing to notice a run has ended.
+    """
+    if ls.run(run_id).get("finished_at"):
+        return
+    ls.append_run_event({
+        "type": T_RUN_FINISHED,
+        "id": run_id,
+        "finished_at": ls.now_iso(),
+        "final_state": state,
+    })
+
+
 def elapsed_hours(run: ls.Run, *, until: _dt.datetime | None = None) -> float:
+    """How long the run has been going, in hours.
+
+    **Stops at `finished_at` when the run has one** instead of running on to
+    now. Those two diverge by exactly however long a finished run sat waiting to
+    be collected, and the difference is not cosmetic: `tools/modal.py` prices
+    this number, and the per-job and monthly ceilings are checked against the
+    result. Collect the next morning and a night of H100 time was booked that
+    nobody bought -- fail-closed, so it blocks legitimate work rather than
+    allowing anything, and still the wrong number. "Raise the ceiling" is then
+    the obvious fix and the wrong one.
+
+    An explicit `until` still wins over both. `tools/gpu.py` passes the end time
+    it read off the remote host, which is a better measurement than either of
+    the defaults here.
+    """
     started = ls.parse_iso(run.get("submitted_at"))
     if not started:
         return 0.0
-    until = until or _dt.datetime.now(_dt.timezone.utc)
+    until = (
+        until
+        or ls.parse_iso(run.get("finished_at"))
+        or _dt.datetime.now(_dt.timezone.utc)
+    )
     return max(0.0, (until - started).total_seconds() / 3600.0)
 
 
