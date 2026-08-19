@@ -19,6 +19,7 @@ is a fake that can be told to behave in each of them.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -311,8 +312,14 @@ async def test_a_close_during_a_slow_connect_waits_for_the_connect(monkeypatch):
 
     session = app.Session("race")
     starting = asyncio.create_task(session.start())
+    # Real time rather than bare event-loop ticks: `start` now does its blocking
+    # half (the SDK import, the config read, the credential-store hydrate) on a
+    # worker thread, so waiting for the client means waiting for a thread to be
+    # scheduled and not merely for the loop to come round again. Two hundred
+    # `sleep(0)`s take microseconds and used to be plenty; they are not a wait
+    # at all once anything real happens off the loop.
     for _ in range(200):
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
         if made:
             break
     assert made, "the start task never built a client"
@@ -329,6 +336,72 @@ async def test_a_close_during_a_slow_connect_waits_for_the_connect(monkeypatch):
     await asyncio.wait_for(closing, timeout=5)
     assert made[0].exited_after_enter is True
     assert session.client is None
+
+
+async def test_a_cold_start_leaves_the_event_loop_free(monkeypatch):
+    """The prompt has to reach the browser before the turn starts working.
+
+    As reported: send the first message of a session and it takes five to seven
+    seconds to appear in the chat, which reads as a broken app -- the composer
+    has already cleared, so there is nothing on screen at all.
+
+    Nothing was slow in the way that phrasing suggests. NiceGUI draws an element
+    by queueing it and letting a per-client outbox task emit it when the event
+    loop next runs something else, and between the composer drawing the prompt
+    and the SDK subprocess there was nothing for the loop to run: `_stopped`
+    returns without awaiting when no interrupt is pending, `apply_effort` and
+    `apply_model` both return early while the client is None, and `start` then
+    imported the SDK (two seconds), read the config and hydrated the credential
+    store -- all synchronously, all on the loop.
+
+    So the property is not "the cold start is fast". It is "the cold start does
+    not stop the loop", which is what lets the queued prompt go out. Measured
+    here by a ticker that counts how often it gets to run; before the fix, the
+    answer was zero.
+    """
+    import claude_agent_sdk
+    import agent as agent_mod
+    from core import config as config_mod
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", lambda options=None: _Client())
+    monkeypatch.setattr(agent_mod, "build_options", lambda cfg, **_: object())
+    # Both halves of the cold start, kept synchronous -- which is what they are
+    # -- and made slow enough to measure. `time.sleep` rather than
+    # `asyncio.sleep` on purpose: a coroutine that awaits is not the thing this
+    # test is about.
+    monkeypatch.setattr(agent_mod, "preflight_environment", lambda: time.sleep(0.25))
+    # The real config, read once before the patch, so what `start` records
+    # afterwards (`client_effort`, `client_model`) comes off a real object.
+    loaded = config_mod.load()
+    monkeypatch.setattr(config_mod, "load", lambda *a, **k: loaded)
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    counting = asyncio.create_task(ticker())
+    session = app.Session("cold")
+    try:
+        await session.start()
+    finally:
+        counting.cancel()
+
+    assert session.client is not None
+    assert ticks >= 5, (
+        f"the loop ran {ticks} times during a 250 ms cold start; "
+        "anything queued for the browser is stuck until it finishes"
+    )
 
 
 async def test_a_release_waits_out_a_socket_blip(monkeypatch):

@@ -114,15 +114,29 @@ _COST_BEARING = (
     ("tools.report", "write"),
 )
 
-# Both orders of a combined flag (`-rf`, `-fr`) *and* the separated form
-# (`rm -r -f x`), which the combined-only pattern let straight through.
+# Recursive *and* forced, in either order and in any spelling.
+#
+# Six hand-written alternations stood here, one per order of one pair of
+# spellings, and between them they covered the combined flag (`-rf`, `-fr`), the
+# separated short form (`-r -f`) and the separated long form
+# (`--recursive --force`). What no alternation covered was a *mixed* pair:
+# `rm --recursive -f notes` matched none of them, and it is the spelling
+# somebody writes when they are being explicit about the dangerous half.
+#
+# Two lookaheads instead, one per property, which is what the rule actually says
+# -- "recursive appears, and force appears, within this command" -- and is
+# order-free and spelling-free by construction rather than by enumeration.
+# `[^|;&\r\n]*` in each keeps the search inside the one command, so
+# `rm x | grep -rf y` is still not a recursive delete.
+#
+# The short branch has no trailing `\b` on purpose: `-rf` has no boundary
+# between its `r` and its `f`, and requiring one is what made the combined form
+# need its own alternation in the first place. The long branch keeps it, so
+# `--recursive` matches and `--recursive-something` would not.
 _RM_RF = re.compile(
-    r"\brm\b[^|;&\r\n]*\s-\w*[rR]\w*f"
-    r"|\brm\b[^|;&\r\n]*\s-\w*f\w*[rR]"
-    r"|\brm\b[^|;&\r\n]*\s-\w*[rR]\b[^|;&\r\n]*\s-\w*f\b"
-    r"|\brm\b[^|;&\r\n]*\s-\w*f\b[^|;&\r\n]*\s-\w*[rR]\b"
-    r"|\brm\b[^|;&\r\n]*--recursive[^|;&\r\n]*--force"
-    r"|\brm\b[^|;&\r\n]*--force[^|;&\r\n]*--recursive"
+    r"\brm\b"
+    r"(?=[^|;&\r\n]*\s(?:-\w*[rR]|--recursive\b))"
+    r"(?=[^|;&\r\n]*\s(?:-\w*f|--force\b))"
 )
 _CURL_PIPE_SH = re.compile(r"\b(curl|wget|iwr|Invoke-WebRequest)\b[^|]*\|[^|]*\b(sh|bash|zsh|python|pwsh|powershell)\b")
 _CREDENTIAL_READ = re.compile(r"keyring\s+get|get_password\s*\(|\.credentials\.json")
@@ -215,12 +229,29 @@ def _cost_bearing_over_budget(command: str) -> Denial | None:
 
 
 #: Longest first, so `||` is never read as two `|` and `&&` never as two `&`.
-_OPERATORS = ("||", "&&", "$(", "|", ";", "&", "`", "\n", "\r")
+#:
+#: `(` and `)` are here because grouping starts a command exactly as an operator
+#: does. `( ssh box )` and `{ ssh box; }` are two of the shortest bypasses that
+#: existed, and they were invisible for the same reason the substitution bugs
+#: were: the segment kept its delimiter, so the head of `( conda )` was `(` and
+#: the deny list matched nothing. Note `$(` sits ahead of `(`, and the explicit
+#: substitution branch in `_segments` runs before this list is scanned at all --
+#: a substitution opens a frame, a bare parenthesis only opens a segment.
+_OPERATORS = ("||", "&&", "$(", "|", ";", "&", "`", "(", ")", "\n", "\r")
+
+#: `{` is a separator only where the shell reads it as the group reserved word,
+#: which is where a blank follows it. That distinction is not pedantry: `find .
+#: -exec grep ssh {} \;` and `${HOME}` and `awk '{print $1}'` all contain a brace
+#: that is not grouping, and splitting on those would deny commands nobody wrote.
+#: `}` needs no rule of its own -- the `;` the shell requires before it has
+#: already ended the segment, and a segment that merely *starts* with `}` has a
+#: harmless head.
+_GROUP_OPEN = re.compile(r"\{\s")
 
 
 def _blind_segments(command: str) -> list[str]:
     """The split that ignores quoting. Kept as the fallback -- see `_segments`."""
-    return [s for s in re.split(r"\|\||&&|[|;&\r\n]|\$\(|`", command) if s.strip()]
+    return [s for s in re.split(r"\|\||&&|[|;&()\r\n]|\{\s|\$\(|`", command) if s.strip()]
 
 
 def _segments(command: str) -> list[str]:
@@ -318,15 +349,23 @@ def _segments(command: str) -> list[str]:
             frame = suspended[-1]
             # A `(` here is grouping, not a substitution: the `$(` case above
             # consumed both of its characters, so it can never reach this.
+            #
+            # It ends the segment as well as deepening the frame. Counting the
+            # depth without splitting kept the frame honest and left the group
+            # unread: `"$( (ssh box) )"` stayed one segment whose head was
+            # `(ssh`, so the fix for the *matching closer* had a bypass sitting
+            # inside the very string it was written for.
             if frame[1] == ")" and char == "(":
                 frame[2] += 1
-                buf.append(char)
+                out.append("".join(buf))
+                buf = []
                 i += 1
                 continue
             if char == frame[1]:
                 if frame[1] == ")" and frame[2]:
                     frame[2] -= 1
-                    buf.append(char)
+                    out.append("".join(buf))
+                    buf = [char]
                 else:
                     quote = suspended.pop()[0]
                     # The closer ends the segment instead of joining it. A body
@@ -346,6 +385,8 @@ def _segments(command: str) -> list[str]:
             i += 1
             continue
         operator = next((op for op in _OPERATORS if command.startswith(op, i)), None)
+        if operator is None and _GROUP_OPEN.match(command, i):
+            operator = "{"
         if operator is not None:
             out.append("".join(buf))
             buf = []
@@ -360,6 +401,21 @@ def _segments(command: str) -> list[str]:
     return [s for s in out if s.strip()]
 
 
+#: Reserved words that *introduce* a command rather than being one. Skipping
+#: them is finishing the parse, not widening the rule: `if ssh box; then ...`
+#: and `for h in a b; do ssh $h; done` both run ssh, and both left a segment
+#: whose first token was grammar. `sudo`, `nohup`, `env` and `exec` are
+#: deliberately absent -- those are programs that run other programs, which is
+#: the indirection class this module's docstring puts out of scope.
+#:
+#: `for`, `in` and `case` are absent for a different reason: what follows them
+#: is a *name*, not a command, so skipping them would make `for ssh in a b` look
+#: like a remote execution and deny a loop nobody should be denied.
+_INTRODUCERS = frozenset({
+    "if", "elif", "then", "else", "while", "until", "do", "!", "time", "{", "(", ";",
+})
+
+
 def _head(segment: str) -> str:
     try:
         tokens = shlex.split(segment, posix=True)
@@ -368,6 +424,8 @@ def _head(segment: str) -> str:
     for token in tokens:
         if "=" in token and not token.startswith("-") and not token.startswith("/"):
             continue  # leading VAR=value assignments
+        if token in _INTRODUCERS:
+            continue
         return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower().removesuffix(".exe")
     return ""
 

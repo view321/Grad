@@ -197,13 +197,21 @@ def test_a_substitution_ends_at_its_matching_parenthesis():
     runs the pipeline -- so the `|` has to keep splitting. In the second the
     parenthesis genuinely closes the substitution and the tail is literal text
     that runs nothing, so denying it would be a false denial. The two differ
-    only by where the closer is."""
+    only by where the closer is.
+
+    The grouping parenthesis now ends a segment as well as deepening the frame,
+    which is why `(true)` arrives as `true` rather than as ` (true) `. Counting
+    the depth without splitting kept the *frame* right and left the *group*
+    unread -- `"$( (ssh box) )"` stayed one segment whose head was `(ssh`, a
+    bypass sitting inside the very string this test was written for."""
     assert _segments('echo "$( (true) | ssh box )"') == [
         'echo "',
-        " (true) ",
+        "true",
+        ") ",
         " ssh box ",
         ')"',
     ]
+    assert evaluate_bash('echo "$( (ssh box) )"') is not None
     assert evaluate_bash('echo "$(cat f) | ssh box"') is None
 
 
@@ -221,3 +229,107 @@ def test_the_closer_ends_a_segment_and_opens_the_next():
     assert evaluate_bash('echo "$(ssh)"') is not None
     assert _segments('echo "$(date) ssh box"') == ['echo "', "date", ') ssh box"']
     assert evaluate_bash('echo "$(date) ssh box"') is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(ssh gpu-box nvidia-smi)",
+        "( ssh gpu-box nvidia-smi )",
+        "((ssh gpu-box ls))",
+        "true; (ssh gpu-box ls)",
+        "echo hi && (pip install torch)",
+        "echo hi | (kaggle competitions list)",
+        "{ ssh gpu-box ls; }",
+        "{ conda install pytorch; }",
+        "true && { hf jobs run img cmd; }",
+        # Grouping inside a substitution, which had the same hole one level down.
+        'echo "$( (ssh gpu-box ls) )"',
+    ],
+)
+def test_grouping_starts_a_command(command):
+    """`( cmd )` and `{ cmd; }` run `cmd`, and neither used to reach the head rule.
+
+    Found by the generated suite in `tests/property`, which shrank it to
+    `( conda )` -- three tokens, no quoting, no substitution, and the shortest
+    bypass this list ever had. The parser already counted grouping parentheses
+    *inside* a substitution frame, to find the matching closer; it just never
+    treated one as the start of a command, so the head of `( ssh box )` was `(`
+    and matched nothing.
+
+    A brace only counts where a blank follows it, which is where the shell reads
+    it as the group reserved word rather than as brace expansion or a parameter
+    -- see `test_a_brace_that_is_not_a_group_is_not_a_separator`."""
+    assert evaluate_bash(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "! ssh gpu-box ls",
+        "time ssh gpu-box ls",
+        "if ssh gpu-box ls; then true; fi",
+        "if true; then ssh gpu-box ls; fi",
+        "if false; then true; else pip install torch; fi",
+        "if false; then true; elif true; then kaggle kernels push; fi",
+        "while ssh gpu-box ls; do true; done",
+        "until true; do scp a gpu-box:/b; done",
+        "for h in a b; do ssh $h nvidia-smi; done",
+    ],
+)
+def test_a_reserved_word_is_not_the_command_it_introduces(command):
+    """`do`, `then`, `else`, `if`, `!` and `time` are grammar, not programs.
+
+    `for h in a b; do ssh $h; done` split cleanly on its semicolons and then
+    reported the head of ` do ssh $h` as `do`. Skipping these in `_head` is
+    finishing the parse rather than widening the rule -- which is why `sudo`,
+    `nohup`, `env` and `exec` are deliberately *not* skipped. Those are programs
+    that run other programs, the indirection class this module's docstring puts
+    out of scope alongside `bash -c`."""
+    assert evaluate_bash(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm --recursive -f notes",
+        "rm -r --force notes",
+        "rm -f --recursive notes",
+        "rm --force -r notes",
+    ],
+)
+def test_a_recursive_delete_is_denied_with_mixed_flag_spellings(command):
+    """Six alternations covered short-with-short and long-with-long, and nothing
+    covered one of each.
+
+    `rm --recursive -f notes` matched none of them -- and it is the spelling
+    somebody writes when they are being explicit about the dangerous half. Two
+    lookaheads now say what the rule means, "recursive appears and force appears
+    in this command", which is order-free and spelling-free by construction
+    rather than by enumeration."""
+    assert evaluate_bash(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"find . -name '*.py' -exec grep -l ssh {} \;",
+        "echo ${HOME}/notes",
+        "awk '{print $1}' data/results.tsv",
+        "python -c \"print({'a': 1})\"",
+        "echo {1..5}",
+        # Not recursive, so not this rule's business however forceful it is.
+        "rm -f figures/001.png",
+        "rm --force figures/001.png",
+        "rm -r notebooks/scratch",
+        "rm -iv notes/old.md",
+    ],
+)
+def test_a_brace_that_is_not_a_group_is_not_a_separator(command):
+    """The cost of the two fixes above, held to zero.
+
+    Splitting on every `{` would have denied `find ... -exec grep ssh {} \\;`,
+    and matching `rm` plus any `-r`-ish flag would have denied every single-file
+    delete. Both are commands this agent runs constantly, and a deny list that
+    cries wolf on them is one somebody turns off."""
+    assert evaluate_bash(command) is None

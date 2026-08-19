@@ -96,7 +96,25 @@ def summarise(values: Sequence[Any]) -> dict[str, Any]:
     if n == 0:
         return {"n": 0, "mean": None, "sd": None, "sem": None,
                 "ci95": None, "min": None, "max": None, "samples": []}
-    mean = math.fsum(samples) / n
+    low, high = min(samples), max(samples)
+    # Clamped into the range it was taken over, which the true mean of any set
+    # of reals is always inside. `fsum` gives the exactly-rounded sum and the
+    # division then rounds once more, and that last rounding can land outside --
+    # so `[3.05, 3.05, 3.05]` reported a mean of 3.0499999999999994, below its
+    # own minimum, and a standard deviation of 5e-16 for three runs that agreed
+    # exactly.
+    #
+    # Both halves of that matter and the second one more. This module exists
+    # because "`val_loss = 3.05` against a predicted `[2.9, 3.2]` was recorded as
+    # in-range with identical confidence whether the run-to-run spread was 0.001
+    # or 0.3" -- so a spread of *zero*, which is what three identical seeds
+    # measured, is precisely the reading it must not get wrong. Clamping fixes
+    # the deviation too rather than only the mean: with the mean exact, every
+    # `x - mean` is exactly 0 and the variance is exactly 0.
+    #
+    # The correction is never more than one unit in the last place. Found by
+    # `tests/property/test_prop_stats.py`, which asserts the identity directly.
+    mean = min(high, max(low, math.fsum(samples) / n))
     if n == 1:
         return {"n": 1, "mean": mean, "sd": None, "sem": None, "ci95": None,
                 "min": samples[0], "max": samples[0], "samples": samples}
@@ -112,8 +130,8 @@ def summarise(values: Sequence[Any]) -> dict[str, Any]:
         "sd": sd,
         "sem": sem,
         "ci95": [mean - half, mean + half],
-        "min": min(samples),
-        "max": max(samples),
+        "min": low,
+        "max": high,
         "samples": samples,
     }
 

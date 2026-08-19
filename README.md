@@ -290,14 +290,23 @@ shapes of the paths that have run, and they fail with actionable errors rather
 than tracebacks — but a real credential and a real run are what find the
 mismatches.
 
-The test suite is 56 files and runs offline; the network is stubbed by a fixture,
-because a suite that reaches the network does not fail, it hangs. The gate tests
-run against a real ledger in a temporary workspace, since a mock of a gate proves
-nothing about the gate.
+The test suite runs offline; the network is stubbed by a fixture, because a suite
+that reaches the network does not fail, it hangs. The gate tests run against a
+real ledger in a temporary workspace, since a mock of a gate proves nothing about
+the gate.
 
 ```bash
 python -m pytest -q
 ```
+
+Alongside the example-based tests, `tests/property/` generates inputs and checks
+rules rather than outputs — a mean lies between the extremes it was taken over, a
+rolling spend never falls when a run is submitted, and if the shell would run
+`ssh` then the deny list says so. That last one found three bypasses on its first
+run, including `( ssh gpu-box nvidia-smi )`: three tokens, no quoting, and the
+shortest hole the hook ever had. Mutation testing (`mutmut`) is configured for
+the same modules and run by hand rather than in CI. Both are described in
+[`docs/testing.md`](docs/testing.md).
 
 Three things to know before trusting it with a budget:
 

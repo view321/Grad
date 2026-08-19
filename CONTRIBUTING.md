@@ -75,6 +75,15 @@ What the CI checks, and why it is shaped the way it is:
   resolves whether or not the wheel contains it. If you change
   `[tool.setuptools]`, that job is the one to watch.
 
+There is a second suite inside the first. `tests/property/` generates its inputs
+with Hypothesis instead of listing them, and it is where a rule goes when the
+examples keep running out — `hooks._segments` had four bugs in four commits and a
+fifth that no example had reached. It runs with everything else and takes about a
+second; `HYPOTHESIS_PROFILE=deep` turns it up when you have just changed one of
+the modules it covers. Mutation testing is configured too, and is not in CI.
+Both are in [`docs/testing.md`](docs/testing.md), including the two ways a
+generated test can silently pass on the previous example's leftovers.
+
 Some conventions worth knowing before a larger change:
 
 - **Capability is a CLI, not a framework.** New agent-facing capability is a
