@@ -106,3 +106,38 @@ def test_command_string_matching_is_not_the_security_model():
     """Documented honestly: `ssh` reached through an interpreter is invisible
     here, which is why the credentials live in Credential Manager instead."""
     assert evaluate_bash("python -c \"import subprocess; subprocess.run(['ssh','h','ls'])\"") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'grep -n "zzz\|pip install" file',
+        r'grep -rn "ssh\|scp" hooks.py',
+        "grep -n 'pip install|conda' notes.md",
+        'echo "a | b"',
+        "echo 'ssh box'",
+    ],
+)
+def test_an_operator_inside_quotes_is_not_an_operator(command):
+    """`_segments` split on `|` without seeing quotes, so a grep for the deny
+    list's own vocabulary was denied as though it were the command it matched:
+    `grep -n "zzz\\|pip install" file` left a tail of `pip install" file` whose
+    head was `pip`. Anyone auditing this file writes exactly that grep."""
+    assert evaluate_bash(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "$(ssh gpu-box ls)"',
+        "echo `ssh gpu-box ls`",
+        'echo "unbalanced | ssh gpu-box ls',
+    ],
+)
+def test_quote_awareness_still_fails_closed(command):
+    """The two things the quote-aware split deliberately does not do. Command
+    substitution stays live inside double quotes, which is where one would be
+    hidden; single quotes suppress it, as the shell does. An unbalanced quote
+    falls back to the blind split, because over-splitting costs a false denial
+    and that is the direction this list is allowed to be wrong in."""
+    assert evaluate_bash(command) is not None

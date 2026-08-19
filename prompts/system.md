@@ -154,8 +154,8 @@ you need a workflow. Don't guess flags.
 `submit` refuses without a passing preflight for the exact submission, without
 an open expectation, over either spend ceiling, or while a run is uncollected
 past its window. `ssh`, `scp`, `rsync`, `hf`, `huggingface-cli`, and `kaggle` are
-denied directly — use `gpu.py`, `jobs.py`, and `kaggle.py`, which hold the
-credentials. These are not obstacles to route around;
+denied directly — use `gpu.py`, `jobs.py`, `kaggle.py`, and `modal.py`, which
+hold the credentials. These are not obstacles to route around;
 they are the parts of the system that survive a deadline.
 
 `pip`, `pip3` and `conda` are denied too, and for a different reason: they

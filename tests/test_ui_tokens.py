@@ -244,6 +244,22 @@ def test_the_switch_is_one_attribute_and_ships_in_the_same_sheet():
     assert sheet.count("--grad-handle:") == 1
 
 
+def test_every_palette_declares_the_scheme_the_browser_draws_in():
+    """The scrollbars were the one part of the inversion no token could reach.
+
+    Everything else here dresses something the app renders; a scrollbar is drawn
+    by the browser, which takes its colour from `color-scheme` alone -- so
+    without this the dark palette kept light scrollbars on every pane that
+    overflowed. It is emitted from the *colour* half on purpose: the non-colour
+    half ships once, with the light palette, and a declaration there would pin
+    every theme to `light` with no way to override it."""
+    for name in tokens.PALETTES:
+        assert name in tokens.COLOR_SCHEME, name
+        assert f"color-scheme: {tokens.COLOR_SCHEME[name]};" in tokens.colour_variables(name)
+    # One per palette in the shipped sheet: `:root` and the dark override block.
+    assert tokens.stylesheet().count("color-scheme:") == len(tokens.PALETTES)
+
+
 def test_an_unknown_theme_falls_back_rather_than_failing():
     """What a settings file written by a newer version looks like from an older
     one. The answer is the design's default, not a stylesheet that will not

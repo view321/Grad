@@ -169,6 +169,21 @@ DARK: dict[str, str] = {
 PALETTES: dict[str, dict[str, str]] = {"light": COLOUR, "dark": DARK}
 DEFAULT_THEME = "light"
 
+#: Which native colour scheme each palette is, emitted as `color-scheme` beside
+#: the variables.
+#:
+#: Everything else in this file dresses elements the app renders. Scrollbars are
+#: not among them: on a scrolling pane the browser draws its own, and it picks
+#: the colour from `color-scheme` alone -- so a dark palette without this keeps
+#: light scrollbars on every window that overflows, which is the one part of the
+#: inversion no token above could reach. It also settles the native controls
+#: `_quasar_reset` leaves alone, and the default canvas an iframe paints before
+#: its own sheet arrives.
+#:
+#: A table rather than `name == "dark"` for the same reason `PALETTES` is one: a
+#: third palette should have to say which of the two it is, not be guessed at.
+COLOR_SCHEME: dict[str, str] = {"light": "light", "dark": "dark"}
+
 #: Every ground in the system, and the token that is legible on it.
 #:
 #: This is the table that makes a second palette safe. The rule "one accent per
@@ -336,9 +351,19 @@ def resolved_theme() -> str:
 
 
 def colour_variables(theme: str | None = None) -> str:
-    """Just the colours, for one palette. The part that differs between themes."""
+    """Just the colours, for one palette. The part that differs between themes.
+
+    `color-scheme` rides along rather than sitting in `css_variables` because it
+    varies with exactly this table and nothing else -- putting it with the
+    non-colour half would emit it once, in the light palette, and leave the dark
+    block unable to override the one declaration it most needs to.
+    """
+    scheme = COLOR_SCHEME.get(
+        str(theme or DEFAULT_THEME).lower(), COLOR_SCHEME[DEFAULT_THEME]
+    )
     active = palette(theme)
-    lines = [f"    --grad-{name}: {value};" for name, value in active.items()]
+    lines = [f"    color-scheme: {scheme};"]
+    lines += [f"    --grad-{name}: {value};" for name, value in active.items()]
     lines += [
         f"    --grad-series-{name}: {active[key]};" for name, key in SERIES_KEYS.items()
     ]

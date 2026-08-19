@@ -214,14 +214,79 @@ def _cost_bearing_over_budget(command: str) -> Denial | None:
     )
 
 
+#: Longest first, so `||` is never read as two `|` and `&&` never as two `&`.
+_OPERATORS = ("||", "&&", "$(", "|", ";", "&", "`", "\n", "\r")
+
+
+def _blind_segments(command: str) -> list[str]:
+    """The split that ignores quoting. Kept as the fallback -- see `_segments`."""
+    return [s for s in re.split(r"\|\||&&|[|;&\r\n]|\$\(|`", command) if s.strip()]
+
+
 def _segments(command: str) -> list[str]:
     """Split on shell operators so `foo && ssh bar` is inspected as two commands.
 
     A newline is in the class because a newline *is* a command separator: without
     it `"true\\nssh gpu-box nvidia-smi"` was one segment whose head was `true`,
     and the cheapest possible bypass of the deny list was pressing Enter.
+
+    **Quoting is respected, because an operator inside quotes is not one.**
+    `grep -n "a\\|b" file` is a single command, and splitting it blindly left a
+    tail of `b" file`; a pattern that happened to contain a denied word was
+    denied as though the user had typed it as a command. Read-only greps for the
+    deny list's own vocabulary are exactly what someone auditing this file
+    writes, so the false denial landed on the people best placed to hit it.
+
+    **Command substitution is the exception, and stays live inside double
+    quotes**, where `"$(ssh box)"` really does start a new command -- which is
+    also the one place worth hiding one. Single quotes suppress it, as the shell
+    does.
+
+    Unbalanced quotes fall back to the blind split: a string this cannot parse
+    is one it must not vouch for. Over-splitting only ever costs a false denial,
+    and that is the direction a deny list is allowed to be wrong in.
     """
-    return [s for s in re.split(r"\|\||&&|[|;&\r\n]|\$\(|`", command) if s.strip()]
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        # Outside single quotes a backslash escapes whatever follows, so an
+        # escaped operator is text and must not split.
+        if char == "\\" and quote != "'" and i + 1 < n:
+            buf.append(char)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif quote == '"' and (command.startswith("$(", i) or char == "`"):
+                out.append("".join(buf))
+                buf = []
+                i += 2 if char == "$" else 1
+                continue
+            buf.append(char)
+            i += 1
+            continue
+        if char in "'\"":
+            quote = char
+            buf.append(char)
+            i += 1
+            continue
+        operator = next((op for op in _OPERATORS if command.startswith(op, i)), None)
+        if operator is not None:
+            out.append("".join(buf))
+            buf = []
+            i += len(operator)
+            continue
+        buf.append(char)
+        i += 1
+    if quote is not None:
+        return _blind_segments(command)
+    out.append("".join(buf))
+    return [s for s in out if s.strip()]
 
 
 def _head(segment: str) -> str:
