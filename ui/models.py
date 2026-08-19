@@ -1712,16 +1712,42 @@ def band_geometry(
 
 
 def _expectation_state(expectation: dict[str, Any], falsified: set[str], deviations: list[dict[str, Any]]) -> str:
+    """Which of the four an expectation is in, cheapest judgement last.
+
+    `judged` is the state this window spent a long time without, and its absence
+    is the reason the ledger looked frozen. `in_range` is None for every case no
+    program can settle -- a relational prediction, a non-numeric result, a run
+    that reported nothing for the quantity -- and §7's whole argument is that
+    those are closed by a human writing a verdict. `unjudged_deviations()` and
+    `ledger query --pending` both stop listing a deviation the moment it carries
+    one; this did not, so an expectation the agent had judged went on reading
+    `open` forever, and the count at the top of the window never moved however
+    much work was done. Seventeen open, one met, one broken -- and five of those
+    seventeen had been settled with a note explaining exactly how.
+
+    It is a fourth state rather than a mapping onto `met`/`broken` because the
+    verdicts do not mean that. `bug` says the deviation was ours and the
+    prediction was never really tested; `inconclusive` says neither, yet. Only
+    `real` claims the prediction was wrong, and it is written on runs that
+    confirmed one as often as on runs that refuted one -- the note carries the
+    science, and inferring met-or-broken from the verdict alone would be this
+    window deciding results. `judged` says what is true: a human settled it, and
+    here is what they said.
+    """
     if expectation.get("id") in falsified:
         return "broken"
     if any(d.get("in_range") is False for d in deviations):
         return "broken"
     if deviations and all(d.get("in_range") is True for d in deviations):
         return "met"
+    if deviations and all(d.get("in_range") is True or d.get("verdict") for d in deviations):
+        return "judged"
     return "open"
 
 
-LEDGER_ACCENT = {"open": "attention", "met": "ok", "broken": "broken"}
+#: `judged` is neutral on purpose. It is the one state that makes no claim about
+#: the world -- the claim is in the verdict and the note beside it.
+LEDGER_ACCENT = {"open": "attention", "met": "ok", "judged": "neutral", "broken": "broken"}
 
 
 def ledger_model() -> dict[str, Any]:
@@ -1777,6 +1803,11 @@ def ledger_model() -> dict[str, Any]:
                 "comparability": expectation.get("comparability"),
                 "basis": expectation.get("basis") or [],
                 "confidence": expectation.get("confidence"),
+                # The judgement itself, so a settled expectation shows what
+                # settled it. A state chip that says `judged` and nothing else
+                # would replace one silence with another.
+                "verdict": latest.get("verdict"),
+                "verdict_note": latest.get("note"),
                 "runs": [d.get("run_id") for d in deviations],
                 "unjudged": bool(
                     [d for d in deviations if d.get("in_range") is not True and not d.get("verdict")]
@@ -2177,6 +2208,30 @@ FORGOTTEN_STATUS = ls_mod.FORGOTTEN
 WRITTEN_OFF_STATUSES = ls_mod.WRITTEN_OFF_STATUSES
 
 
+def _failure_name(error: Any) -> str:
+    """What to call a failure on its chip, whichever shape the record has.
+
+    Two shapes, because two things write this field. A run that failed *on the
+    backend* carries a structured error and is read for its `type` or `code`; a
+    run whose submission failed carries a string -- every backend spells it
+    `extra={"error": str(exc)}` in the `except` around its submit -- and there
+    is nothing to look a key up in.
+
+    Reading the string one as a dict is what took the whole window down. The
+    model builder is wrapped, so the AttributeError became `SOURCE UNREADABLE`
+    over an empty table saying "Nothing has been submitted" -- which is the
+    worst available lie, because the queue's job is to show you the runs that
+    are holding the spend ceiling, and a failed submission is exactly the record
+    someone is looking for when they open it. One bad record hid every good one.
+    """
+    if isinstance(error, dict):
+        return str(error.get("type") or error.get("code") or "error")
+    text = str(error or "").strip()
+    # First line, and chip-length: an SDK traceback is not a chip, and the full
+    # message is in `ledger show`.
+    return _short(text.splitlines()[0], 28) if text else "error"
+
+
 def _queue_state(run: Any) -> tuple[str, str]:
     """One run's state chip, and the progress bar variant that goes with it."""
     status = str(run.get("status") or "").lower()
@@ -2184,9 +2239,7 @@ def _queue_state(run: Any) -> tuple[str, str]:
         return status.upper(), "queued"
     if run.collected:
         if status in FAILED_STATUSES:
-            error = run.get("error") or {}
-            name = error.get("type") or error.get("code") or "error"
-            return f"FAILED · {name}", "failed"
+            return f"FAILED · {_failure_name(run.get('error'))}", "failed"
         return "DONE", "done"
     if status in FAILED_STATUSES:
         return "FAILED", "failed"

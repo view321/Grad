@@ -194,6 +194,59 @@ def test_an_unsettleable_deviation_is_flagged_unjudged(workspace):
     assert entry["state"] == "open"
 
 
+def test_a_judged_deviation_stops_reading_open(workspace):
+    """The state the window did not have, and the reason it looked frozen.
+
+    `in_range` is None for everything no program can settle, and §7's argument
+    is that a human closes those with a verdict -- `unjudged_deviations()` and
+    `ledger query --pending` both drop a deviation the moment it carries one.
+    This did not, so an expectation that had been judged, with a note explaining
+    exactly how, went on reading `open` forever and the count at the top of the
+    window never moved however much work was done.
+    """
+    record = _expect(workspace)
+    _run("run-1", record["id"], 3.05, None)
+    assert models.ledger_model()["entries"][0]["state"] == "open", "unjudged, so open"
+
+    ls.append_run_event(
+        {"type": ls.T_VERDICT, "id": "run-1", "quantity": "val_loss", "verdict": "real",
+         "note": "real measurement, imprecise prediction", "judged_at": ls.now_iso()}
+    )
+    entry = models.ledger_model()["entries"][0]
+    assert entry["state"] == "judged"
+    assert entry["unjudged"] is False
+    assert models.ledger_model()["counts"]["open"] == 0
+    # And what closed it, in the words of whoever closed it.
+    assert entry["verdict"] == "real"
+    assert entry["verdict_note"] == "real measurement, imprecise prediction"
+
+
+def test_a_verdict_settles_what_the_arithmetic_could_not_and_never_restates_it(workspace):
+    """`judged` is a fourth state rather than a mapping onto met/broken because
+    the verdicts do not mean that. `real` says the deviation is the world's and
+    is written on runs that confirmed a prediction as often as on runs that
+    refuted one; the note carries the science. So a number that landed outside
+    its band stays `broken` however it was judged -- the comparison is a fact,
+    and inferring the state from the verdict instead would be this window
+    deciding results."""
+    record = _expect(workspace)
+    _run("run-1", record["id"], 4.4, False)
+    ls.append_run_event(
+        {"type": ls.T_VERDICT, "id": "run-1", "quantity": "val_loss", "verdict": "bug",
+         "note": "our harness read the wrong metrics file", "judged_at": ls.now_iso()}
+    )
+    assert models.ledger_model()["entries"][0]["state"] == "broken"
+
+
+def test_every_state_the_model_can_return_has_a_filter_to_reach_it(workspace):
+    """The window shows one state at a time. A state with no button is a set of
+    expectations nobody can open -- worse than the miscount, because the entries
+    are there and unreachable."""
+    import ui.windows.ledger as ledger_window
+
+    assert {key for key, _ in ledger_window.FILTERS} == set(models.LEDGER_ACCENT)
+
+
 def test_an_explicit_falsification_outranks_the_arithmetic(workspace):
     """A human's judgement beats the comparison, so it is checked first."""
     record = _expect(workspace)
@@ -284,6 +337,35 @@ def test_a_failed_run_names_the_error_in_its_chip(workspace):
     )
     row = models.queue_model()["rows"][0]
     assert row["state"] == "FAILED · KeyError"
+    assert row["accent"] == "broken"
+
+
+def test_a_failed_run_whose_error_is_a_string_does_not_take_the_window_down(workspace):
+    """The other shape this field arrives in, and the one that broke it.
+
+    A run that failed *on the backend* carries a structured error; a run whose
+    *submission* failed carries a string -- `extra={"error": str(exc)}` is how
+    every backend spells it in the `except` around its submit. Reading the
+    string one as a dict raised AttributeError inside the model builder, which
+    is wrapped, so the window rendered SOURCE UNREADABLE over "Nothing has been
+    submitted" with twenty-six runs in the ledger. One unreadable record hid
+    every readable one -- and it hid them for a failed submission, which is
+    exactly what someone opens the queue to find.
+    """
+    ls.append_run_event(
+        {"type": ls.T_RUN_SUBMITTED, "id": "run-1", "task": "t", "status": "in_flight",
+         "submitted_at": ls.now_iso(), "estimate_usd": 1.0, "estimated_duration_s": 10}
+    )
+    ls.append_run_event(
+        {"type": ls.T_RUN_COLLECTED, "id": "run-1", "status": "submit_failed",
+         "collected_at": ls.now_iso(), "results": {}, "deviations": [],
+         "error": "kaggle kernels failed (exit 1): Authentication required\nsign up at kaggle.com"}
+    )
+    model = models.queue_model()
+    assert model["error"] is None, "one bad record must not take the window down"
+    row = model["rows"][0]
+    assert row["state"].startswith("FAILED · kaggle kernels failed")
+    assert "\n" not in row["state"], "a chip is one line"
     assert row["accent"] == "broken"
 
 

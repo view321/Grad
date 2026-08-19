@@ -10,6 +10,12 @@ the whole argument of §7. A deviation is unjudged when it is not confirmed in
 range *and* carries no verdict -- `in_range` is `False` for a numeric miss and
 `None` for the cases no program can settle (a relational prediction, a
 non-numeric result), and both need a human.
+
+Four states, and the fourth is the other half of that argument. `open`, `met`
+and `broken` are what the arithmetic can say; `judged` is what a verdict says,
+and without it every expectation the machine could not settle stayed `open`
+after a human had settled it -- the one window whose job is to show that the
+loop closed, showing that it never did.
 """
 
 from __future__ import annotations
@@ -19,13 +25,16 @@ from typing import Any
 from ui import kit
 from ui.tasks import envelope_message, run_tool
 
-FILTERS = (("open", "OPEN"), ("met", "MET"), ("broken", "BROKEN"))
+FILTERS = (("open", "OPEN"), ("met", "MET"), ("judged", "JUDGED"), ("broken", "BROKEN"))
 
 
 def subtitle(workspace: Any) -> str:
     model = workspace.model("ledger") or {}
     counts = model.get("counts") or {}
-    return f"{counts.get('open', 0)} open · {counts.get('met', 0)} met · {counts.get('broken', 0)} broken"
+    return (
+        f"{counts.get('open', 0)} open · {counts.get('met', 0)} met · "
+        f"{counts.get('judged', 0)} judged · {counts.get('broken', 0)} broken"
+    )
 
 
 def chips(workspace: Any) -> list[tuple[str, str]]:
@@ -85,6 +94,14 @@ def _entry(workspace: Any, entry: dict[str, Any]) -> None:
                     else ""
                 ),
             )
+
+        if entry.get("verdict"):
+            # What closed it, in the words of whoever closed it. The ledger is
+            # read months later by someone who no longer remembers which of the
+            # three it was, which is the same reason `_verdict` refuses an empty
+            # note when writing one.
+            reason = entry.get("verdict_note") or ""
+            kit.note(f"verdict {entry['verdict']}{' — ' + reason if reason else ''}")
 
         if entry.get("comparability"):
             kit.note(f"comparability — {entry['comparability']}")

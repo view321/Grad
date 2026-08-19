@@ -14,6 +14,9 @@ mocked away.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -51,14 +54,38 @@ def submission(tmp_path: Path, **overrides) -> Submission:
 # registration
 # ---------------------------------------------------------------------------
 def test_the_backend_is_registered_everywhere_a_backend_is_listed(workspace):
-    """Four lists name the backends and they drift independently. The one that
+    """Five lists name the backends and they drift independently. The one that
     actually bit: `modal` in `REMOTE_BACKENDS` without a matching branch in the
-    candidate dispatcher ran the whole campaign on Hugging Face Jobs."""
+    candidate dispatcher ran the whole campaign on Hugging Face Jobs.
+
+    The second one bit quieter. `wakeups.STATUS_TOOLS` had no `modal`, so a
+    `--run` wake fell back to the ledger -- which only turns terminal once
+    `collect` has run, so the wake could not fire until after the agent had done
+    the thing it was armed to be told about."""
+    from core import wakeups as wk
     from tools import evolve as evolve_tool
 
     assert "modal" in settings.BACKENDS
     assert "modal" in evolve_tool.REMOTE_BACKENDS
     assert submit_lib.COLLECTORS["modal"] == "python -m tools.modal collect"
+    assert wk.STATUS_TOOLS["modal"] == "tools.modal"
+
+
+def test_the_status_payload_is_one_the_watcher_can_read(workspace):
+    """Registering the tool is half of being pollable. `wakeups._remote_finished`
+    reads a fixed set of keys off whatever `status --json` returns, and this
+    backend's is `state` -- a name none of the other three use. Without it the
+    poller runs every 30 seconds, answers, and reports "not finished" for the
+    whole life of the run."""
+    from core import wakeups as wk
+
+    assert wk._remote_finished({"state": "running"}) is False
+    assert wk._remote_finished({"state": "completed"}) is True
+    assert wk._remote_finished({"state": "failed"}) is True
+    # A run whose ledger record has no sandbox id never reached the platform and
+    # will not by being asked again -- `MISSING`'s argument in Modal's words.
+    assert wk._remote_finished({"state": "no_handle"}) is True
+    assert wk._remote_state({"state": "completed"}) == "completed"
 
 
 def test_the_collect_command_a_refusal_names_is_this_one(workspace):
@@ -179,6 +206,86 @@ def test_the_wrapper_preserves_the_exit_code_across_the_copy(workspace, tmp_path
     script = modal_tool._wrapped_command(["python", "train.py"], submission(tmp_path), "/out")[2]
     assert "rc=$?" in script
     assert script.rstrip().endswith("exit $rc")
+
+
+def test_the_copy_cannot_overwrite_what_the_run_wrote(workspace, tmp_path):
+    """The courtesy must not outrank `GRAD_METRICS_FILE`, and it must not be
+    able to copy a file this run did not write. Asserted on the script as well
+    as run below, because the string is the artifact that ships."""
+    script = modal_tool._wrapped_command(["python", "train.py"], submission(tmp_path), "/out")[2]
+    # Whatever the image brought is gone before the pipeline starts, so a
+    # metrics file in the working directory at exit was written by this run.
+    assert "rm -f metrics.json;" in script
+    # And the Volume wins if the run put something there itself.
+    assert "[ ! -f /out/metrics.json ]" in script
+
+
+# The wrapper is a shell script, and the two guards below are shell semantics.
+# Asserting on the string proves what was written; running it proves what it
+# does, which is the part that was wrong.
+requires_sh = pytest.mark.skipif(shutil.which("sh") is None, reason="the wrapper is a POSIX sh script")
+
+
+def _run_wrapper(inner: str, sub, out_dir: Path, *, cwd: Path) -> subprocess.CompletedProcess:
+    """Run the wrapped command the way a Sandbox would: this cwd, that Volume."""
+    argv = modal_tool._wrapped_command(["sh", "-c", inner], sub, out_dir.as_posix())
+    env = {**os.environ, "GRAD_METRICS_FILE": (out_dir / "metrics.json").as_posix()}
+    return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+
+
+def _staged(tmp_path: Path) -> tuple[Path, Path]:
+    """A working directory holding a stale metrics file, and an empty Volume.
+
+    The stale file is not contrived: `_image` bakes the whole spec directory
+    into the image, and preflight's dry run writes `metrics.json` into exactly
+    that directory. It ships with the pipeline and is sitting in the working
+    directory before the run starts.
+    """
+    workdir = tmp_path / "pipeline"
+    workdir.mkdir()
+    (workdir / "metrics.json").write_text("STALE\n", encoding="utf-8")
+    out = tmp_path / "volume" / "run-1"
+    return workdir, out
+
+
+@requires_sh
+def test_a_dry_runs_metrics_cannot_overwrite_the_real_ones(workspace, tmp_path):
+    """The incident, reproduced. A metrics file from a local CPU dry run was
+    baked into the image, sat in the working directory for the whole run, and
+    was copied over the real metrics at exit -- exit 0, artifacts that looked
+    complete, and a `val_loss_final` in the ledger from a different experiment.
+    Nothing about the run looked wrong; the only reason it was caught is that
+    the local file turned out byte-identical to the collected one."""
+    workdir, out = _staged(tmp_path)
+    result = _run_wrapper('echo REAL > "$GRAD_METRICS_FILE"', submission(tmp_path), out, cwd=workdir)
+
+    assert result.returncode == 0, result.stderr
+    assert (out / "metrics.json").read_text(encoding="utf-8").strip() == "REAL"
+
+
+@requires_sh
+def test_a_run_that_writes_nothing_collects_nothing(workspace, tmp_path):
+    """The same bug with no run to overwrite: a failed run whose metrics file
+    never existed would have collected the dry run's numbers and reported them
+    as the failure's results."""
+    workdir, out = _staged(tmp_path)
+    result = _run_wrapper("exit 3", submission(tmp_path), out, cwd=workdir)
+
+    assert result.returncode == 3, "the exit code still survives the guards"
+    assert not (out / "metrics.json").exists()
+
+
+@requires_sh
+def test_the_courtesy_copy_still_happens_for_the_pipeline_it_exists_for(workspace, tmp_path):
+    """The guards must not cost the thing they guard. A pipeline that ignores
+    `GRAD_METRICS_FILE` writes beside itself, finds nothing in the Volume to
+    protect, and is still collected -- otherwise the money is spent and the
+    result is gone."""
+    workdir, out = _staged(tmp_path)
+    result = _run_wrapper("echo MINE > metrics.json", submission(tmp_path), out, cwd=workdir)
+
+    assert result.returncode == 0, result.stderr
+    assert (out / "metrics.json").read_text(encoding="utf-8").strip() == "MINE"
 
 
 def test_a_spec_command_overrides_the_entrypoint(workspace, tmp_path):

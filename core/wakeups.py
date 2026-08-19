@@ -114,18 +114,36 @@ POLL_MAX_S = 30.0
 #: and a wake left armed on it would poll until its own deadline. Firing sends
 #: the agent to `collect`, which refuses with `kernel_missing` and names
 #: `forget`, which is exactly where that run needs to go.
+#:
+#: `NO_HANDLE` is `MISSING` in Modal's vocabulary and is here for that same
+#: reason: `tools/modal.py status` reports it for a run whose ledger record
+#: carries no sandbox id, which is a run that never reached the platform and
+#: will not reach it by being asked again. `collect` refuses it with `no_handle`
+#: and names `ledger abandon`.
 TERMINAL_REMOTE = {
     "COMPLETE", "COMPLETED", "DONE", "ERROR", "FAILED", "CANCELED", "CANCELLED",
-    "KILLED", "CANCELACKNOWLEDGED", "MISSING",
+    "KILLED", "CANCELACKNOWLEDGED", "MISSING", "NO_HANDLE",
 }
 
 #: Which CLI answers `status` for a run, per `platform`. The sibling of
 #: `core/submit.py:COLLECTORS`, and kept beside it in spirit for the same reason:
 #: an unknown platform degrades to "cannot tell", never to a guess.
+#:
+#: `modal` was absent from this table for as long as the backend existed, and
+#: what that cost is worth naming because it is not the failure you would
+#: predict. A platform with no poller does not error and does not warn: it falls
+#: through to the branch in `_check_run` that reports `unpollable`, and the wake
+#: then rests on the ledger alone. But the ledger only turns terminal when
+#: `collect` writes to it -- so a `--run` wake armed on a Modal sandbox could
+#: only fire *after* the agent had already done the thing it armed the wake to
+#: be told about. It looked like a wake that was slow. It was a wake that could
+#: never be early. Degrading to the ledger is right for a platform nothing here
+#: knows; it is silent damage for one that has a `status` command sitting unused.
 STATUS_TOOLS = {
     "hf_jobs": "tools.jobs",
     "kaggle": "tools.kaggle",
     "ssh": "tools.gpu",
+    "modal": "tools.modal",
 }
 
 
@@ -482,21 +500,31 @@ def _remote_state(data: dict[str, Any]) -> Any:
         return data["remote"] or None
     if isinstance(data.get("kernel"), dict):
         return data["kernel"].get("status")
-    return data.get("remote_state")
+    return data.get("remote_state") or data.get("state")
 
 
 def _remote_finished(data: dict[str, Any]) -> bool:
     """Does this status payload say the job has stopped?
 
-    Three shapes, because there are three backends and they were never going to
+    Four shapes, because there are four backends and they were never going to
     agree: `gpu.py` reports the marker file it writes when the command exits,
-    `jobs.py` a stage string, `kaggle.py` a kernel status. An unrecognised value
-    is not finished -- see `TERMINAL_REMOTE`.
+    `jobs.py` a stage string, `kaggle.py` a kernel status, `modal.py` the
+    sandbox's own `state`. An unrecognised value is not finished -- see
+    `TERMINAL_REMOTE`.
+
+    Reading all of them off one payload rather than dispatching on the platform
+    is deliberate: the caller already knows which tool it asked, and a table
+    mapping platform to key would be a third list to keep in step with
+    `STATUS_TOOLS` and `COLLECTORS`. The keys do not collide -- no backend here
+    emits two of them -- so the union is unambiguous. Adding `state` is what
+    made Modal pollable in fact rather than only in the table above: without it
+    the poller ran, answered, and reported "not finished" for the whole life of
+    the run, which is the same silence as having no poller at all.
     """
     marker = data.get("remote")
     if isinstance(marker, dict) and marker:
         return True
-    candidates = [data.get("remote_state")]
+    candidates = [data.get("remote_state"), data.get("state")]
     kernel = data.get("kernel")
     if isinstance(kernel, dict):
         candidates.append(kernel.get("status"))

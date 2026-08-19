@@ -264,9 +264,25 @@ def _command_for(sub: Submission) -> list[str]:
 
 def _stage(host: Host, sub: Submission, remote_dir: str) -> None:
     """Copy the pipeline directory to the host. Everything in the submission
-    hash comes from here, so the remote sees exactly what was preflighted."""
+    hash comes from here, so the remote sees exactly what was preflighted.
+
+    Everything except one file. `collect` fetches the metrics file out of this
+    directory *by name*, and preflight's dry run writes exactly that file into
+    the spec directory -- `_check_dry_run` runs the entrypoint with the spec
+    directory as its cwd. So a local dry run's numbers ride along to the host,
+    and any run that does not overwrite them comes back carrying them: exit 0,
+    artifacts that look complete, and a result in the ledger from a different
+    experiment. Nothing about it looks wrong.
+
+    Removing it here is what makes "a metrics file on the host" mean "this run
+    wrote one". A run that produced none then fails to fetch one and is recorded
+    with `metrics_error`, which is the honest outcome and a loud one.
+    `tools/modal.py:_wrapped_command` guards the same file, which arrives there
+    by a different road: the spec directory is baked into the image.
+    """
     _ssh(host, f"mkdir -p {shlex.quote(remote_dir)}")
     _scp(host, str(sub.spec_path.parent) + "/.", _remote(host, remote_dir))
+    _ssh(host, f"rm -f {shlex.quote(f'{remote_dir}/{Path(sub.metrics_file).name}')}")
 
 
 def _launch(host: Host, sub: Submission, remote_dir: str, command: list[str]) -> str:
