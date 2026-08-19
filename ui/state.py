@@ -207,6 +207,23 @@ class Workspace:
         #: destroyed. The window seeds the box from this on build and clears it
         #: on send.
         self.chat_draft: str = ""
+        #: True from the moment the composer accepts a prompt until that whole
+        #: send has finished, compaction included.
+        #:
+        #: `Session.busy` cannot cover this, and the gap is one the composer
+        #: opened for itself. `busy` is set inside `ask`, and the composer now
+        #: yields once before calling it so the browser gets the drawn prompt
+        #: before the SDK subprocess starts -- so between the `busy` check and
+        #: `busy` becoming True there is a real suspension point, and a second
+        #: Enter lands inside it. Both sends pass the guard; the second draws a
+        #: user message the agent never receives, and then runs `maybe_compact`
+        #: underneath a turn that is live, which is the one thing the comment
+        #: above that call says must never happen.
+        #:
+        #: Here rather than in the composer's closure because the closure is
+        #: rebuilt on every redraw, and a redraw during a turn would reset the
+        #: flag while the send it belongs to is still running.
+        self.chat_sending: bool = False
         #: The NiceGUI client this workspace was built for, set by `shell.build`.
         #:
         #: Held because `context.client` is resolved from the slot stack, which
