@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from hooks import evaluate_bash, probe
+from hooks import _segments, evaluate_bash, probe
 
 
 @pytest.mark.parametrize(
@@ -132,12 +132,42 @@ def test_an_operator_inside_quotes_is_not_an_operator(command):
         'echo "$(ssh gpu-box ls)"',
         "echo `ssh gpu-box ls`",
         'echo "unbalanced | ssh gpu-box ls',
+        # An operator *inside* a double-quoted substitution. These are the ones
+        # the first quote-aware split let through: it emitted a split at `$(`
+        # and then read the body as quoted text, so the `|` never separated
+        # anything and every head was `echo`.
+        'echo "$(echo x | ssh gpu-box ls)"',
+        'echo "$(true && ssh gpu-box ls)"',
+        'echo "$(true; ssh gpu-box ls)"',
+        'echo "`echo x | ssh gpu-box ls`"',
+        'echo "$(echo "$(ssh gpu-box ls)")"',
+        'X="$(ssh gpu-box ls)"',
+        'echo "$(unclosed | ssh gpu-box ls"',
     ],
 )
 def test_quote_awareness_still_fails_closed(command):
-    """The two things the quote-aware split deliberately does not do. Command
+    """Everything the blind split denied must still be denied.
+
+    Quoting was taught to the splitter to stop false denials, and the whole risk
+    of that change is in this direction: a deny list that becomes less
+    aggressive can only be checked by what it no longer catches. Command
     substitution stays live inside double quotes, which is where one would be
-    hidden; single quotes suppress it, as the shell does. An unbalanced quote
-    falls back to the blind split, because over-splitting costs a false denial
-    and that is the direction this list is allowed to be wrong in."""
+    hidden, and it opens a whole command context rather than a single split
+    point -- otherwise `"$(echo x | ssh box)"` keeps its pipeline intact and the
+    shell runs an `ssh` nothing ever inspected. An unbalanced quote or an
+    unclosed substitution falls back to the blind split, because over-splitting
+    costs a false denial and that is the direction this list may be wrong in."""
     assert evaluate_bash(command) is not None
+
+
+def test_a_substitution_body_is_segmented_as_commands():
+    """The mechanism behind the case above, pinned directly: the body splits on
+    its own operators and the text after the `)` is quoted again."""
+    assert _segments('echo "$(echo x | ssh box)"') == [
+        'echo "',
+        "echo x ",
+        " ssh box)\"",
+    ]
+    # Single quotes suppress substitution, as the shell does, so this is one
+    # command and `ssh` is never a head.
+    assert _segments("echo '$(ssh box)'") == ["echo '$(ssh box)'"]

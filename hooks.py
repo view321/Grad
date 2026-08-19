@@ -242,31 +242,64 @@ def _segments(command: str) -> list[str]:
     also the one place worth hiding one. Single quotes suppress it, as the shell
     does.
 
-    Unbalanced quotes fall back to the blind split: a string this cannot parse
-    is one it must not vouch for. Over-splitting only ever costs a false denial,
-    and that is the direction a deny list is allowed to be wrong in.
+    **A substitution opens a whole command context, not just a split point.**
+    Emitting one split at `$(` and carrying on as though the body were quoted
+    text is a fail-open: `"$(echo x | ssh box)"` keeps its `|` unsplit, every
+    head is `echo`, and the deny list waves through a pipeline the shell will
+    run. The suspended quote is stacked and restored at the `)`, so operators
+    inside the body split and the text after it is quoted again.
+
+    Unbalanced quotes -- and unclosed substitutions -- fall back to the blind
+    split: a string this cannot parse is one it must not vouch for.
+    Over-splitting only ever costs a false denial, and that is the direction a
+    deny list is allowed to be wrong in.
     """
     out: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    #: Quote states suspended by an open substitution, innermost last. A
+    #: substitution is a *command* context, so `"$(a | ssh box)"` has to go back
+    #: to splitting on `|` inside it and back to quoted text after the `)`.
+    suspended: list[str | None] = []
     i, n = 0, len(command)
     while i < n:
         char = command[i]
-        # Outside single quotes a backslash escapes whatever follows, so an
-        # escaped operator is text and must not split.
+        # A backslash takes the next character with it. Outside quotes that is
+        # the shell's rule exactly; inside double quotes the shell honours it
+        # only before `$`, a backtick, `"`, `\` and a newline, and treating the
+        # rest as escaped too can only ever suppress a split, never invent one.
+        # The characters it would wrongly escape are not operators in that
+        # position anyway, so the two agree everywhere it matters here.
         if char == "\\" and quote != "'" and i + 1 < n:
             buf.append(char)
             buf.append(command[i + 1])
             i += 2
             continue
-        if quote is not None:
-            if char == quote:
+        # Single quotes first, because they suppress substitution outright.
+        if quote == "'":
+            if char == "'":
                 quote = None
-            elif quote == '"' and (command.startswith("$(", i) or char == "`"):
-                out.append("".join(buf))
-                buf = []
-                i += 2 if char == "$" else 1
-                continue
+            buf.append(char)
+            i += 1
+            continue
+        # `$(` opens a command context anywhere it is not single-quoted; a
+        # backtick does the same, but only inside double quotes -- unquoted it
+        # is already an operator below.
+        if command.startswith("$(", i) or (char == "`" and quote == '"'):
+            suspended.append(quote)
+            quote = None
+            out.append("".join(buf))
+            buf = []
+            i += 2 if char == "$" else 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            buf.append(char)
+            i += 1
+            continue
+        if suspended and (char == ")" or (char == "`" and suspended[-1] == '"')):
+            quote = suspended.pop()
             buf.append(char)
             i += 1
             continue
@@ -283,7 +316,8 @@ def _segments(command: str) -> list[str]:
             continue
         buf.append(char)
         i += 1
-    if quote is not None:
+    # An unclosed substitution is as unparseable as an unbalanced quote.
+    if quote is not None or suspended:
         return _blind_segments(command)
     out.append("".join(buf))
     return [s for s in out if s.strip()]
