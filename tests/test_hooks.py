@@ -143,6 +143,14 @@ def test_an_operator_inside_quotes_is_not_an_operator(command):
         'echo "$(echo "$(ssh gpu-box ls)")"',
         'X="$(ssh gpu-box ls)"',
         'echo "$(unclosed | ssh gpu-box ls"',
+        # Grouping parentheses inside the body. Closing the frame at the first
+        # `)` rather than the matching one reopened the quote halfway through,
+        # putting the pipeline back inside a string the shell nonetheless runs.
+        'echo "$( (true) | ssh gpu-box ls )"',
+        'echo "$((true) | ssh gpu-box ls)"',
+        'echo "$( ( (true) ) | ssh gpu-box ls )"',
+        'echo "`(true) | ssh gpu-box ls`"',
+        'echo "$( (unbalanced | ssh gpu-box ls )"',
     ],
 )
 def test_quote_awareness_still_fails_closed(command):
@@ -171,3 +179,20 @@ def test_a_substitution_body_is_segmented_as_commands():
     # Single quotes suppress substitution, as the shell does, so this is one
     # command and `ssh` is never a head.
     assert _segments("echo '$(ssh box)'") == ["echo '$(ssh box)'"]
+
+
+def test_a_substitution_ends_at_its_matching_parenthesis():
+    """Why the frame counts grouping parentheses rather than stopping at the
+    first `)`, and why it cannot just treat every `)` as dangerous.
+
+    In the first the parenthesis is grouping, the body continues, and the shell
+    runs the pipeline -- so the `|` has to keep splitting. In the second the
+    parenthesis genuinely closes the substitution and the tail is literal text
+    that runs nothing, so denying it would be a false denial. The two differ
+    only by where the closer is."""
+    assert _segments('echo "$( (true) | ssh box )"') == [
+        'echo "',
+        " (true) ",
+        ' ssh box )"',
+    ]
+    assert evaluate_bash('echo "$(cat f) | ssh box"') is None

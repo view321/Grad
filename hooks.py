@@ -246,8 +246,16 @@ def _segments(command: str) -> list[str]:
     Emitting one split at `$(` and carrying on as though the body were quoted
     text is a fail-open: `"$(echo x | ssh box)"` keeps its `|` unsplit, every
     head is `echo`, and the deny list waves through a pipeline the shell will
-    run. The suspended quote is stacked and restored at the `)`, so operators
-    inside the body split and the text after it is quoted again.
+    run. The suspended quote is stacked and restored at the *matching* closer,
+    so operators inside the body split and the text after it is quoted again.
+
+    Matching is the operative word, and it is why the frame counts grouping
+    parentheses. Ending at the first `)` instead reopens the quote halfway
+    through `"$( (true) | ssh box )"`, and the rest of a body the shell really
+    does execute is read as a string. The mirror case is the reason this cannot
+    simply deny every `)`: in `"$(cat f) | ssh box"` the parenthesis genuinely
+    ends the substitution, the tail is literal text, and no `ssh` runs -- so a
+    denial there would be a false one.
 
     Unbalanced quotes -- and unclosed substitutions -- fall back to the blind
     split: a string this cannot parse is one it must not vouch for.
@@ -257,10 +265,18 @@ def _segments(command: str) -> list[str]:
     out: list[str] = []
     buf: list[str] = []
     quote: str | None = None
-    #: Quote states suspended by an open substitution, innermost last. A
-    #: substitution is a *command* context, so `"$(a | ssh box)"` has to go back
-    #: to splitting on `|` inside it and back to quoted text after the `)`.
-    suspended: list[str | None] = []
+    #: One frame per open substitution, innermost last: the quote state it
+    #: suspended, which delimiter closes it, and how many grouping parentheses
+    #: are open inside it. A substitution is a *command* context, so
+    #: `"$(a | ssh box)"` has to go back to splitting on `|` inside it and back
+    #: to quoted text after the `)`.
+    #:
+    #: The depth is what makes the closer the *matching* one. Popping at the
+    #: first `)` ends the frame early on `"$( (true) | ssh box )"`, which puts
+    #: the pipeline back inside quotes and lets an `ssh` the shell really runs
+    #: go uninspected. It has to stay a count and not a flag because the
+    #: grouping can nest.
+    suspended: list[list[Any]] = []
     i, n = 0, len(command)
     while i < n:
         char = command[i]
@@ -286,7 +302,7 @@ def _segments(command: str) -> list[str]:
         # backtick does the same, but only inside double quotes -- unquoted it
         # is already an operator below.
         if command.startswith("$(", i) or (char == "`" and quote == '"'):
-            suspended.append(quote)
+            suspended.append([quote, "`" if char == "`" else ")", 0])
             quote = None
             out.append("".join(buf))
             buf = []
@@ -298,11 +314,23 @@ def _segments(command: str) -> list[str]:
             buf.append(char)
             i += 1
             continue
-        if suspended and (char == ")" or (char == "`" and suspended[-1] == '"')):
-            quote = suspended.pop()
-            buf.append(char)
-            i += 1
-            continue
+        if suspended:
+            frame = suspended[-1]
+            # A `(` here is grouping, not a substitution: the `$(` case above
+            # consumed both of its characters, so it can never reach this.
+            if frame[1] == ")" and char == "(":
+                frame[2] += 1
+                buf.append(char)
+                i += 1
+                continue
+            if char == frame[1]:
+                if frame[1] == ")" and frame[2]:
+                    frame[2] -= 1
+                else:
+                    quote = suspended.pop()[0]
+                buf.append(char)
+                i += 1
+                continue
         if char in "'\"":
             quote = char
             buf.append(char)
