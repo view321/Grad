@@ -185,20 +185,54 @@ class Session:
         #: deep in the SDK.
         self._lifecycle = asyncio.Lock()
 
+    @staticmethod
+    def _cold_start(agent: Any) -> tuple[Any, Any]:
+        """The blocking half of building a client. Runs on a worker thread.
+
+        Nothing in here is slow enough to notice on its own. Together they were
+        the reason a fresh prompt took five to seven seconds to appear on
+        screen, and the reason is *when* they run rather than how long they
+        take: this is the first thing a turn does, the event loop has not
+        yielded since the composer drew the prompt, and NiceGUI's outbox cannot
+        send a queued element while the loop is busy. So the prompt sat in the
+        queue for the whole cold start, with the composer already cleared and
+        nothing on screen to show it had been sent.
+
+        Measured on the machine this was written on: importing the SDK is two
+        seconds, `config.load` is eighty milliseconds, and
+        `preflight_environment` is another three hundred -- most of that the
+        credential store's backend coming up, which is a blocking COM call on
+        Windows with no async form to prefer.
+
+        The SDK import is *inside* this function rather than at the call site
+        for the same reason it was lazy before -- the UI has to load on a
+        machine without it -- and it stays a `from ... import`, executed per
+        call, so a test that patches `claude_agent_sdk.ClaudeSDKClient` still
+        gets its double.
+
+        `preflight_environment` scrubs and hydrates `os.environ`, which is
+        process-global rather than loop-local, so a thread is a legitimate place
+        for it. The lock the caller holds is what keeps two of these from
+        overlapping.
+        """
+        from claude_agent_sdk import ClaudeSDKClient  # noqa: PLC0415
+
+        cfg = config_mod.load()
+        agent.preflight_environment()
+        return cfg, ClaudeSDKClient
+
     async def start(self) -> None:
         if self.client is not None:
             return
         import agent  # noqa: PLC0415 - imported here so the UI can load without the SDK
-        from claude_agent_sdk import ClaudeSDKClient  # noqa: PLC0415
 
         async with self._lifecycle:
             # Re-checked under the lock: a start that waited here waited on
             # another start, and the client it built is the one to use.
             if self.client is not None:
                 return
-            cfg = config_mod.load()
-            agent.preflight_environment()
-            await self._connect(agent, ClaudeSDKClient, cfg)
+            cfg, client_cls = await asyncio.to_thread(self._cold_start, agent)
+            await self._connect(agent, client_cls, cfg)
             # Consumed, not kept. A rewind aims at one rebuild; leaving these set
             # would have the *next* one -- an effort change, an interrupt, a
             # model switch -- silently truncate the conversation again, at a

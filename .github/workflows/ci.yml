@@ -67,9 +67,30 @@ jobs:
         # and therefore passes or fails on the time of day, not on the code. It
         # is deselected here rather than deleted so that it still runs locally,
         # where a human can tell the difference.
+        #
+        # `tests/property` runs in here with everything else -- it is inside
+        # `tests/` and needs no separate invocation. What it does *not* get from
+        # this leg is a different seed, which is the next step's job.
         run: |
           python -m pytest -q \
             --deselect tests/test_wakeup.py::test_the_deadline_is_reported_as_a_deadline
+
+      - name: Generated tests, with seeds a developer never runs
+        shell: bash
+        # The local profile is `derandomize=True` on purpose: a property suite
+        # that fails one time in five and passes when you re-run it teaches
+        # people to re-run it. That makes every local run explore the *same*
+        # examples, which is exactly the wrong trade for CI -- so this leg turns
+        # randomisation back on and raises the count, and a rare counterexample
+        # surfaces on a pull request rather than never.
+        #
+        # Separate from the step above rather than folded into it, because a
+        # failure here means something different: not "this push broke a rule"
+        # but "a rule was already breakable and this seed found it". Both are
+        # worth failing on; only one of them is a regression.
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: python -m pytest tests/property -q
 
   # --------------------------------------------------------------------------
   # What a user actually installs

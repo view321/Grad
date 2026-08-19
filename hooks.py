@@ -114,15 +114,29 @@ _COST_BEARING = (
     ("tools.report", "write"),
 )
 
-# Both orders of a combined flag (`-rf`, `-fr`) *and* the separated form
-# (`rm -r -f x`), which the combined-only pattern let straight through.
+# Recursive *and* forced, in either order and in any spelling.
+#
+# Six hand-written alternations stood here, one per order of one pair of
+# spellings, and between them they covered the combined flag (`-rf`, `-fr`), the
+# separated short form (`-r -f`) and the separated long form
+# (`--recursive --force`). What no alternation covered was a *mixed* pair:
+# `rm --recursive -f notes` matched none of them, and it is the spelling
+# somebody writes when they are being explicit about the dangerous half.
+#
+# Two lookaheads instead, one per property, which is what the rule actually says
+# -- "recursive appears, and force appears, within this command" -- and is
+# order-free and spelling-free by construction rather than by enumeration.
+# `[^|;&\r\n]*` in each keeps the search inside the one command, so
+# `rm x | grep -rf y` is still not a recursive delete.
+#
+# The short branch has no trailing `\b` on purpose: `-rf` has no boundary
+# between its `r` and its `f`, and requiring one is what made the combined form
+# need its own alternation in the first place. The long branch keeps it, so
+# `--recursive` matches and `--recursive-something` would not.
 _RM_RF = re.compile(
-    r"\brm\b[^|;&\r\n]*\s-\w*[rR]\w*f"
-    r"|\brm\b[^|;&\r\n]*\s-\w*f\w*[rR]"
-    r"|\brm\b[^|;&\r\n]*\s-\w*[rR]\b[^|;&\r\n]*\s-\w*f\b"
-    r"|\brm\b[^|;&\r\n]*\s-\w*f\b[^|;&\r\n]*\s-\w*[rR]\b"
-    r"|\brm\b[^|;&\r\n]*--recursive[^|;&\r\n]*--force"
-    r"|\brm\b[^|;&\r\n]*--force[^|;&\r\n]*--recursive"
+    r"\brm\b"
+    r"(?=[^|;&\r\n]*\s(?:-\w*[rR]|--recursive\b))"
+    r"(?=[^|;&\r\n]*\s(?:-\w*f|--force\b))"
 )
 _CURL_PIPE_SH = re.compile(r"\b(curl|wget|iwr|Invoke-WebRequest)\b[^|]*\|[^|]*\b(sh|bash|zsh|python|pwsh|powershell)\b")
 _CREDENTIAL_READ = re.compile(r"keyring\s+get|get_password\s*\(|\.credentials\.json")
@@ -214,14 +228,192 @@ def _cost_bearing_over_budget(command: str) -> Denial | None:
     )
 
 
+#: Longest first, so `||` is never read as two `|` and `&&` never as two `&`.
+#:
+#: `(` and `)` are here because grouping starts a command exactly as an operator
+#: does. `( ssh box )` and `{ ssh box; }` are two of the shortest bypasses that
+#: existed, and they were invisible for the same reason the substitution bugs
+#: were: the segment kept its delimiter, so the head of `( conda )` was `(` and
+#: the deny list matched nothing. Note `$(` sits ahead of `(`, and the explicit
+#: substitution branch in `_segments` runs before this list is scanned at all --
+#: a substitution opens a frame, a bare parenthesis only opens a segment.
+_OPERATORS = ("||", "&&", "$(", "|", ";", "&", "`", "(", ")", "\n", "\r")
+
+#: `{` is a separator only where the shell reads it as the group reserved word,
+#: which is where a blank follows it. That distinction is not pedantry: `find .
+#: -exec grep ssh {} \;` and `${HOME}` and `awk '{print $1}'` all contain a brace
+#: that is not grouping, and splitting on those would deny commands nobody wrote.
+#: `}` needs no rule of its own -- the `;` the shell requires before it has
+#: already ended the segment, and a segment that merely *starts* with `}` has a
+#: harmless head.
+_GROUP_OPEN = re.compile(r"\{\s")
+
+
+def _blind_segments(command: str) -> list[str]:
+    """The split that ignores quoting. Kept as the fallback -- see `_segments`."""
+    return [s for s in re.split(r"\|\||&&|[|;&()\r\n]|\{\s|\$\(|`", command) if s.strip()]
+
+
 def _segments(command: str) -> list[str]:
     """Split on shell operators so `foo && ssh bar` is inspected as two commands.
 
     A newline is in the class because a newline *is* a command separator: without
     it `"true\\nssh gpu-box nvidia-smi"` was one segment whose head was `true`,
     and the cheapest possible bypass of the deny list was pressing Enter.
+
+    **Quoting is respected, because an operator inside quotes is not one.**
+    `grep -n "a\\|b" file` is a single command, and splitting it blindly left a
+    tail of `b" file`; a pattern that happened to contain a denied word was
+    denied as though the user had typed it as a command. Read-only greps for the
+    deny list's own vocabulary are exactly what someone auditing this file
+    writes, so the false denial landed on the people best placed to hit it.
+
+    **Command substitution is the exception, and stays live inside double
+    quotes**, where `"$(ssh box)"` really does start a new command -- which is
+    also the one place worth hiding one. Single quotes suppress it, as the shell
+    does.
+
+    **A substitution opens a whole command context, not just a split point.**
+    Emitting one split at `$(` and carrying on as though the body were quoted
+    text is a fail-open: `"$(echo x | ssh box)"` keeps its `|` unsplit, every
+    head is `echo`, and the deny list waves through a pipeline the shell will
+    run. The suspended quote is stacked and restored at the *matching* closer,
+    so operators inside the body split and the text after it is quoted again.
+
+    Matching is the operative word, and it is why the frame counts grouping
+    parentheses. Ending at the first `)` instead reopens the quote halfway
+    through `"$( (true) | ssh box )"`, and the rest of a body the shell really
+    does execute is read as a string. The mirror case is the reason this cannot
+    simply deny every `)`: in `"$(cat f) | ssh box"` the parenthesis genuinely
+    ends the substitution, the tail is literal text, and no `ssh` runs -- so a
+    denial there would be a false one.
+
+    Unbalanced quotes -- and unclosed substitutions -- fall back to the blind
+    split: a string this cannot parse is one it must not vouch for.
+    Over-splitting only ever costs a false denial, and that is the direction a
+    deny list is allowed to be wrong in.
     """
-    return [s for s in re.split(r"\|\||&&|[|;&\r\n]|\$\(|`", command) if s.strip()]
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    #: One frame per open substitution, innermost last: the quote state it
+    #: suspended, which delimiter closes it, and how many grouping parentheses
+    #: are open inside it. A substitution is a *command* context, so
+    #: `"$(a | ssh box)"` has to go back to splitting on `|` inside it and back
+    #: to quoted text after the `)`.
+    #:
+    #: The depth is what makes the closer the *matching* one. Popping at the
+    #: first `)` ends the frame early on `"$( (true) | ssh box )"`, which puts
+    #: the pipeline back inside quotes and lets an `ssh` the shell really runs
+    #: go uninspected. It has to stay a count and not a flag because the
+    #: grouping can nest.
+    suspended: list[list[Any]] = []
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        # A backslash takes the next character with it. Outside quotes that is
+        # the shell's rule exactly; inside double quotes the shell honours it
+        # only before `$`, a backtick, `"`, `\` and a newline, and treating the
+        # rest as escaped too can only ever suppress a split, never invent one.
+        # The characters it would wrongly escape are not operators in that
+        # position anyway, so the two agree everywhere it matters here.
+        if char == "\\" and quote != "'" and i + 1 < n:
+            buf.append(char)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        # Single quotes first, because they suppress substitution outright.
+        if quote == "'":
+            if char == "'":
+                quote = None
+            buf.append(char)
+            i += 1
+            continue
+        # `$(` opens a command context anywhere it is not single-quoted; a
+        # backtick does the same, but only inside double quotes -- unquoted it
+        # is already an operator below.
+        if command.startswith("$(", i) or (char == "`" and quote == '"'):
+            suspended.append([quote, "`" if char == "`" else ")", 0])
+            quote = None
+            out.append("".join(buf))
+            buf = []
+            i += 2 if char == "$" else 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            buf.append(char)
+            i += 1
+            continue
+        if suspended:
+            frame = suspended[-1]
+            # A `(` here is grouping, not a substitution: the `$(` case above
+            # consumed both of its characters, so it can never reach this.
+            #
+            # It ends the segment as well as deepening the frame. Counting the
+            # depth without splitting kept the frame honest and left the group
+            # unread: `"$( (ssh box) )"` stayed one segment whose head was
+            # `(ssh`, so the fix for the *matching closer* had a bypass sitting
+            # inside the very string it was written for.
+            if frame[1] == ")" and char == "(":
+                frame[2] += 1
+                out.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+            if char == frame[1]:
+                if frame[1] == ")" and frame[2]:
+                    frame[2] -= 1
+                    out.append("".join(buf))
+                    buf = [char]
+                else:
+                    quote = suspended.pop()[0]
+                    # The closer ends the segment instead of joining it. A body
+                    # that takes no arguments is a single token, and keeping the
+                    # delimiter made that token `ssh)"`, which is not `ssh` and
+                    # was not denied. It opens the *next* buffer rather than
+                    # being dropped, so the quoted tail of `"$(date) ssh box"`
+                    # inherits a harmless head instead of reading as a command
+                    # the shell never runs.
+                    out.append("".join(buf))
+                    buf = [char]
+                i += 1
+                continue
+        if char in "'\"":
+            quote = char
+            buf.append(char)
+            i += 1
+            continue
+        operator = next((op for op in _OPERATORS if command.startswith(op, i)), None)
+        if operator is None and _GROUP_OPEN.match(command, i):
+            operator = "{"
+        if operator is not None:
+            out.append("".join(buf))
+            buf = []
+            i += len(operator)
+            continue
+        buf.append(char)
+        i += 1
+    # An unclosed substitution is as unparseable as an unbalanced quote.
+    if quote is not None or suspended:
+        return _blind_segments(command)
+    out.append("".join(buf))
+    return [s for s in out if s.strip()]
+
+
+#: Reserved words that *introduce* a command rather than being one. Skipping
+#: them is finishing the parse, not widening the rule: `if ssh box; then ...`
+#: and `for h in a b; do ssh $h; done` both run ssh, and both left a segment
+#: whose first token was grammar. `sudo`, `nohup`, `env` and `exec` are
+#: deliberately absent -- those are programs that run other programs, which is
+#: the indirection class this module's docstring puts out of scope.
+#:
+#: `for`, `in` and `case` are absent for a different reason: what follows them
+#: is a *name*, not a command, so skipping them would make `for ssh in a b` look
+#: like a remote execution and deny a loop nobody should be denied.
+_INTRODUCERS = frozenset({
+    "if", "elif", "then", "else", "while", "until", "do", "!", "time", "{", "(", ";",
+})
 
 
 def _head(segment: str) -> str:
@@ -232,6 +424,8 @@ def _head(segment: str) -> str:
     for token in tokens:
         if "=" in token and not token.startswith("-") and not token.startswith("/"):
             continue  # leading VAR=value assignments
+        if token in _INTRODUCERS:
+            continue
         return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower().removesuffix(".exe")
     return ""
 

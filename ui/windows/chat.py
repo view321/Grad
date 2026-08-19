@@ -38,6 +38,7 @@ file, and a redraw would take the transcript's scroll position with it.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import time
 from typing import Any
@@ -778,6 +779,25 @@ def _composer(ui: Any, workspace: Any, transcript: Any, tail: _Tail, statusline:
             # bound to the wrong index would cut in the wrong place.
             _message({"role": "user", "text": prompt}, workspace, index=len(session.settled))
         workspace.set_agent_state("running")
+        # Hand the frame to the browser *before* the turn starts, which is the
+        # difference between an app that is working and an app that looks
+        # broken.
+        #
+        # Drawing an element does not send it. NiceGUI queues it and a per-client
+        # outbox task emits it when the event loop next runs something else --
+        # and from here to the SDK subprocess there was nothing for the loop to
+        # run. `_stopped` returns without awaiting when no interrupt is pending,
+        # `apply_effort` and `apply_model` both return early while `self.client`
+        # is None, and `start` then does `config.load()` and
+        # `preflight_environment()` synchronously before it awaits anything. So
+        # on a cold session the prompt sat in the outbox for the whole spawn --
+        # measured at five to seven seconds -- with the composer cleared and
+        # nothing on screen to show the message had been sent at all.
+        #
+        # One tick is enough *because* the blocking half of that spawn now runs
+        # in a worker thread (`Session.start`); without that fix this would hand
+        # the outbox a loop that is about to stop running again immediately.
+        await asyncio.sleep(0)
         # The prompt goes to the agent exactly as it was typed. There was once a
         # mode chip here that prefixed it with `[plan]` or `[run]`, but nothing
         # downstream ever gave those tokens a meaning -- not the system prompt,

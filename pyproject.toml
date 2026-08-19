@@ -112,7 +112,19 @@ wiki = ["repowiki==0.3.1"]
 # install time. Optional because the campaign bookkeeping and the budget gate --
 # the parts that matter -- are ours either way.
 evolve = ["shinka-evolve==0.0.7"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# `hypothesis` is not optional-in-practice: `tests/property/` imports it at
+# module scope, so a `dev` install without it turns the generated suite into a
+# collection error rather than a skip -- which is the right way round. Those
+# tests are the ones that found the shell-parser bypasses, and a suite that
+# quietly stops running them is worse than one that fails to start.
+#
+# `mutmut` is genuinely optional and is *not* run by CI. It answers a different
+# question -- "does any test notice when this line changes?" -- at a cost
+# measured in CPU-hours, which is a thing to spend deliberately on a module that
+# has just changed rather than on every push. It also refuses to run natively on
+# Windows (its issue #397), so on the machine this was written on it is a WSL
+# job; `docs/testing.md` has the invocation.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "hypothesis>=6.100", "mutmut>=3.7"]
 
 [project.scripts]
 grad = "agent:main"
@@ -143,3 +155,64 @@ addopts = "-q"
 markers = [
     "slow: integration tests that start a real Jupyter kernel",
 ]
+
+# ---------------------------------------------------------------------------
+# Mutation testing
+# ---------------------------------------------------------------------------
+[tool.mutmut]
+# The question this answers is not "is the code covered" but "would anything
+# notice if it were wrong", and those turn out to be very different questions.
+# A line executed by twenty tests that all assert on something else is covered
+# and unprotected, and coverage reports it as green.
+#
+# `source_paths` is a short list on purpose, and it is not the whole project.
+# Mutation testing costs roughly one test run per mutant, so the useful version
+# of it is aimed rather than sprayed: these are the modules that are pure
+# functions of their arguments, that decide something irreversible (what gets
+# denied, what a run measured, what is written to the ledger), and that a
+# generated suite in `tests/property/` already covers -- which is what makes a
+# surviving mutant here a finding rather than a to-do.
+#
+# Widen it deliberately, one module at a time, when that module is what changed.
+source_paths = [
+    "hooks.py",
+    "core/stats.py",
+    "core/jsonl.py",
+    "core/traces.py",
+    "core/submission.py",
+    "core/kaggle_quota.py",
+    "core/effort.py",
+    "core/compaction.py",
+]
+
+# The suite is about three minutes, and mutmut runs it once per surviving
+# mutant. Naming the covering tests here is what turns days into hours: mutmut
+# still narrows further by which tests actually reach the mutated function, but
+# it cannot narrow below the set it was given.
+pytest_add_cli_args_test_selection = [
+    "tests/property",
+    "tests/test_hooks.py",
+    "tests/test_stats.py",
+    "tests/test_jsonl.py",
+    "tests/test_traces.py",
+    "tests/test_submission.py",
+    "tests/test_effort.py",
+    "tests/test_experiments.py",
+    "tests/test_gates.py",
+    "tests/test_kaggle.py",
+    "tests/test_context_and_compaction.py",
+]
+
+# mutmut runs the suite from a copy of the tree under `mutants/`, so anything
+# imported at collection time has to be there. `tests/` and `pyproject.toml` it
+# copies by itself; these are the rest of what `tests/conftest.py` reaches for
+# -- `ui` because the autouse process-state fixture imports it, `core` in full
+# because the eight modules above are not the only ones their imports touch.
+also_copy = ["core", "tools", "ui", "agent.py", "config"]
+
+# No cache provider, because several hundred pytest processes writing one
+# `.pytest_cache` inside the mutant tree is contention for a file none of them
+# reads. The generated tests run under Hypothesis's `dev` profile, which is
+# `derandomize=True` -- deliberately, since a mutant killed by a lucky seed is a
+# mutant reported as killed and never looked at again.
+pytest_add_cli_args = ["-p", "no:cacheprovider", "-q"]

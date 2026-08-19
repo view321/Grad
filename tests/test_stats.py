@@ -49,6 +49,40 @@ def test_the_sample_standard_deviation_is_used_not_the_population_one():
     assert summary["sd"] == pytest.approx(math.sqrt(5.0 / 3.0))
 
 
+@pytest.mark.parametrize(
+    "value", [3.05, 0.95, 0.1, 699050.7704552475, 1e-7, 12345.6789]
+)
+def test_seeds_that_agreed_exactly_report_no_spread(value):
+    """Three runs that reported the same number measured a spread of zero.
+
+    They did not. `fsum` returns the exactly-rounded sum and the division by n
+    rounds once more, and that second rounding can land a unit in the last place
+    *outside* the samples -- so `[3.05, 3.05, 3.05]` summarised to a mean of
+    3.0499999999999994, which is below its own minimum, and an sd of 5e-16.
+
+    The mean being outside `[min, max]` is the visible half and the smaller one:
+    a report citing both looks like a corrupt ledger, but the number is right to
+    fifteen places. The half that matters is the spread. This module exists
+    because a result "was recorded as in-range with identical confidence whether
+    the run-to-run spread was 0.001 or 0.3" -- so zero spread, which is what
+    identical seeds measured, is the one reading it must not invent noise for.
+
+    Found by `tests/property/test_prop_stats.py`, which asserts
+    `min <= mean <= max` over generated samples; it took 2000 examples to find a
+    triple where the rounding goes the wrong way.
+    """
+    summary = stats.summarise([value] * 3)
+    assert summary["min"] <= summary["mean"] <= summary["max"]
+    assert summary["mean"] == value
+    assert summary["sd"] == 0.0
+    assert summary["sem"] == 0.0
+    assert summary["ci95"] == [value, value]
+    # And the verdict that rests on it: a point interval, contained by any
+    # prediction that contains the point.
+    assert stats.observed_interval(summary) == (value, value)
+    assert stats.compare(summary, value, value)["in_range"] is True
+
+
 def test_junk_samples_are_excluded_rather_than_averaged():
     assert stats.numeric([1.0, "x", None, True, float("nan"), 2.0]) == [1.0, 2.0]
     # A quantity whose every sample is unusable has nothing to summarise.

@@ -161,6 +161,11 @@ def _document(name: str, body: str, theme: str | None = None) -> str:
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <style>
+  /* `color-scheme` for the same reason `ui/tokens.py` emits one: this is a
+     document of its own, it is the pane that scrolls furthest, and its
+     scrollbar is drawn by the browser rather than by anything below. */
+  html {{ color-scheme: {tokens.COLOR_SCHEME.get(
+              str(theme or tokens.DEFAULT_THEME).lower(), 'light')}; }}
   html, body {{ margin: 0; background: {c['paper']}; color: {c['ink']};
                 font-family: {tokens.FONT_SANS}; font-size: 13px; }}
   body {{ padding: 14px 16px 40px; }}
