@@ -22,6 +22,7 @@ import traceback
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from core import paths
 from core.errors import (
     EXIT_INTERNAL,
     EXIT_MEANINGS,
@@ -75,7 +76,21 @@ def _suggest(unknown: Sequence[str], parser: argparse.ArgumentParser) -> str | N
 class Cli:
     """A tool CLI. One instance per file in ``tools/``."""
 
-    def __init__(self, prog: str, description: str, *, epilog: str = "") -> None:
+    def __init__(
+        self,
+        prog: str,
+        description: str,
+        *,
+        epilog: str = "",
+        checks_install: bool = True,
+    ) -> None:
+        """`checks_install=False` exempts a tool from the install-shape guard.
+
+        Exactly one tool needs it, and it needs it badly: `grad-workspace` is
+        how a workspace pointed at an installed copy gets pointed somewhere
+        else, so a guard that refused there would be blocking its own remedy.
+        """
+        self.checks_install = checks_install
         exit_docs = "\n".join(
             f"  {code:>2}  {meaning}" for code, meaning in sorted(EXIT_MEANINGS.items())
         )
@@ -151,6 +166,25 @@ class Cli:
                     fix=f"{target.prog} --help",
                 )
             as_json = as_json or bool(getattr(args, "json", False))
+            # Every tool, at the one point they all pass through.
+            #
+            # `paths.ensure_workspace()` used to be the only caller, and fifteen
+            # tools never call it -- including `jobs`, `kaggle`, `modal` and
+            # `gpu`, whose ledger writes are the most expensive in the system to
+            # lose. A run record written into `site-packages` is an uncollected
+            # run and real money, and the guard meant to prevent that covered the
+            # tools that write notes.
+            #
+            # After parsing, so `--help` and `--version` still answer on a broken
+            # install -- they are how somebody works out what to do about it, and
+            # both leave through the `SystemExit` branch below without reaching
+            # here. Before the missing-command check, because "the workspace is
+            # inside an installed package" is the more actionable of the two
+            # things wrong with `grad-jobs` typed bare in that state. Inside the
+            # `try`, so the refusal arrives as exit 11 with a fix line rather
+            # than as a traceback.
+            if self.checks_install:
+                paths.check_not_installed_copy()
             command = getattr(args, "_command", None)
             if not command:
                 raise UsageError(

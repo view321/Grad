@@ -73,7 +73,12 @@ What the CI checks, and why it is shaped the way it is:
   bugs in this project's history were invisible to an editable install, because
   an editable install puts the source tree on `sys.path` and `import agent`
   resolves whether or not the wheel contains it. If you change
-  `[tool.setuptools]`, that job is the one to watch.
+  `[tool.setuptools]`, that job is the one to watch. It builds with `rm -rf
+  build dist` in front of it, and that is not tidiness: setuptools reuses
+  `build/lib` when it finds one, so a wheel built locally in a tree that has
+  ever been built in before can ship a module from whenever that copy was made.
+  `build/` is gitignored, so there is no diff and no review that catches it —
+  the file is not wrong, it is old. Build locally the same way.
 
 There is a second suite inside the first. `tests/property/` generates its inputs
 with Hypothesis instead of listing them, and it is where a rule goes when the

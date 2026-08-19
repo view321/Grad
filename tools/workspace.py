@@ -33,6 +33,12 @@ cli = Cli(
         "same folder -- that is the default -- but keeping them apart is what makes\n"
         "`grad update` a fast-forward rather than a merge with your own research."
     ),
+    # The one tool exempt from the install-shape guard, because it is the cure.
+    # A workspace that has resolved into `site-packages` is fixed by pointing it
+    # somewhere else, and `select` is what does that -- so refusing here would
+    # leave `GRAD_ROOT` as the only way out of a problem this command exists to
+    # solve.
+    checks_install=False,
 )
 
 #: What `move` relocates: the research directories, in the order they are

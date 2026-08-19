@@ -10,6 +10,20 @@ The honest residual is recorded in the handoff and not papered over here: a
 model determined to misbehave could import keyring itself. The threat model is
 accidental or deadline-pressured spend, and this is the right bar for that --
 it also means the spend ceilings guard the only path that can authenticate.
+
+**The residual is wider than "could import keyring", and the width is accepted
+rather than overlooked.** `python -c "from core import credentials; ..."` reads
+any secret here in one line, `tools/nb.py` runs the same code in a kernel, and
+`~/.modal.toml` and `~/.kaggle/kaggle.json` hold plaintext pairs that no rule in
+`hooks.py` covers. None of that is fixable by pattern-matching commands: the
+tokens must be readable by the process that authenticates, and the agent *is*
+that process. The deny list's `_CREDENTIAL_READ` rule catches the habitual
+spellings and nothing more, and it says so where it is defined.
+
+What is available against an accepted residual is *detection*, so `get` appends
+one line per successful read to `paths.credential_log_path()` -- the name, the
+time, and the calling frame, never the value. It is a record of what happened,
+which is the thing you cannot reconstruct afterwards; it stops nothing.
 """
 
 from __future__ import annotations
@@ -177,9 +191,12 @@ def get(name: str, *, required: bool = True) -> str | None:
             value = kr.get_password(SERVICE, name)
         except Exception as exc:  # noqa: BLE001 - backend errors vary wildly by platform
             store_error = exc
+    source = "store"
     if not value and _env_fallback_allowed():
         value = os.environ.get(f"GRAD_{name.upper()}")
+        source = "environment"
     if value:
+        _audit(name, source)
         return value
     if not required:
         return None
@@ -196,6 +213,51 @@ def get(name: str, *, required: bool = True) -> str | None:
         f"credential {name!r} is not in the credential store",
         fix=f"python -m tools.jobs credential set {name}   # prompts, does not echo",
     )
+
+
+#: Frames inside this module, skipped when naming the caller: `present` reaching
+#: `get` says nothing a reader wants, and the frame above it does.
+_OWN_FILE = __file__
+
+
+def _audit(name: str, source: str) -> None:
+    """Append one line saying a secret was read. Never the secret.
+
+    Every *successful* read, with no exemptions -- including `present`, whose
+    caller only wanted a boolean but whose read of the store was a real one. A
+    log with a carve-out in it is a log you have to reason about before you can
+    trust, and the caller frame is recorded precisely so the uninteresting reads
+    can be filtered out by whoever is reading rather than by whoever wrote this.
+
+    **Swallows everything.** This is accounting hung off the credential path, and
+    the credential path is what makes a research session able to run at all: an
+    unwritable ledger directory must cost a log line, not a job. That is the same
+    trade `hooks._cost_bearing_over_budget` makes and for the same reason, with
+    the same consequence acknowledged -- a log that can silently not be written
+    is not evidence of absence.
+    """
+    try:
+        import inspect  # noqa: PLC0415 - only on the credential path, which is rare
+
+        from core import jsonl, paths  # noqa: PLC0415 - see the module docstring
+        from core.ledger_store import now_iso  # noqa: PLC0415
+
+        caller = "unknown"
+        frame = inspect.currentframe()
+        while frame is not None:
+            if frame.f_code.co_filename != _OWN_FILE:
+                caller = (
+                    f"{frame.f_globals.get('__name__', '?')}."
+                    f"{frame.f_code.co_name}:{frame.f_lineno}"
+                )
+                break
+            frame = frame.f_back
+        jsonl.append(
+            paths.credential_log_path(),
+            {"at": now_iso(), "credential": name, "source": source, "caller": caller},
+        )
+    except Exception:  # noqa: BLE001 - see the docstring
+        pass
 
 
 def set_(name: str, value: str) -> None:

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from core import credentials
+from core import credentials, jsonl, paths
 from core.errors import ConfigError
 
 keyring = pytest.importorskip("keyring", reason="the remote extra is not installed")
@@ -117,3 +117,61 @@ def test_a_missing_keyring_package_keeps_its_own_advice(monkeypatch):
 
 def _raises_import_error():
     raise ConfigError("the `keyring` package is not installed", fix="pip install keyring")
+
+
+# ---------------------------------------------------------------------------
+# the read log
+# ---------------------------------------------------------------------------
+def test_a_successful_read_is_logged_without_the_value(workspace, monkeypatch):
+    """Detection, because prevention is not available here.
+
+    The rail in `hooks.py` catches `keyring get` and `.credentials.json` and
+    stops there; `python -c "from core import credentials; ..."` reads anything
+    in one line, and no pattern over a command string can forbid that without
+    forbidding the process from authenticating at all. So every successful read
+    leaves a line saying what was read and by whom -- and, the part worth a test,
+    **never what it was**."""
+    monkeypatch.setenv("GRAD_ALLOW_ENV_CREDENTIALS", "1")
+    monkeypatch.setenv("GRAD_VOYAGE_KEY", "sk-the-actual-secret")
+    monkeypatch.setattr(credentials, "_keyring", _raises_import_error)
+
+    assert credentials.get(credentials.VOYAGE_KEY) == "sk-the-actual-secret"
+
+    path = paths.credential_log_path()
+    raw = path.read_text(encoding="utf-8")
+    assert "sk-the-actual-secret" not in raw
+    rows = jsonl.read(path)
+    assert len(rows) == 1
+    assert rows[0]["credential"] == credentials.VOYAGE_KEY
+    assert rows[0]["source"] == "environment"
+    # The frame that asked, so the reads nobody cares about can be filtered by
+    # the reader rather than exempted here.
+    assert "test_a_successful_read_is_logged_without_the_value" in rows[0]["caller"]
+
+
+def test_a_failed_read_logs_nothing(workspace, dead_store):
+    """The log records disclosures, not attempts. A line per failed optional
+    lookup would bury the ones that matter under `present()` returning False."""
+    assert credentials.get(credentials.S2_KEY, required=False) is None
+    with pytest.raises(ConfigError):
+        credentials.get(credentials.HF_TOKEN)
+    assert jsonl.read(paths.credential_log_path()) == []
+
+
+def test_an_unwritable_log_does_not_break_the_read(workspace, monkeypatch):
+    """Accounting hung off the credential path must not be able to strand a
+    session: the credential path is what makes the session able to run at all.
+
+    Stated as a test because the swallow-everything `except` in `_audit` is
+    otherwise indistinguishable from carelessness, and because the consequence
+    is worth being explicit about -- a log that can silently fail to be written
+    is not evidence of absence."""
+    monkeypatch.setenv("GRAD_ALLOW_ENV_CREDENTIALS", "1")
+    monkeypatch.setenv("GRAD_VOYAGE_KEY", "from-the-environment")
+    monkeypatch.setattr(credentials, "_keyring", _raises_import_error)
+
+    def unwritable(*_a, **_k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(jsonl, "append", unwritable)
+    assert credentials.get(credentials.VOYAGE_KEY) == "from-the-environment"

@@ -20,7 +20,7 @@ import os
 import pytest
 
 from core import paths, workspace as workspace_mod
-from core.errors import UsageError
+from core.errors import ConfigError, UsageError
 
 
 @pytest.fixture
@@ -303,3 +303,55 @@ def test_the_current_folder_is_not_offered_as_somewhere_to_go(tmp_path, pointer,
     assert model["root"] == str(second.resolve())
     assert str(second.resolve()) not in model["recent"]
     assert str(first.resolve()) in model["recent"]
+
+
+# ---------------------------------------------------------------------------
+# the install-shape assertion
+# ---------------------------------------------------------------------------
+def test_a_workspace_inside_site_packages_is_refused(tmp_path, pointer, no_env, monkeypatch):
+    """The failure this catches succeeds at everything except being correct.
+
+    `root()`'s last resort is the directory the code sits in. That is right for a
+    checkout and wrong for an install: `README.md` documents `pip install -e`,
+    and an install recorded as non-editable puts the code under `site-packages`,
+    so the fallback resolves there and every ledger write, note and figure lands
+    inside the installed package. Nothing raises. The runs just go somewhere
+    nobody looks and the next install overwrites, and the only symptom is a
+    ledger that keeps coming up empty.
+    """
+    installed = tmp_path / "venv" / "Lib" / "site-packages" / "grad"
+    installed.mkdir(parents=True)
+    monkeypatch.setattr(paths, "root", lambda: installed)
+
+    with pytest.raises(ConfigError) as exc:
+        paths.ensure_workspace()
+    assert "site-packages" in str(exc.value)
+    assert "GRAD_ROOT" in (exc.value.fix or "")
+    # ...and it refuses *before* creating anything, which is the whole point.
+    assert not (installed / "ledger").exists()
+
+
+def test_dist_packages_counts_too(tmp_path, pointer, no_env, monkeypatch):
+    """Debian renames the directory, and the mistake is identical there."""
+    installed = tmp_path / "usr" / "lib" / "python3" / "dist-packages" / "grad"
+    installed.mkdir(parents=True)
+    monkeypatch.setattr(paths, "root", lambda: installed)
+    with pytest.raises(ConfigError):
+        paths.ensure_workspace()
+
+
+def test_an_explicit_root_is_a_deliberate_answer_and_is_left_alone(tmp_path, monkeypatch):
+    """A check that fires on GRAD_ROOT would break the one escape hatch its own
+    error message recommends -- and the test suite, which points GRAD_ROOT at a
+    temp directory that could be anywhere."""
+    chosen = tmp_path / "site-packages" / "research"
+    chosen.mkdir(parents=True)
+    monkeypatch.setenv("GRAD_ROOT", str(chosen))
+    paths.ensure_workspace()
+    assert (chosen / "ledger").is_dir()
+
+
+def test_an_ordinary_checkout_is_not_refused(workspace):
+    """The direction that would cost more if it were wrong: a false refusal here
+    is Grad declining to start at all."""
+    paths.check_not_installed_copy()

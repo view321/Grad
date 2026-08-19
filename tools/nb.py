@@ -12,6 +12,22 @@ that fix.
 
 Figures are written to `figures/NNN.png` and the path is printed; the agent
 Reads the path (which handles images) and the UI renders it inline.
+
+**No deny list runs here, and that is a decision rather than an omission.**
+`tools/task.py` does call `hooks.evaluate_bash` on its payload, and the contrast
+is the argument: `task.py`'s payload *is* a shell argv, so `shlex.join` and the
+deny list are exact about the same language. This payload is Python. Running a
+shell deny list over it would refuse `# rm -rf` in a comment and wave through
+`subprocess.run(["ssh", ...])` -- simultaneously wrong in both directions, and
+the fail-open direction is the one that matters. A speed bump that can be
+stepped over by writing the same thing a different way, at the cost of denying
+comments, is worse than an honest boundary.
+
+So the kernel is what it says it is: a Python execution environment, in the same
+out-of-scope class as `bash -c` in `hooks.py`'s docstring. It reaches
+credentials, the network and the filesystem, and the controls that bound it are
+the architectural ones -- the spend ceilings on the paths that can authenticate,
+and the read log in `core/credentials.py`.
 """
 
 from __future__ import annotations
